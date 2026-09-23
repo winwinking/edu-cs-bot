@@ -4,7 +4,7 @@ import uuid
 from typing import List, Optional
 
 from openai import APIConnectionError, APIError, APITimeoutError
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
@@ -12,7 +12,7 @@ from app.common.config import get_settings
 from app.common.db import AsyncSessionLocal
 from app.common.llm_client import stream_chat_completion
 from app.common.logging import get_logger
-from app.common.models import Conversation, Message, MessageRole
+from app.common.models import Conversation, Message, MessageRole, MessageStatus
 
 from app.worker.metrics import first_token_seconds
 from app.worker.pubsub import publish_error, publish_reply_chunk, publish_reply_end
@@ -52,11 +52,20 @@ async def _resolve_conversation(session, tenant_id: str, user_id: str, conversat
     return conversation_id
 
 
-async def _insert_user_message(
+async def _upsert_user_message(
     session, tenant_id: str, conversation_id: uuid.UUID, client_message_id: str, content: str, trace_id: Optional[str]
-) -> bool:
-    # ON CONFLICT DO NOTHING + RETURNING：插成功了才会有返回行，插突不成功说明这条消息已经处理过，
-    # 这是"队列至少一次投递 + 数据库唯一约束 = 业务只处理一次"里，数据库这一侧的实现
+) -> str:
+    """插入用户消息，返回三种结果之一：
+
+    - "inserted"：全新消息，正常往下走生成回复
+    - "retry"：(tenant_id, message_id) 之前插过，但 status 还是 received——说明上一次处理到一半
+      （比如调完 LLM、还没来得及写回复）worker 就崩了，这次要重新走一遍生成回复的流程，
+      不能直接当"已处理"跳过，否则用户永远收不到回复
+    - "done"：之前已经完整回复过（status=replied），是真正的重复投递，跳过
+
+    只用 ON CONFLICT DO NOTHING 判断"插没插成功"是不够的：插入失败只能说明这条消息之前来过，
+    不能说明有没有回复完，所以冲突之后还要多查一次 status。
+    """
     stmt = (
         pg_insert(Message)
         .values(
@@ -67,12 +76,20 @@ async def _insert_user_message(
             role=MessageRole.user,
             content=content,
             trace_id=trace_id,
+            status=MessageStatus.received,
         )
         .on_conflict_do_nothing(constraint="uq_messages_tenant_message_id")
         .returning(Message.id)
     )
     result = await session.execute(stmt)
-    return result.first() is not None
+    if result.first() is not None:
+        return "inserted"
+
+    existing = await session.execute(
+        select(Message.status).where(Message.tenant_id == tenant_id, Message.message_id == client_message_id)
+    )
+    status = existing.scalar_one()
+    return "done" if status == MessageStatus.replied else "retry"
 
 
 async def _load_recent_messages(session, tenant_id: str, conversation_id: uuid.UUID, limit: int) -> List[dict]:
@@ -103,6 +120,16 @@ async def _insert_assistant_message(
             content=content,
             trace_id=trace_id,
         )
+    )
+
+
+async def _mark_user_message_replied(session, tenant_id: str, client_message_id: str) -> None:
+    # 回复真正写完之后再打这个标记，这样"标记为 replied"和"消息处理完成"永远是同一时刻，
+    # 中途崩溃的话这行就不会被执行，下次重投递会走 "retry" 分支重新生成回复
+    await session.execute(
+        update(Message)
+        .where(Message.tenant_id == tenant_id, Message.message_id == client_message_id)
+        .values(status=MessageStatus.replied)
     )
 
 
@@ -146,13 +173,18 @@ async def process_inbound_message(
             logger.warning("越权访问会话", conversation_id=conversation_id_raw)
             return "forbidden"
 
-        inserted = await _insert_user_message(
+        outcome = await _upsert_user_message(
             session, tenant_id, conversation_id, client_message_id, content, trace_id
         )
-        if not inserted:
-            await session.commit()
-            logger.info("消息已处理过（命中数据库唯一约束），跳过", message_id=client_message_id)
+        await session.commit()
+        if outcome == "done":
+            logger.info("消息已完整回复过，跳过", message_id=client_message_id)
             return "duplicate"
+        if outcome == "retry":
+            logger.warning(
+                "消息之前处理到一半就中断了（用户消息已入库但未回复），重新生成回复",
+                message_id=client_message_id,
+            )
 
         history = await _load_recent_messages(
             session, tenant_id, conversation_id, settings.conversation_history_limit
@@ -173,6 +205,8 @@ async def process_inbound_message(
 
     async with AsyncSessionLocal() as session:
         await _insert_assistant_message(session, tenant_id, conversation_id, reply_text, trace_id)
+        # 降级回复也算"已经给用户答复过"，同样标记 replied，不需要也不应该之后再重新生成一次真回复
+        await _mark_user_message_replied(session, tenant_id, client_message_id)
         await session.commit()
 
     return result

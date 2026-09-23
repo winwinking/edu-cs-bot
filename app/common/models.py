@@ -23,6 +23,13 @@ class MessageRole(str, enum.Enum):
     assistant = "assistant"
 
 
+class MessageStatus(str, enum.Enum):
+    # 只用在 role=user 的消息上：区分"已入库但还没回复"和"已经完整回复过"，
+    # 这样 worker 中途崩溃、消息被重新投递时，能分清是真重复还是没处理完，不会让用户收不到回复
+    received = "received"
+    replied = "replied"
+
+
 class Tenant(Base):
     __tablename__ = "tenants"
 
@@ -60,8 +67,9 @@ class Conversation(Base):
 class Message(Base):
     __tablename__ = "messages"
     __table_args__ = (
-        # 唯一约束是 worker 端幂等的最后一道防线：
-        # 队列至少一次投递，同一条消息可能被处理两次，第二次 INSERT 冲突就说明已经处理过
+        # 唯一约束是 worker 端幂等的最后一道防线：队列至少一次投递，同一条消息可能被投递两次，
+        # 第二次 INSERT 会冲突——但冲突只代表"这条消息之前插过"，不代表"已经回复完了"，
+        # 还要看 status 才能判断是真重复（replied）还是处理到一半崩了要重新处理（received）
         UniqueConstraint("tenant_id", "message_id", name="uq_messages_tenant_message_id"),
         Index("ix_messages_tenant_conversation_created", "tenant_id", "conversation_id", "created_at"),
     )
@@ -74,3 +82,7 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     trace_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    # 只有 role=user 的行会设这个字段，assistant 行留空；见 MessageStatus 的注释
+    status: Mapped[Optional[MessageStatus]] = mapped_column(
+        Enum(MessageStatus, name="message_status", native_enum=True), nullable=True
+    )

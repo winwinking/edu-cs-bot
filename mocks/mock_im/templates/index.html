@@ -95,6 +95,18 @@
         addMeta("请先填 token", true);
         return;
       }
+
+      // 按钮真正禁用要等 onopen（异步）才发生，这之前如果又点一次会造出第二个 WebSocket，
+      // 两个连接会被 gateway 各自转发同一份回复，页面上文字就会重复——这里同步禁用 + 关掉旧连接兜底
+      connectBtn.disabled = true;
+      if (ws) {
+        ws.onopen = null;
+        ws.onclose = null;
+        ws.onmessage = null;
+        ws.onerror = null;
+        ws.close();
+      }
+
       const host = window.location.hostname;
       const url = `ws://${host}:${GATEWAY_HOST_PORT}/ws?token=${encodeURIComponent(token)}`;
       ws = new WebSocket(url);

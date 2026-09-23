@@ -20,7 +20,7 @@ seed:
 	docker compose run --rm tools python scripts/seed.py
 
 demo:
-	bash scripts/demo.sh
+	docker compose run --rm tools sh scripts/demo.sh
 
 test:
 	@echo "待实现"
