@@ -1,5 +1,19 @@
 name: edu-cs-bot
 
+# gateway / worker / scheduler / tools 共用同一个镜像，用 YAML anchor 避免每个服务都抄一遍
+x-app-build: &app-build
+  image: edu-cs-bot/app:latest
+  build:
+    context: .
+    dockerfile: docker/app.Dockerfile
+
+x-app-healthcheck: &app-healthcheck
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+    interval: 5s
+    timeout: 5s
+    retries: 10
+
 # 5 个 mock 服务共用同一个镜像和健康检查方式，用 YAML anchor 避免每个服务都抄一遍
 x-mocks-build: &mocks-build
   image: edu-cs-bot/mocks:latest
@@ -21,15 +35,28 @@ services:
   # 一次性任务用的容器：迁移、种子数据这类活不需要一直跑着，跟 gateway/worker/scheduler 共用同一个镜像
   # profiles 让它不随 make up 启动，只有 docker compose run 显式叫它的时候才会起来，干完活就退出
   tools:
-    image: edu-cs-bot/app:latest
-    build:
-      context: .
-      dockerfile: docker/app.Dockerfile
+    <<: *app-build
     profiles: ["tools"]
     env_file:
       - .env
     depends_on:
       postgres:
+        condition: service_healthy
+
+  gateway:
+    <<: [*app-build, *app-healthcheck]
+    command: ["python", "-m", "app.gateway.main"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${GATEWAY_HOST_PORT}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
 
   postgres:

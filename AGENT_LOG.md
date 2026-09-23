@@ -166,3 +166,41 @@ CC 验证时未走 make migrate / make seed，实际执行因依赖尚未创建�
 
 **人工审查与修复点**：
 （留空，由 Jo 填写）
+
+---
+
+## 步骤 1.6：gateway
+
+**日期**：2026-09-23
+
+**改动/新建模块**：
+- `app/gateway/main.py`：FastAPI app，`lifespan` 里建 MQ 连接、开 publisher-confirm channel、声明拓扑，存在 `app.state` 上；`GET /health`（存活）、`GET /ready`（查 postgres/redis/rabbitmq）、`GET /metrics`（Prometheus 文本格式）；`WS /ws?token=...` 端点
+- `app/gateway/connection_manager.py`：`ConnectionManager`，按 `(tenant_id, user_id)` 分组管理本实例的连接集合，第一个连接建立时订阅 Redis 频道 `im:out:{tenant_id}:{user_id}`，最后一个断开时退订，订阅到的消息原样转发给这个用户当前所有本地连接
+- `app/gateway/message_handler.py`：单条消息的处理流程——JSON 解析 → Pydantic 校验 → `SET dedup:{tenant_id}:{message_id} NX EX` 去重 → 发布到 RabbitMQ（等 publisher confirm）→ 回 ack；任何一步失败都回 `error`，投递失败时把刚写的 dedup key 删掉
+- `app/gateway/metrics.py`：三个指标——`gateway_ws_connections`（gauge）、`gateway_inbound_messages_total{status}`（counter）、`gateway_ack_latency_seconds`（histogram）
+- `app/common/mq.py`：`declare_topology` 返回值从 `(inbound_queue, dead_queue)` 改成 `(inbound_exchange, inbound_queue, dead_queue)`——gateway 要用 exchange 发消息，之前只有 worker 视角（只消费队列），漏了这个返回值
+- `docker-compose.yml`：加了 `gateway` 服务；把 `tools` 的 build/image 配置提成 `x-app-build` anchor 复用（之前是 `tools` 自己写的，现在 gateway 也要用同一个镜像）
+
+**关键决策**：
+- WebSocket 的鉴权顺序是"先 `accept()`，鉴权失败再 `close(code=4401)`"，不是先鉴权失败直接拒绝握手——这是我自己验证时踩的坑，见下面"过程中发现的 bug"。
+- 去重用 `SET NX EX` 一条 Redis 命令完成"不存在就写入并设过期"，这是原子操作，不会有"两个并发请求都查到不存在，都插入"的竞态。
+- 消息体（发到 RabbitMQ 的）里放了 worker 需要的全部信息（tenant_id/user_id/conversation_id/message_id/content/trace_id），headers 里只放 trace_id/tenant_id/user_id 这三个（按需求原文），worker 不用回头查 gateway 拿上下文。
+- `ConnectionManager` 用 `asyncio.Lock` 保护"连接集合从空变非空/从非空变空"这个判断，因为同一个用户可能有多个端几乎同时连接/断开，不加锁可能出现重复订阅或该退订时没退订。
+
+**过程中发现的 bug（自己验证时发现并修复，不是 Jo 发现的）**：
+- 一开始的实现是"鉴权失败时不 `accept()`，直接 `close(code=4401)`"，想法是"握手都没完成就不算建立过连接"。但实测发现这样浏览器/客户端收到的是 HTTP 403，收不到 4401——因为 WebSocket 的 close code 是协议帧的一部分，只有完成握手（`accept()`）之后才能带自定义 code 发出去，`accept()` 之前调 `close()` 会被 ASGI server 降级成普通的 HTTP 级别拒绝，自定义 code 传不出去。修法：改成先 `accept()`，鉴权失败立刻 `close(code=4401)`，这样客户端才能真的看到 4401。
+
+**验证记录**：
+- 用真实容器跑了一遍（`gateway` 容器 + `websockets`/`redis` 库直连测试脚本，都在 compose 网络里）：
+  - `GET /health`、`GET /ready`（三个依赖都 `true`）、`GET /metrics`（能看到三个自定义指标）都正常
+  - 不带 token 连接 / 带一个乱造的假 token 连接，两种情况都收到 `close code=4401`
+  - 正常发一条消息 → 收到 `ack status=accepted` 且带 `trace_id`；用同一个 `message_id` 重发 → 收到 `ack status=duplicate`
+  - 发超长内容（3000 字符）→ 收到 `error code=invalid_message`；发不合法 JSON → 收到 `error code=invalid_json`
+  - 手动往 Redis 频道 `im:out:{tenant_id}:{user_id}` `PUBLISH` 一条消息，确认连着的 WebSocket 原样收到（验证了 `ConnectionManager` 的订阅转发链路）
+  - `rabbitmqctl list_queues` 确认 accepted 的那条消息真的躺在 `inbound.messages` 里（此时还没有 worker 消费，符合预期），`inbound.dead` 是空的
+  - `redis-cli TTL dedup:...` 确认去重 key 的过期时间接近 86400 秒
+  - 全部断开连接后 `/metrics` 里 `gateway_ws_connections` 回到 0，`gateway_inbound_messages_total` 按 `accepted=1/duplicate=1/error=2` 精确对上这次测试做的事
+- 验证完执行了 `docker compose down`
+
+**人工审查与修复点**：
+（留空，由 Jo 填写）

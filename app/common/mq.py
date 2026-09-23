@@ -9,7 +9,7 @@ from typing import Tuple
 
 import aio_pika
 from aio_pika import ExchangeType
-from aio_pika.abc import AbstractChannel, AbstractQueue, AbstractRobustConnection
+from aio_pika.abc import AbstractChannel, AbstractExchange, AbstractQueue, AbstractRobustConnection
 
 from app.common.config import get_settings
 
@@ -37,8 +37,10 @@ async def get_confirm_channel(connection: AbstractRobustConnection) -> AbstractC
     return channel
 
 
-async def declare_topology(channel: AbstractChannel) -> Tuple[AbstractQueue, AbstractQueue]:
-    """声明 inbound 主队列和死信队列，返回 (inbound_queue, dead_queue)"""
+async def declare_topology(channel: AbstractChannel) -> Tuple[AbstractExchange, AbstractQueue, AbstractQueue]:
+    """声明 inbound 主队列和死信队列，返回 (inbound_exchange, inbound_queue, dead_queue)。
+    inbound_exchange 是 gateway 发布消息要用的句柄，worker 只消费队列用不上。
+    """
     dlx_exchange = await channel.declare_exchange(DLX_EXCHANGE, ExchangeType.DIRECT, durable=True)
     dead_queue = await channel.declare_queue(DEAD_QUEUE, durable=True)
     await dead_queue.bind(dlx_exchange, routing_key=DEAD_ROUTING_KEY)
@@ -53,4 +55,4 @@ async def declare_topology(channel: AbstractChannel) -> Tuple[AbstractQueue, Abs
         },
     )
     await inbound_queue.bind(inbound_exchange, routing_key=INBOUND_ROUTING_KEY)
-    return inbound_queue, dead_queue
+    return inbound_exchange, inbound_queue, dead_queue
