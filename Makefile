@@ -12,12 +12,12 @@ logs:
 ps:
 	docker compose ps
 
-# gateway / worker / scheduler 共用一个镜像，迁移在 worker 容器里跑
+# tools 是一次性任务容器（profiles 挡住了 make up 默认启动它），迁移/种子数据这类活跑完就退出
 migrate:
-	docker compose run --rm worker alembic upgrade head
+	docker compose run --rm tools alembic upgrade head
 
 seed:
-	docker compose run --rm worker python scripts/seed.py
+	docker compose run --rm tools python scripts/seed.py
 
 demo:
 	bash scripts/demo.sh

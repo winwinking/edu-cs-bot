@@ -1,5 +1,11 @@
 """structlog 配置：JSON 输出，trace_id/tenant_id/conversation_id 用 contextvars 自动挂到每条日志上，
 并在渲染前脱敏，防止手机号/身份证/银行卡/邮箱/JWT 这类敏感信息原样进日志。
+
+脱敏分两层：
+1. 按字段名——只要 key 里包含 password/token/phone/email/id_card/bank_card 这类词，不管值长什么样，整体打码。
+   这是第一道防线，因为业务字段名是我们自己定的，比正则猜值的格式更可靠。
+2. 按内容正则——防止敏感信息混在一段普通文本里（比如 detail: "手机号 138xxx 验证失败"），
+   字段名那层不会覆盖到这种情况，所以正则作为兜底，两层都要。
 """
 import logging
 import re
@@ -17,6 +23,10 @@ _ID_CARD_RE = re.compile(r"\b(\d{6})\d{8}(\d{3}[\dXx])\b")
 _BANK_CARD_RE = re.compile(r"\b(\d{4})\d{8,11}(\d{4})\b")
 _PHONE_RE = re.compile(r"\b(1[3-9]\d)\d{4}(\d{4})\b")
 
+# 字段名脱敏用的关键词，大小写不敏感、只要 key 里包含就命中（如 access_token、user_phone、bank_card_no）
+_SENSITIVE_FIELD_RE = re.compile(r"(password|token|phone|email|id_card|bank_card)", re.IGNORECASE)
+_REDACTED_FIELD = "***REDACTED***"
+
 
 def _mask_text(value: str) -> str:
     value = _JWT_RE.sub("***REDACTED_TOKEN***", value)
@@ -27,19 +37,22 @@ def _mask_text(value: str) -> str:
     return value
 
 
-def _mask_value(value: Any) -> Any:
+def _mask_value(value: Any, key: str | None = None) -> Any:
     if isinstance(value, str):
+        # 字段名命中敏感关键词：不管内容是什么格式，直接整体打码，不依赖内容正则猜得准不准
+        if key and _SENSITIVE_FIELD_RE.search(key):
+            return _REDACTED_FIELD
         return _mask_text(value)
     if isinstance(value, dict):
-        return {k: _mask_value(v) for k, v in value.items()}
+        return {k: _mask_value(v, key=k) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_mask_value(v) for v in value]
+        return [_mask_value(v, key=key) for v in value]
     return value
 
 
 def desensitize_processor(logger: Any, method_name: str, event_dict: dict) -> dict:
     for key, value in list(event_dict.items()):
-        event_dict[key] = _mask_value(value)
+        event_dict[key] = _mask_value(value, key=key)
     return event_dict
 
 

@@ -2,6 +2,20 @@ name: edu-cs-bot
 
 # gateway / worker / scheduler / mocks 在后续步骤加入
 services:
+  # 一次性任务用的容器：迁移、种子数据这类活不需要一直跑着，跟 gateway/worker/scheduler 共用同一个镜像
+  # profiles 让它不随 make up 启动，只有 docker compose run 显式叫它的时候才会起来，干完活就退出
+  tools:
+    image: edu-cs-bot/app:latest
+    build:
+      context: .
+      dockerfile: docker/app.Dockerfile
+    profiles: ["tools"]
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   postgres:
     image: pgvector/pgvector:pg15
     restart: unless-stopped

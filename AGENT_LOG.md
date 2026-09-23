@@ -85,4 +85,55 @@
 - 验证完执行了 `docker compose down`
 
 **人工审查与修复点**：
-（留空，由 Jo 填写）
+- Jo 发现：脱敏只靠内容正则去猜格式，存在漏判风险——只要值的格式不标准（比如手机号存成非标准格式、token 不是 JWT 形态），正则就可能匹配不上，敏感信息照样原样进日志。
+- 处理：`logging.py` 的 `desensitize_processor` 加了一层按字段名脱敏，key 里只要包含 `password`/`token`/`phone`/`email`/`id_card`/`bank_card`（大小写不敏感、子串匹配，如 `access_token`、`user_phone`、`bank_card_no` 都能命中），不管值是什么格式，整体替换成 `***REDACTED***`，作为第一道防线；原来的内容正则退化为兜底，负责处理敏感信息混在普通文本字段里的情况（比如 `detail: "用户手机号是 13812345678"`）。已用非标准格式的 password/token/phone/id_card/bank_card 值验证过，字段名这层确实能兜住正则漏判的场景。
+
+---
+
+## 步骤 1.4：数据库迁移与种子数据
+
+**日期**：2026-09-23
+
+**改动/新建模块**：
+- `app/common/models.py`（新增，不在步骤 1.3 原定的文件清单里——见下面"偏离说明"）：`Tenant`/`User`/`Conversation`/`Message` 四张表的 ORM 模型，`UserRole`/`MessageRole` 两个 Python 枚举映射成 Postgres 原生 ENUM
+- `migrations/env.py`：async Alembic 环境，连接串从 `Settings` 拿（不从 `alembic.ini` 读，避免密码进版本库），手动把 cwd 加进 `sys.path` 保证 `import app.*` 不失败
+- `migrations/script.py.mako`：标准 Alembic 模板
+- `migrations/versions/202609230001_init_schema.py`：建表迁移——启用 `vector` 扩展、建 `tenants`/`users`/`conversations`/`messages` 四张表，`messages` 上建 `(tenant_id, message_id)` 唯一约束，`users.tenant_id`、`conversations.(tenant_id, user_id)`、`messages.(tenant_id, conversation_id, created_at)` 都建了索引
+- `scripts/seed.py`：种两个租户（t_a 星辰教育、t_b 启明学堂），每个租户 3 个用户（student/parent/agent 各一个），`ON CONFLICT DO NOTHING` 保证脚本可重复跑
+- `scripts/gen_token.py`：按 `--tenant --user` 查数据库拿到真实 role，签发 JWT 打印出来
+- `docker/app.Dockerfile`：加了 `ENV PYTHONPATH=/app`（见下面"过程中发现的 bug"）
+
+**偏离 PHASE1 文档的地方**：
+- 步骤 1.3 列的 `app/common` 文件清单里没有 `models.py`，但步骤 1.4 要建表、种子脚本和 `gen_token.py` 都要查用户表，需要有个地方放 ORM 模型定义，所以补了这个文件，放在 `app/common` 下（worker 步骤 1.7 之后也会用到同一套模型）。这是为了完成步骤 1.4 必须做的最小补充，没有多做别的。
+
+**关键决策**：
+- 迁移是手写的 `op.create_table`，没有直接用 `alembic revision --autogenerate` 生成正式迁移——手写的能加中文注释解释为什么有唯一约束、为什么建这些索引，autogenerate 生成的东西没法加注释还很啰嗦。但写完之后专门跑了一次 autogenerate 做"一致性检查"：如果 `models.py` 和手写迁移之间有差异，autogenerate 会生成非空的 diff；跑出来是空的（`upgrade()`/`downgrade()` 都是 `pass`），说明两边完全对得上，这个临时生成的文件验证完就删了，不进版本库。
+- `tenants.id`/`users.id` 用业务可读的字符串主键（`t_a`、`u_a_1001`），不用自增数字或 UUID——这两张表的行是人工/种子数据定的，可读性对手工测试和讲解更重要；`conversations.id`/`messages.id` 是系统运行时生成的，用 UUID（Python 侧 `uuid.uuid4` 默认值，不依赖数据库端生成函数）。
+- `role` 字段用 Postgres 原生 ENUM 而不是普通字符串 + 应用层校验，非法角色在数据库这一层就会被拒绝，不用等到业务代码校验。
+- `(tenant_id, message_id)` 唯一约束的注释直接抄了需求原文的表述："队列至少一次投递 + 数据库唯一约束 = 业务只处理一次"，方便讲解时对照。
+
+**过程中发现的 bug（自己验证时发现并修复，不是 Jo 发现的）**：
+1. 迁移脚本一开始把同一个 `postgresql.ENUM(...)` 对象既用来手动 `.create()`，又用在 `Column` 定义里——`create_table` 建表时会对列关联的类型再自动建一次，导致 `DuplicateObjectError: type "user_role" already exists`。修法：给这个 ENUM 对象传 `create_type=False`，告诉它"类型我自己管，你建表时别自动建"。
+2. `python scripts/seed.py` 这样直接跑脚本时，Python 会把 `sys.path[0]` 设成脚本所在目录 `scripts/`，不是项目根目录 `/app`，导致 `import app.common...` 报 `ModuleNotFoundError`。修法：在 `app.Dockerfile` 里加 `ENV PYTHONPATH=/app`，让容器里所有 `python scripts/xxx.py` 都能正常 import，不用每个脚本自己写 `sys.path.insert`。
+
+**验证记录**：
+- 用真实 `python:3.11-slim` 容器（接到 compose 网络）跑了一遍完整流程：
+  - `alembic upgrade head` 成功；查 `information_schema` 确认 5 张表（含 `alembic_version`）都建出来了，`uq_messages_tenant_message_id` 唯一约束存在，`vector` 扩展已启用
+  - `alembic revision --autogenerate` 生成空 diff，验证 `models.py` 和手写迁移完全一致，验证完删掉了这个临时文件
+  - `scripts/seed.py` 跑了两次，两次都是"2 个租户，6 个用户"，确认幂等；查出来的用户角色分布是 t_a/t_b 各 1 个 student/parent/agent，跟种子数据设计一致
+  - `scripts/gen_token.py --tenant t_a --user u_a_1001` 打出的 JWT 解码后 `sub`/`tenant_id`/`role` 三个 claim 都对；对不存在的用户 `u_nope` 正确抛错退出
+  - 全部打印 `ALL MIGRATION/SEED CHECKS DONE`
+- 验证完执行了 `docker compose down`
+
+**人工审查与修复点**：
+CC 验证时未走 make migrate / make seed，实际执行因依赖尚未创建的 worker 服务而失败。已要求改为独立的一次性 tools 服务，并按用户真实操作路径重新验证。
+
+**补充修复（同一次审查里一起改的）**：
+- `docker-compose.yml` 新增 `tools` 服务：跟 gateway/worker/scheduler 共用 `docker/app.Dockerfile`，打了 `edu-cs-bot/app:latest` 镜像标签方便以后复用；`profiles: ["tools"]` 让它不随 `make up`/`docker compose up` 启动，只有显式 `docker compose run --rm tools ...` 才会被叫起来，干完活自动退出（`--rm`）；`depends_on: postgres: condition: service_healthy` 保证迁移/种子脚本不会在数据库还没就绪时跑。
+- `Makefile` 的 `migrate`/`seed` 目标从 `docker compose run --rm worker ...` 改成 `docker compose run --rm tools ...`。
+- 用真实命令重新走了一遍 `make up → make migrate → make seed → make seed`：
+  - `make up`（`docker compose up -d --build`）确认没有把 `tools` 一起建出来/启动（`profiles` 生效）
+  - `make migrate` 第一次跑要现场 build `tools` 镜像（约 3.5 分钟，纯下载依赖的时间），之后 `alembic upgrade head` 成功
+  - `make seed` 跑两次，两次都打印"2 个租户，6 个用户"，确认幂等
+  - `docker compose ps -a` 确认 `tools` 容器跑完即被移除，不会常驻
+- 顺带确认了 `logging.py` 的按字段名脱敏（`_SENSITIVE_FIELD_RE`/`_REDACTED_FIELD`）确实还在，没有被后续改动带丢。
