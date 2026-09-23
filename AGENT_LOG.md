@@ -47,4 +47,42 @@
 - 验证完后执行了 `docker compose down`（保留数据卷，未清理），需要的话可以再 `make up` 拉起来看
 
 **人工审查与修复点**：
+- Jo 发现：本机之前做图谱项目时装过一个开机自启的原生 Redis，同样占 6379 端口。容器和它都能各自启动，但本机脚本连 `localhost:6379` 时可能悄悄连到那个原生 Redis 而不是容器里的这个，排查起来会很晕。
+- 处理：`.env.example`/`.env` 的 `REDIS_HOST_PORT` 默认值从 6379 改成 6380（仅宿主机映射端口，容器内部互联仍是标准的 6379，不影响 gateway/worker 的连接方式），并在 README 端口表里写明原因，避免以后忘记为什么用了非标准端口。
+
+---
+
+## 步骤 1.3：公共模块 app/common
+
+**日期**：2026-09-23
+
+**改动/新建模块**：
+- `app/common/config.py`：pydantic-settings 的 `Settings`，把 `.env.example` 里列的所有变量都建了模型，`get_settings()` 用 `lru_cache` 保证全进程只解析一次
+- `app/common/logging.py`：structlog 配置（JSON 输出、`ensure_ascii=False`），`bind_trace_context`/`clear_trace_context` 用 contextvars 绑定 trace_id/tenant_id/conversation_id；加了 `desensitize_processor`，用正则在渲染前脱敏手机号、身份证、银行卡、邮箱、JWT 形态字符串
+- `app/common/db.py`：async engine + `AsyncSessionLocal` 工厂，`Base`（给 1.4 的 ORM 模型用），`check_db_connection()` 给 `/ready` 探活
+- `app/common/redis.py`：`redis.asyncio` 客户端（带超时），`check_redis_connection()`
+- `app/common/mq.py`：aio-pika 连接 + 拓扑声明（`im.inbound` → `inbound.messages`，死信 `im.dlx` → `inbound.dead`，`inbound.messages` 配置了 dead-letter 参数），开启 publisher confirms
+- `app/common/auth.py`：PyJWT 签发/校验（HS256），claims 是 sub/tenant_id/role/exp，校验失败统一抛 `TokenError`
+- `app/common/schemas.py`：WebSocket 消息协议的 Pydantic 模型（`ClientMessage`/`AckMessage`/`ReplyChunkMessage`/`ReplyEndMessage`/`ErrorMessage`），`ClientMessage.content` 超过 `WS_MESSAGE_MAX_LENGTH` 直接校验失败
+- `app/common/llm_client.py`：`AsyncOpenAI` 封装 + `stream_chat_completion()` 流式辅助函数，base_url/api_key/model/timeout 全部来自配置
+- `.env.example`/`.env`：补了 `DB_CONNECT_TIMEOUT_SECONDS`/`REDIS_TIMEOUT_SECONDS`/`MQ_CONNECT_TIMEOUT_SECONDS` 三个超时配置项
+
+**关键决策**：
+- 所有外部调用的超时都做成了独立的环境变量（而不是写死的魔法数字），跟已有的 `LLM_TIMEOUT_SECONDS` 保持同样风格，对应硬性规则"所有外部调用必须有超时"。
+- 日志脱敏用正则按"先处理更具体、不容易和别的数字串混淆的模式"的顺序（JWT → 邮箱 → 身份证 → 手机号 → 银行卡），是启发式做法不是 100% 精确，但覆盖了需求里点名的几类敏感信息；处理的是整个 event_dict 的每个字段值（含主 message），不止是最外层字符串。
+- `llm_client.py` 除了裸的 `AsyncOpenAI` 实例，还加了一个 `stream_chat_completion()` 薄封装，worker（步骤 1.7）只管消费文本分片，不用直接碰 OpenAI SDK 的流式接口细节。
+- `mq.py` 的 `get_confirm_channel` 显式传 `publisher_confirms=True`，配合 gateway（步骤 1.6）"等 confirm 成功才回 ack"的设计。
+
+**验证记录**：
+- 起了一个干净的 `python:3.11-slim` 容器（跟 compose 同一个 docker network，装了 `requirements.txt`），跑了一遍脚本：
+  - `Settings` 能正确加载 `.env` 里的值（含刚改的 `REDIS_HOST_PORT=6380`）
+  - 日志脱敏：手机号 `138****5678`、邮箱 `j***@example.com`、伪造 JWT 被整体替换成 `***REDACTED_TOKEN***`、身份证 `110101********2316`，且 trace_id/tenant_id/conversation_id 正确挂在日志上
+  - JWT 签发后能正确解出 sub/tenant_id，篡改后的 token 被 `TokenError` 正确拒绝
+  - `ClientMessage` 正常内容能解析，超长内容（3000 字符）被 Pydantic 校验拒绝
+  - `check_db_connection()` / `check_redis_connection()` 对着真实跑起来的 postgres/redis 都返回 True
+  - `declare_topology()` 对着真实 RabbitMQ 成功声明出 `inbound.messages` 和 `inbound.dead` 两个队列
+  - 全部检查项打印 `ALL CHECKS PASSED`
+- 验证完执行了 `docker compose down`
+
+**人工审查与修复点**：
 （留空，由 Jo 填写）
