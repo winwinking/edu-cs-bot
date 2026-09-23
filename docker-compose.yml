@@ -59,6 +59,29 @@ services:
       rabbitmq:
         condition: service_healthy
 
+  worker:
+    <<: *app-build
+    command: ["python", "-m", "app.worker.main"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${WORKER_HEALTH_HOST_PORT}:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      mock-llm:
+        condition: service_healthy
+
   postgres:
     image: pgvector/pgvector:pg15
     restart: unless-stopped

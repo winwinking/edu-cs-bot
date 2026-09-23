@@ -204,3 +204,35 @@ CC 验证时未走 make migrate / make seed，实际执行因依赖尚未创建�
 
 **人工审查与修复点**：
 （留空，由 Jo 填写）
+
+---
+
+## 步骤 1.7：worker
+
+**日期**：2026-09-23
+
+**改动/新建模块**：
+- `app/worker/handler.py`：核心业务逻辑 `process_inbound_message`——解析会话归属（不存在则以当前 tenant_id/user_id 创建，存在但不属于当前用户则抛 `ConversationForbidden`）→ `INSERT ... ON CONFLICT DO NOTHING RETURNING` 判断是否已处理过 → 读最近 N 条历史（`CONVERSATION_HISTORY_LIMIT`）→ 调 LLM 流式 → 写 assistant 消息。所有"预期内"的结果（forbidden/duplicate/llm_degraded/ok）都在这个函数内部处理完并返回结果标签，不往外抛异常
+- `app/worker/consumer.py`：消费 `inbound.messages`，`prefetch_count` 从配置读；`_on_message` 先做消息体的基本 JSON/字段校验（不合格直接 reject 进死信），再调用 `process_inbound_message`；只有真正跳出 `process_inbound_message`（比如数据库挂了）的异常才会被判定为不可预期异常并 reject 进死信
+- `app/worker/pubsub.py`：往 `im:out:{tenant_id}:{user_id}` 推 `reply_chunk`/`reply_end`/`error`，复用 `app.common.schemas` 里跟 gateway 共享的协议模型，保证两边格式不会走样
+- `app/worker/metrics.py`：`worker_messages_total{result}`、`worker_process_seconds`、`worker_first_token_seconds`
+- `app/worker/main.py`：同进程内跑 MQ 消费循环 + 一个轻量 FastAPI（端口 8001）的 `/health` `/metrics`
+- `docker-compose.yml`：加了 `worker` 服务，依赖 postgres/redis/rabbitmq/mock-llm 都健康才启动
+
+**关键决策**：
+- `process_inbound_message` 的设计原则是"预期内的结果都自己处理完，正常返回；只有真正的 bug 才抛异常"——这样 `consumer.py` 的 ack/reject 判断逻辑非常简单：调用不抛异常就 ack，抛了就 reject 进死信，不用在 consumer 里写一堆 `except SpecificError` 分支。
+- LLM 调用特意挪到了数据库 session 外面单独做——流式请求可能要好几秒甚至更久，不能让一个数据库连接在这几秒里被占着不放。写 assistant 回复时会重新开一个新 session。
+- 越权（`ConversationForbidden`）算"预期内"的业务结果，不进死信——死信是留给消息本身有问题（格式损坏、字段缺失、代码 bug）的，越权是正常业务逻辑能处理的一种情况，只是结果是拒绝而已，所以是 ack + 推 `error` 给客户端，不是 reject。
+- assistant 消息插入时自己拼了个 `assistant-{uuid4()}` 当 `message_id`——因为 `(tenant_id, message_id)` 的唯一约束是给客户端消息去重用的，assistant 消息不是客户端发的，没有天然的 message_id，只要保证不撞车就行。
+
+**验证记录（用真实容器 + 直连 WebSocket/RabbitMQ 的脚本，覆盖了阶段一验收清单里 worker 相关的每一条）**：
+- 正常发一条消息 → gateway 收到 `ack accepted` → worker 消费、插入用户消息、调 mock-llm、逐字推 `reply_chunk`，客户端拼出来的完整回复跟 mock-llm 的模板一字不差，最后收到 `reply_end`
+- 同租户下另一个用户拿别人的 `conversation_id` 发消息 → 收到 `ack accepted`（gateway 不做归属校验）之后紧接着收到 `error code=forbidden`；跨租户复用同一个 `conversation_id` 同样被拒绝——两种越权场景都验证了
+- **停掉 mock-llm** 发消息 → openai SDK 自动重试两次后放弃，worker 捕获异常发送降级回复，文本跟需求原文一字不差（"系统有点忙，我稍后再回复你，也可以回复'转人工'"），**worker 容器全程保持 healthy，没有崩**；重新起 mock-llm 后恢复正常
+- 绕开 gateway，直接往 `inbound.messages` 投递一条非 JSON 的消息体、一条缺字段的合法 JSON——`rabbitmqctl list_queues` 确认两条都进了 `inbound.dead`（分别验证），`inbound.messages` 保持 0，worker 日志里有对应的 error 级别记录且没有崩溃
+- 绕开 gateway 的 Redis 去重，直接往队列里投两条 `message_id`完全相同的消息（模拟 RabbitMQ 至少一次投递的重复场景）→ 数据库里最终只有一行，验证了"队列至少一次投递 + 数据库唯一约束 = 业务只处理一次"这句话在真实场景下成立
+- `GET /metrics`（worker 自己的 8001 端口）显示 `worker_messages_total` 按 `ok=2/forbidden=2/llm_degraded=1/dead_letter=2/duplicate=1` 精确对上这一整轮测试做的事，`process_seconds_count=8` 等于处理的消息总数，`first_token_seconds_count=2` 只在两次真正调用成功 LLM 时被记录（降级/越权/去重/死信都不会记）
+- 验证完执行了 `docker compose down`
+
+**人工审查与修复点**：
+（留空，由 Jo 填写）
