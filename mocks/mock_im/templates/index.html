@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<title>mock-im</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 20px auto; padding: 0 16px; }
+  h1 { font-size: 18px; }
+  #conn-row { display: flex; gap: 8px; margin-bottom: 8px; }
+  #conn-row input { flex: 1; padding: 6px; }
+  #status { font-size: 13px; color: #888; margin-bottom: 12px; }
+  #status.connected { color: #2a7; }
+  #status.error { color: #c33; }
+  #log { border: 1px solid #ddd; border-radius: 6px; height: 420px; overflow-y: auto; padding: 10px; margin-bottom: 8px; }
+  .bubble { max-width: 80%; padding: 8px 12px; border-radius: 10px; margin: 6px 0; white-space: pre-wrap; word-break: break-word; }
+  .user { background: #daf0ff; margin-left: auto; text-align: right; }
+  .assistant { background: #f0f0f0; }
+  .meta { font-size: 12px; color: #999; margin: 4px 0; text-align: center; }
+  .meta.error-meta { color: #c33; }
+  #input-row { display: flex; gap: 8px; }
+  #input-row input { flex: 1; padding: 8px; }
+  button { padding: 8px 14px; cursor: pointer; }
+  button:disabled { cursor: not-allowed; opacity: 0.5; }
+</style>
+</head>
+<body>
+  <h1>mock-im（演示用网页聊天客户端）</h1>
+
+  <div id="conn-row">
+    <input id="token" placeholder="粘贴 JWT token（scripts/gen_token.py 生成）" />
+    <button id="connect-btn">连接</button>
+  </div>
+  <div id="status">未连接</div>
+
+  <div id="log"></div>
+
+  <div id="input-row">
+    <input id="content" placeholder="输入消息内容" disabled />
+    <button id="send-btn" disabled>发送</button>
+    <button id="resend-btn" disabled>重发上一条</button>
+  </div>
+
+  <script>
+    const GATEWAY_HOST_PORT = "__GATEWAY_HOST_PORT__";
+    const conversationId = crypto.randomUUID();
+
+    const $ = (id) => document.getElementById(id);
+    const statusEl = $("status");
+    const logEl = $("log");
+    const tokenEl = $("token");
+    const contentEl = $("content");
+    const connectBtn = $("connect-btn");
+    const sendBtn = $("send-btn");
+    const resendBtn = $("resend-btn");
+
+    let ws = null;
+    let lastMessage = null; // { messageId, content }
+    const bubblesByReplyTo = {};
+
+    function setStatus(text, cls) {
+      statusEl.textContent = text;
+      statusEl.className = cls || "";
+    }
+
+    function addMeta(text, isError) {
+      const div = document.createElement("div");
+      div.className = "meta" + (isError ? " error-meta" : "");
+      div.textContent = text;
+      logEl.appendChild(div);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function addUserBubble(text) {
+      const div = document.createElement("div");
+      div.className = "bubble user";
+      div.textContent = text;
+      logEl.appendChild(div);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function getOrCreateAssistantBubble(replyTo) {
+      if (bubblesByReplyTo[replyTo]) return bubblesByReplyTo[replyTo];
+      const div = document.createElement("div");
+      div.className = "bubble assistant";
+      div.textContent = "";
+      logEl.appendChild(div);
+      bubblesByReplyTo[replyTo] = div;
+      logEl.scrollTop = logEl.scrollHeight;
+      return div;
+    }
+
+    connectBtn.addEventListener("click", () => {
+      const token = tokenEl.value.trim();
+      if (!token) {
+        addMeta("请先填 token", true);
+        return;
+      }
+      const host = window.location.hostname;
+      const url = `ws://${host}:${GATEWAY_HOST_PORT}/ws?token=${encodeURIComponent(token)}`;
+      ws = new WebSocket(url);
+
+      ws.onopen = () => {
+        setStatus("已连接（conversation_id: " + conversationId + "）", "connected");
+        contentEl.disabled = false;
+        sendBtn.disabled = false;
+        connectBtn.disabled = true;
+        tokenEl.disabled = true;
+      };
+
+      ws.onclose = (ev) => {
+        setStatus("连接已关闭（code: " + ev.code + "）", "error");
+        contentEl.disabled = true;
+        sendBtn.disabled = true;
+        connectBtn.disabled = false;
+        tokenEl.disabled = false;
+      };
+
+      ws.onerror = () => {
+        addMeta("WebSocket 出错", true);
+      };
+
+      ws.onmessage = (ev) => {
+        let msg;
+        try {
+          msg = JSON.parse(ev.data);
+        } catch (e) {
+          addMeta("收到无法解析的消息: " + ev.data, true);
+          return;
+        }
+        switch (msg.type) {
+          case "ack":
+            addMeta(`ACK message_id=${msg.message_id} status=${msg.status} trace_id=${msg.trace_id}`);
+            break;
+          case "reply_chunk": {
+            const bubble = getOrCreateAssistantBubble(msg.reply_to);
+            bubble.textContent += msg.delta;
+            logEl.scrollTop = logEl.scrollHeight;
+            break;
+          }
+          case "reply_end":
+            delete bubblesByReplyTo[msg.reply_to];
+            addMeta(`回复结束 reply_to=${msg.reply_to}`);
+            break;
+          case "error":
+            addMeta(`ERROR code=${msg.code} detail=${msg.detail}`, true);
+            break;
+          default:
+            addMeta("未知消息类型: " + JSON.stringify(msg), true);
+        }
+      };
+    });
+
+    function sendMessage(content, reuseMessageId) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        addMeta("还没连接", true);
+        return;
+      }
+      const messageId = reuseMessageId || crypto.randomUUID();
+      const payload = {
+        type: "message",
+        message_id: messageId,
+        conversation_id: conversationId,
+        content: content,
+      };
+      ws.send(JSON.stringify(payload));
+      addUserBubble(content + (reuseMessageId ? "（重发，同一个 message_id）" : ""));
+      lastMessage = { messageId, content };
+      resendBtn.disabled = false;
+    }
+
+    sendBtn.addEventListener("click", () => {
+      const content = contentEl.value;
+      if (!content) return;
+      sendMessage(content);
+      contentEl.value = "";
+    });
+
+    contentEl.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") sendBtn.click();
+    });
+
+    resendBtn.addEventListener("click", () => {
+      if (!lastMessage) return;
+      sendMessage(lastMessage.content, lastMessage.messageId);
+    });
+  </script>
+</body>
+</html>

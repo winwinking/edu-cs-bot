@@ -137,3 +137,32 @@ CC 验证时未走 make migrate / make seed，实际执行因依赖尚未创建�
   - `make seed` 跑两次，两次都打印"2 个租户，6 个用户"，确认幂等
   - `docker compose ps -a` 确认 `tools` 容器跑完即被移除，不会常驻
 - 顺带确认了 `logging.py` 的按字段名脱敏（`_SENSITIVE_FIELD_RE`/`_REDACTED_FIELD`）确实还在，没有被后续改动带丢。
+
+---
+
+## 步骤 1.5：Mock 服务
+
+**日期**：2026-09-23
+
+**改动/新建模块**：
+- `mocks/mock_llm/main.py`：OpenAI 兼容的 `POST /v1/chat/completions`（支持 `stream: true` 的 SSE 和非流式），`GET /admin/config` + `POST /admin/config` 运行时改 `latency_ms`/`error_rate`/`mode`，`GET /health`。`mode` 用 `Literal["normal","hallucinate","invalid_json"]` 先占好枚举，本阶段只实现 `normal`
+- `mocks/mock_im/main.py` + `mocks/mock_im/templates/index.html`：一个纯前端的网页聊天客户端，`GET /` 把 `GATEWAY_HOST_PORT` 注入页面模板；页面 JS 直接连 gateway 的 WebSocket，不经过 mock-im 后端；带"重发上一条"按钮（复用同一个 message_id）
+- `mocks/mock_knowledge/main.py`、`mocks/mock_platform/main.py`、`mocks/mock_finance/main.py`：本阶段只有 `GET /health`
+- `docker-compose.yml`：加了 5 个 mock 服务，用 `x-mocks-build`/`x-mocks-healthcheck` 两个 YAML anchor 避免每个服务重复写同样的 build/镜像/健康检查配置
+
+**关键决策**：
+- mock 服务不依赖 `app.common`（`mocks.Dockerfile` 只拷贝 `mocks/` 目录，没拷贝 `app/`），行为配置直接读 `os.getenv`，不复用 `app.common.config.Settings`——mock 服务概念上是"假的外部系统"，跟我们自己的服务应该是完全独立可替换的，不应该和内部代码耦合。
+- mock-im 页面里的 WebSocket 连接用的是 `window.location.hostname` + 注入的 `GATEWAY_HOST_PORT`（宿主机映射端口），不是容器内部端口——因为这段 JS 是在你的浏览器里跑的，浏览器在宿主机上，不在 docker network 里，必须用宿主机能访问到的地址。
+- mock-llm 流式回复是逐字符 yield，字符间隔硬编码 30ms（纯粹为了演示打字机效果），只有"首 token 前延迟"（`latency_ms`）做成了可配置项，符合需求原文的措辞。
+- 5 个 mock 服务共用 `docker/mocks.Dockerfile`，用 `command` 区分启动哪个模块，用 YAML anchor 避免 compose 文件里 5 份几乎一样的 build/healthcheck 配置。
+
+**验证记录**：
+- `docker compose config --quiet` 通过，`docker compose config` 确认 anchor 合并结果正确（image/build/restart/healthcheck 都在）
+- `make up` 建出全部 8 个服务（3 个基础设施 + 5 个 mock），全部 `healthy`；因为 `mocks.Dockerfile` 和 `app.Dockerfile` 的 `pip install` 层内容完全一样，命中了 `tools` 镜像构建时留下的 Docker 层缓存，5 个 mock 镜像秒建
+- `curl /health` 5 个 mock 服务全部返回 `{"status":"ok"}`
+- mock-llm：非流式请求返回正确的模板回复；流式请求收到多个 `data: {...}` chunk（逐字），最后是 `finish_reason: stop` 的 chunk 加 `data: [DONE]`；`POST /admin/config` 改 `latency_ms=0` 后流式明显变快；改 `error_rate=1.0` 后请求正确返回 `500` + `mock-llm 模拟的上游错误`；改回默认值后恢复正常
+- mock-im：`curl /` 确认页面里的占位符被替换成了真实的 `GATEWAY_HOST_PORT=8000`（gateway 还没实现，完整的连接收发要等步骤 1.6/1.8 才能测）
+- 验证完执行了 `docker compose down`
+
+**人工审查与修复点**：
+（留空，由 Jo 填写）
