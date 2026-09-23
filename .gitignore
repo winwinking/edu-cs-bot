@@ -1,0 +1,16 @@
+# 环境变量文件包含真实密钥，绝不能进 git
+.env
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.coverage
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+
+*.log
