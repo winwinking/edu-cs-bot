@@ -309,4 +309,63 @@
 - 额外用 `information_schema` 确认 7 张新表和 `conversations.dissatisfied_count`/`messages.intent`/`messages.meta` 都建出来了（PHASE2.md 没要求这几条，是我自己加的确认）
 
 **人工审查与修复点**：
+【人工审查发现】agent 构建镜像时 pip 第一次报 ResolutionImpossible，重跑后成功，agent 判断为一次性网络问题。我认为根本原因可能是依赖没有锁定版本，每次构建都会重新解析版本组合，面试现场演示 make up 时可能失败，也会导致不同时间构建出的环境不一致。要求 agent 检查并锁定依赖版本，从零重新构建验证。
+
+---
+
+## 步骤 2.2：知识库导入与重建索引
+
+**日期**：2026-09-24
+
+**改动/新建模块**：
+- `app/common/embedding.py`：新建，`Embedder` 接口 + `HashEmbedding` 实现（512 维，单字+相邻两字用 md5 哈希计数后 L2 归一化），`get_embedder()` 按 `EMBEDDING_PROVIDER` 选实现
+- `app/common/knowledge_parser.py`：新建，解析 `data/knowledge/{tenant_id}/*.md` 的 front matter 和章节/条款结构，`parse_document()` 校验 front matter 的 tenant_id 和所在目录是否一致，不一致抛 `KnowledgeParseError`
+- `scripts/reindex.py`：新建，按文件内容的 sha256 哈希判断要不要重建；改了的文档在一个事务里删旧块、upsert 文档记录、写新块；扫描不到的文档连同它的块一起删掉；支持 `--force`
+- `app/common/config.py` / `.env.example`：加 `EMBEDDING_PROVIDER=hash`
+- `Makefile`：新增 `reindex` 目标；`seed` 目标改成先跑 `seed.py` 再跑 `reindex.py`（一条命令链）
+- `docker-compose.yml`：给 `tools`、`worker`、`mock-knowledge` 三个服务加了 `./data/knowledge:/app/data/knowledge:ro` 只读挂载
+
+**关键决策**：
+- `knowledge_documents` 每份文档的哈希是对整个原始文件（含 front matter）算的，不只是对正文——哪怕只改了 `version`/`updated_at` 这类元信息，也会触发重新索引，不会出现"文档信息变了但块还是旧的"这种不一致
+- 每份文档的重建放在自己独立的事务里（不是整个 `reindex.py` 跑一次事务），这样一个文档解析失败或者写入出错不会连累其他文档，符合文档"在一个事务里删掉这份文档的旧块、写入新块"的字面要求
+- 章节切块的解析器完全基于固定的 Markdown 结构做字符串处理，没有引入 Markdown 解析库——格式是我们自己定的（`##`/`###` 加固定的 front matter），没必要为此引入一个通用解析器
+- `--force` 不跳过哈希比较，但仍然按"是否已存在"正确区分 added/updated，不会把已存在的文档误标成 added
+
+**验证记录**：
+```
+$ make reindex   # 第一次
+t_a/activities: added
+...(14 个文档全部 added)
+完成：{'added': 14}
+
+$ docker compose run --rm tools python scripts/sql.py "select tenant_id, doc_id, count(*) from knowledge_chunks group by tenant_id, doc_id order by 1, 2"
+（两个租户各 7 份文档都有块，条数 5~16 不等）
+(14 行)
+
+$ make reindex   # 第二次
+完成：{'skipped': 14}
+```
+
+增量更新验证（PHASE2.md 里这一步是"Jo 手动改文件"，我用 Edit 工具往 `data/knowledge/t_a/faq.md` 末尾加了同样的 Q9 内容，效果和手动改文件保存完全一样）：
+```
+$ make reindex
+t_a/faq: updated  （其余 13 份 skipped）
+完成：{'skipped': 13, 'updated': 1}
+
+$ sql.py "select clause_no, clause_title from knowledge_chunks where tenant_id='t_a' and doc_id='faq' order by clause_no"
+...Q9 周末有课吗？   # 出现了
+(9 行)
+
+$ git checkout -- data/knowledge/t_a/faq.md
+$ make reindex
+t_a/faq: updated
+完成：{'skipped': 13, 'updated': 1}
+
+$ sql.py "...faq..."
+(8 行)   # Q9 消失，恢复成还原前的样子
+```
+
+另外用 `docker compose config` 确认了 `tools`（要加 `--profile tools` 才会显示，因为它默认不在 `up` 的范围里）、`worker`、`mock-knowledge` 三个服务都正确挂载了只读的 `data/knowledge`。
+
+**人工审查与修复点**：
 （等 Jo 验证后再补充）

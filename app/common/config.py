@@ -61,6 +61,11 @@ class Settings(BaseSettings):
     mock_llm_error_rate: float = 0.0
     mock_llm_mode: str = "normal"
 
+    # ---------- 知识库 ----------
+    # 阶段二默认用不依赖网络/模型的哈希向量（见 app/common/embedding.py），做成可切换的接口，
+    # 以后换成真实 embedding 模型只需要新增一个 EMBEDDING_PROVIDER 的实现，不用改调用方代码
+    embedding_provider: str = "hash"
+
     # ---------- 服务端口 ----------
     gateway_host_port: int = 8000
     worker_health_host_port: int = 8001

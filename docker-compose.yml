@@ -39,6 +39,8 @@ services:
     profiles: ["tools"]
     env_file:
       - .env
+    volumes:
+      - ./data/knowledge:/app/data/knowledge:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -65,6 +67,8 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    volumes:
+      - ./data/knowledge:/app/data/knowledge:ro
     ports:
       - "${WORKER_HEALTH_HOST_PORT}:8001"
     healthcheck:
@@ -153,6 +157,8 @@ services:
   mock-knowledge:
     <<: [*mocks-build, *mocks-healthcheck]
     command: ["python", "-m", "mocks.mock_knowledge.main"]
+    volumes:
+      - ./data/knowledge:/app/data/knowledge:ro
     ports:
       - "${MOCK_KNOWLEDGE_HOST_PORT}:8000"
 

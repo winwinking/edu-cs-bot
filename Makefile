@@ -1,4 +1,4 @@
-.PHONY: up down logs ps migrate seed demo test loadtest
+.PHONY: up down logs ps migrate seed reindex demo test loadtest
 
 up:
 	docker compose up -d --build
@@ -17,7 +17,10 @@ migrate:
 	docker compose run --rm tools alembic upgrade head
 
 seed:
-	docker compose run --rm tools python scripts/seed.py
+	docker compose run --rm tools sh -c "python scripts/seed.py && python scripts/reindex.py"
+
+reindex:
+	docker compose run --rm tools python scripts/reindex.py
 
 demo:
 	docker compose run --rm tools sh scripts/demo.sh
