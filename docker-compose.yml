@@ -165,6 +165,9 @@ services:
   mock-platform:
     <<: [*mocks-build, *mocks-healthcheck]
     command: ["python", "-m", "mocks.mock_platform.main"]
+    environment:
+      MOCK_PLATFORM_LATENCY_MS: ${MOCK_PLATFORM_LATENCY_MS}
+      MOCK_PLATFORM_MODE: ${MOCK_PLATFORM_MODE}
     ports:
       - "${MOCK_PLATFORM_HOST_PORT}:8000"
 

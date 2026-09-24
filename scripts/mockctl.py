@@ -4,11 +4,13 @@
   python scripts/mockctl.py llm mode=invalid_json
   python scripts/mockctl.py finance mode=timeout
   python scripts/mockctl.py platform agents_online=false
+  python scripts/mockctl.py platform show-commands
   python scripts/mockctl.py llm show
   python scripts/mockctl.py all reset
 
-finance/platform 的 /admin/config 要到阶段二 2.9/2.10 才会实现，现在调用会报错，这是预期的——
-这个工具是通用的，接口一实现就能直接用，不用等它们做完再回头改 mockctl.py。
+finance/platform 的 /admin/config 在阶段二 2.9/2.10 都已实现。`platform show-commands` 是
+platform 专属的子命令（打印 GET /admin/commands，给 Jo 验证"幂等键相同的指令只执行一次"用），
+跟其余服务通用的 show/reset/key=value 不是一回事，单独判断，不复用 _update() 那条路径。
 """
 import argparse
 import asyncio
@@ -58,8 +60,18 @@ async def _update(client: httpx.AsyncClient, service: str, updates: dict) -> Non
     print(f"[{service}] 已更新：{json.dumps(resp.json(), ensure_ascii=False)}")
 
 
+async def _platform_show_commands(client: httpx.AsyncClient) -> None:
+    resp = await client.get(f"{_base_url('platform')}/admin/commands")
+    resp.raise_for_status()
+    print(json.dumps(resp.json(), ensure_ascii=False, indent=2))
+
+
 async def main(service: str, args: list[str]) -> None:
     async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
+        if service == "platform" and args == ["show-commands"]:
+            await _platform_show_commands(client)
+            return
+
         if service == "all":
             if args != ["reset"]:
                 raise SystemExit("all 只支持 reset：python scripts/mockctl.py all reset")

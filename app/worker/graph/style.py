@@ -36,6 +36,14 @@ KNOWLEDGE_NO_HIT_REPLY = "我暂时没有查到明确依据，建议转人工确
 FINANCE_FORBIDDEN_REPLY = "这个账号的财务信息不属于你，我这边不能查询。如果需要，请本人登录后再问我。"
 FINANCE_UPSTREAM_ERROR_REPLY = "财务系统暂时查不到你的信息，这次查询我已记录，稍后回复你。"
 
+# 平台指令二次确认相关的固定话术（PHASE2.md 2.10 第 5、6 点）：具体动作是什么、确认话术怎么写
+# 由 app/worker/graph/command.py 按 action 动态拼，这两句是跟具体动作无关的通用兜底
+PLATFORM_ALREADY_PROCESSED_REPLY = "这个操作已经处理过了。"
+PLATFORM_CONFIRM_TIMEOUT_REPLY = "确认已超时，操作没有执行，需要的话重新跟我说一次。"
+# 低风险指令（打开课程表等）调用 mock-platform 失败时的兜底，跟财务查询故障话术是同一个设计：
+# 不编结果、如实告知稍后再试
+PLATFORM_LOW_RISK_ERROR_REPLY = "这个操作暂时办不了，我已经记录，你可以稍后再试。"
+
 # 知识问答 system prompt 的追加部分（PHASE2.md 2.8 第 3 点）：只根据资料回答，出处由代码加，
 # 不用 LLM 自己写——LLM 编出处这件事本来就防不住，干脆不让它写，交给 OutputGuard 逐句核对
 KNOWLEDGE_SYSTEM_ADDENDUM = (

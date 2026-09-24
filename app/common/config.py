@@ -87,6 +87,14 @@ class Settings(BaseSettings):
     mock_finance_latency_ms: int = 50
     mock_finance_mode: str = "normal"
 
+    # ---------- 平台指令与二次确认（阶段二 2.10） ----------
+    mock_platform_base_url: str = "http://mock-platform:8000"
+    platform_timeout_seconds: float = 3
+    mock_platform_latency_ms: int = 50
+    mock_platform_mode: str = "normal"
+    # 待确认操作的有效期：超过这个时间用户还没回复"确认……"，就按超时处理，不再执行
+    pending_action_ttl_seconds: int = 300
+
     # ---------- 服务端口 ----------
     gateway_host_port: int = 8000
     worker_health_host_port: int = 8001

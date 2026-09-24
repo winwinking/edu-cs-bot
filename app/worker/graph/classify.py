@@ -65,12 +65,40 @@ def _strip_punctuation(text: str) -> str:
 
 
 async def _has_active_pending_action(session: AsyncSession, tenant_id: str, conversation_id: str) -> bool:
+    """有没有一条还没过期、还没被处理的待确认——只用来判断"对/是的"这类模糊回应要不要走
+    confirm_ambiguous 的提醒话术：待确认已经执行完或过期了，"对"就该当成普通消息正常处理，
+    不该再提醒"要回复确认关闭"（都处理完了，提醒也没意义）。"""
     stmt = (
         select(PendingAction.id)
         .where(
             PendingAction.tenant_id == tenant_id,
             PendingAction.conversation_id == uuid.UUID(conversation_id),
             PendingAction.status == PendingActionStatus.pending,
+            PendingAction.expires_at > func.now(),
+        )
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    return result.first() is not None
+
+
+async def _has_recent_pending_action(session: AsyncSession, tenant_id: str, conversation_id: str) -> bool:
+    """这个会话有没有一条"还在有效期内"的待确认操作——不要求 status 还是 pending（跟上面那个
+    "未过期"版本的区别只在这一点），已经在有效期内执行完/取消的也算。用来判断"确认关闭""算了"
+    这类短句要不要路由去 confirm_action/cancel_action。
+
+    这里必须带 expires_at 这个时间窗，不能是"这个会话有没有出现过待确认操作"（不管多久以前）：
+    人审时验证过一个反例——会话里很久以前有一条已经执行完的操作，用户现在说"确认一下我的课表"，
+    这句话里也含"确认"两个字，如果不限定时间窗，会被误判成在重复确认那条早就结束的旧操作，回复
+    "这个操作已经处理过了"，这是错的，"确认"在这句话里就是"核对"的普通动词用法。限定在
+    expires_at 这个窗口内（跟 PendingAction 自己的有效期一致），能覆盖"操作刚执行完，用户手快
+    又确认了一次"（这时 expires_at 还没到，仍然要拦下来回复"已经处理过了"），又不会永久把这个
+    会话的"确认"两个字焊死成"一定是在回应旧操作"。"""
+    stmt = (
+        select(PendingAction.id)
+        .where(
+            PendingAction.tenant_id == tenant_id,
+            PendingAction.conversation_id == uuid.UUID(conversation_id),
             PendingAction.expires_at > func.now(),
         )
         .limit(1)
@@ -144,14 +172,25 @@ async def _classify_with_llm(state: GraphState) -> dict:
 
 
 async def _classify_core(state: GraphState, session: AsyncSession, content: str) -> dict:
-    # 1. 确认/取消（去掉标点后不超过 8 个字，且当前会话有未过期的待确认操作才生效）
+    # 1. 确认/取消（去掉标点后不超过 8 个字才生效，防止正常长句里碰巧带"确认""取消"被误判）
     stripped = _strip_punctuation(content)
-    if len(stripped) <= _CONFIRM_CANCEL_MAX_LEN:
-        if await _has_active_pending_action(session, state["tenant_id"], state["conversation_id"]):
-            if any(k in stripped for k in _CONFIRM_KEYWORDS):
-                return {"intent": "confirm_action", "route_source": "rule"}
-            if any(k in stripped for k in _CANCEL_KEYWORDS):
-                return {"intent": "cancel_action", "route_source": "rule"}
+    is_short = len(stripped) <= _CONFIRM_CANCEL_MAX_LEN
+    if is_short:
+        has_confirm_keyword = any(k in stripped for k in _CONFIRM_KEYWORDS)
+        has_cancel_keyword = any(k in stripped for k in _CANCEL_KEYWORDS)
+        if has_confirm_keyword or has_cancel_keyword:
+            # 含"确认"/取消词：这个会话最近（有效期内）出现过待确认操作就路由过去，不要求
+            # status 还是 pending——操作已经在有效期内执行完，也要走 confirm_action/cancel_action，
+            # 由它们自己查真实状态回复"已经处理过了"/"确认已超时"，而不是在这里因为状态不是
+            # pending 就放过，让这句话落到 LLM 分类被误判成别的意图（mock-llm 对"确认关闭"没有
+            # 任何规则命中，会被当成闲聊——这是 2.10 验证时实测发现的，见 AGENT_LOG）。用
+            # "有效期内"而不是"不管多久以前"，是为了不把这个会话的"确认"两个字永久焊死成
+            # "一定是在回应旧操作"——人审时验证过反例，见 _has_recent_pending_action 的注释
+            if await _has_recent_pending_action(session, state["tenant_id"], state["conversation_id"]):
+                return {
+                    "intent": "confirm_action" if has_confirm_keyword else "cancel_action",
+                    "route_source": "rule",
+                }
 
     # 2. 转人工关键词
     if any(k in content for k in HANDOFF_KEYWORDS):
@@ -164,7 +203,19 @@ async def _classify_core(state: GraphState, session: AsyncSession, content: str)
         return {"intent": "high_risk", "route_source": "rule", "risk_flags": ["sensitive_request"]}
 
     # 5. LLM function calling
-    return await _classify_with_llm(state)
+    result = await _classify_with_llm(state)
+
+    # 短句 + 有未过期的待确认操作 + LLM/mock-llm 也没判出任何真实意图（chitchat）——这才是
+    # "对/是的/好的"这类模糊回应的通用特征，PHASE2.md 2.10 第 6 点要求提醒回复确切的确认短语，
+    # 不能当成默认同意直接执行（误操作代价是真的执行一个高风险指令）。这个判断故意放在 LLM
+    # 分类之后、只在结果是 chitchat 时才覆盖，而不是"短句+有未过期待确认"就直接短路——人审时
+    # 验证过反例："发票多久能开"这种正常问题也是短句，如果不看 LLM 的分类结果就直接短路成
+    # confirm_ambiguous，会把一个跟确认无关的正常问题错误地拦下来
+    if is_short and result.get("intent") == "chitchat":
+        if await _has_active_pending_action(session, state["tenant_id"], state["conversation_id"]):
+            return {"intent": "confirm_ambiguous", "route_source": "rule"}
+
+    return result
 
 
 async def classify(state: GraphState, runtime) -> dict:

@@ -137,3 +137,30 @@ def test_plain_finance_question_still_routes_to_finance():
     # 回归：这句本来就没有"规则"这类排除词，不受这次改动影响
     result = match_tool_call("我上个月的发票开了吗？")
     assert result == ("query_finance", {"kind": "invoices", "period": "last_month"})
+
+
+# ---------- R3 请假识别容忍中间插词（覆盖 2.10 p2 场景发现的路由缺口） ----------
+
+
+def test_leave_request_with_quantifier_in_between_routes_to_platform():
+    # PHASE2.md 2.10 验证脚本原句："请个假"中间插了"个"字，原来只按"请假"两个连续字匹配会漏判
+    from datetime import date, timedelta
+
+    result = match_tool_call("帮我请个假，明天的数学课")
+    assert result is not None
+    assert result[0] == "platform_command"
+    assert result[1]["action"] == "submit_leave"
+    assert result[1]["date"] == (date.today() + timedelta(days=1)).isoformat()
+
+
+def test_plain_leave_request_without_quantifier_still_works():
+    result = match_tool_call("帮我请假，后天的英语课")
+    assert result is not None
+    assert result[1]["action"] == "submit_leave"
+
+
+def test_knowledge_question_about_leave_policy_not_misrouted_to_platform_command():
+    # 没有"帮我/给我/替我/请帮"这类触发词，"请假"只是在问政策，R3 的触发词前置条件先挡住了
+    result = match_tool_call("寒假班请假会退课时费吗")
+    assert result is not None
+    assert result[0] == "search_knowledge"

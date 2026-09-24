@@ -25,6 +25,8 @@ _FINANCE_EXPLICIT_QUERY_ANY = ("帮我查", "查一下", "帮我看看")
 
 # R3：触发平台指令的口语前缀
 _PLATFORM_TRIGGER_ANY = ("帮我", "给我", "替我", "请帮")
+# "请假"中间常被口语插进量词/时间词，比如"请个假""请一天假"，不能只按字面"请假"两个连续字匹配
+_LEAVE_RE = re.compile(r"请.{0,3}假")
 
 # R4：问句特征词
 _QUESTION_FEATURE_ANY = ("吗", "怎么", "多久", "能不能", "是否", "什么", "规则", "政策")
@@ -107,7 +109,7 @@ def _match_platform_command(content: str) -> Optional[tuple[str, dict]]:
             return "platform_command", {"action": "disable_auto_renew"}
         if "开" in content:
             return "platform_command", {"action": "enable_auto_renew"}
-    if "请假" in content:
+    if _LEAVE_RE.search(content):
         args: dict = {"action": "submit_leave"}
         if "明天" in content:
             args["date"] = (date.today() + timedelta(days=1)).isoformat()

@@ -13,6 +13,7 @@ from openai import APIConnectionError, APIError, APITimeoutError
 from app.common.llm_client import stream_chat_completion
 from app.common.logging import get_logger
 from app.worker.graph.classify import classify
+from app.worker.graph.command import cancel_action, command, confirm_action, confirm_ambiguous, request_confirmation
 from app.worker.graph.finance import finance
 from app.worker.graph.guard import OutputGuard
 from app.worker.graph.knowledge import knowledge
@@ -24,9 +25,9 @@ from app.worker.pubsub import publish_reply_chunk, publish_reply_end
 
 logger = get_logger(__name__)
 
-# 意图 -> 节点名。command/handoff/confirm_action/cancel_action/request_confirmation 还是占位节点
-# （见 nodes.py 的 placeholder），阶段二后续步骤逐个换成真正的业务节点；
-# knowledge 已在 2.8、finance 已在 2.9 接入真正的实现
+# 意图 -> 节点名。handoff 还是占位节点（见 nodes.py 的 placeholder），2.11 会换成真正的实现；
+# knowledge 已在 2.8、finance 已在 2.9、command/request_confirmation/confirm_action/
+# cancel_action/confirm_ambiguous 已在 2.10 接入真正的实现
 _INTENT_TO_NODE = {
     "knowledge_qa": "knowledge",
     "finance_query": "finance",
@@ -36,6 +37,7 @@ _INTENT_TO_NODE = {
     "handoff": "handoff",
     "confirm_action": "confirm_action",
     "cancel_action": "cancel_action",
+    "confirm_ambiguous": "confirm_ambiguous",
     "fallback": "fallback",
 }
 
@@ -46,6 +48,7 @@ _BUSINESS_NODES = (
     "request_confirmation",
     "confirm_action",
     "cancel_action",
+    "confirm_ambiguous",
     "reminder_stub",
     "handoff",
     "chitchat",
@@ -72,10 +75,11 @@ def _build_graph():
     graph.add_node("classify", classify)
     graph.add_node("knowledge", knowledge)
     graph.add_node("finance", finance)
-    graph.add_node("command", placeholder)
-    graph.add_node("request_confirmation", placeholder)
-    graph.add_node("confirm_action", placeholder)
-    graph.add_node("cancel_action", placeholder)
+    graph.add_node("command", command)
+    graph.add_node("request_confirmation", request_confirmation)
+    graph.add_node("confirm_action", confirm_action)
+    graph.add_node("cancel_action", cancel_action)
+    graph.add_node("confirm_ambiguous", confirm_ambiguous)
     graph.add_node("reminder_stub", reminder_stub)
     graph.add_node("handoff", placeholder)
     graph.add_node("chitchat", chitchat)
