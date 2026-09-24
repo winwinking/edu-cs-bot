@@ -24,6 +24,8 @@ _config: dict = {
     "error_rate": float(os.getenv("MOCK_LLM_ERROR_RATE", "0.0")),
     "mode": os.getenv("MOCK_LLM_MODE", "normal"),
 }
+# 启动时的快照，/admin/reset 用来把 _config 恢复到这个状态（给 mockctl.py all reset 用）
+_DEFAULT_CONFIG: dict = dict(_config)
 
 _REPLY_TEMPLATE = (
     "您好，我已经收到您的问题，正在为您查询处理，请稍等。"
@@ -68,6 +70,12 @@ async def update_config(update: AdminConfigUpdate) -> dict:
         _config["error_rate"] = update.error_rate
     if update.mode is not None:
         _config["mode"] = update.mode
+    return _config
+
+
+@app.post("/admin/reset")
+async def reset_config() -> dict:
+    _config.update(_DEFAULT_CONFIG)
     return _config
 
 

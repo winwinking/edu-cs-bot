@@ -443,4 +443,44 @@ $ docker compose run --rm tools python scripts/search_kb.py --tenant t_a --retri
 ```
 
 **人工审查与修复点**：
+【人工审查确认】MOCK_KNOWLEDGE_MIN_SCORE=0.04 作为止损值可以接受，不改 mock-knowledge 的打分方式。理由：mock_knowledge 是备用检索器，默认和 E2E 场景都走 pgvector，投入时间调优 mock 的价值低。已在 docs/phase2_threshold.md 末尾补充"已知问题"章节，写明两组分数无法完全分开的原因、当前取值偏向漏答而不是乱答、以后的改进方向（高频词黑名单、只用正文打分）。
+
+---
+
+## 步骤 2.4：命令行对话工具和 mock 控制工具
+
+**日期**：2026-09-24
+
+**改动/新建模块**：
+- `scripts/chat.py`：新建，命令行多轮对话工具——查数据库拿真实 role 签 token（和 `gen_token.py` 相同逻辑）、连 `ws://gateway:8000/ws`、打印 `[ack]`、流式回复、`[meta]`，30 秒收不到 `reply_end` 超时退出
+- `scripts/mockctl.py`：新建，统一控制 mock 服务配置，支持 `<service> key=value`、`<service> show`、`<service> reset`、`all reset`
+- `mocks/mock_llm/main.py`：加 `POST /admin/reset`，把配置恢复到进程启动时的快照，给 `mockctl.py all reset` 用
+
+**偏离 PHASE2.md 的地方（按仓库现有情况对应）**：
+- PHASE2.md 里 `--conv` 给的示例是 `c_test_1`、`f2`、`p1` 这类人类可读短标签，但阶段一的 `conversation_id` 必须是合法 UUID（worker 用 `uuid.UUID()` 解析，不合法会被当成坏消息进死信）。`chat.py` 内部用 `uuid5((tenant, user, --conv 标签))` 把标签确定性地转换成 UUID——同一个标签每次算出来的 UUID 都一样，天然支持"同一个 --conv 能连续多轮对话"，带上 tenant/user 是因为一个会话本来就只属于一个租户下的一个用户。已用真实多轮对话验证这个映射是稳定的。
+- `reply_end` 目前还没有 `meta` 字段（要等 2.7 LangGraph 编排落地才会加），`chat.py` 取不到 `meta` 时打印空对象 `{}`，这和 PHASE2.md 本步验证预期"meta 可以是空的"一致。
+
+**关键决策**：
+- `mockctl.py` 没有为每个 mock 服务单独写死一遍 base_url，而是用 `http://mock-{name}:8000` 这个 docker-compose 里固定的命名规则统一拼——四个服务的内部地址完全规律，没必要为此在 `Settings` 里加四条配置
+- `mockctl.py` 的 `all reset` 遇到 mock-finance/mock-platform 现在还没实现 `/admin/reset`（要到 2.9/2.10 才有）时会捕获异常打印"跳过"，不会让整个命令失败——这样工具现在就能用，以后那两个 mock 补上接口也不用回头改 `mockctl.py`
+- mock-llm 加 `/admin/reset` 端点，而不是让 `mockctl.py` 自己记一份"默认配置"再拼参数传回去——默认值的唯一数据源应该是 mock 服务自己启动时读的环境变量，`mockctl.py` 不应该知道每个服务的默认值具体是什么
+
+**验证记录**：
+```
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv c_test_1 "你好"
+[ack] status=accepted trace_id=59a3322e8258453bba0497200c8333d6
+您好，我已经收到您的问题，正在为您查询处理，请稍等。根据目前掌握的信息，建议您可以先查看课程详情页，或者联系人工客服获取更详细的帮助。如果还有其他问题，请随时告诉我。
+[meta] {}
+
+$ docker compose run --rm tools python scripts/mockctl.py llm show
+[llm] {"latency_ms": 300, "error_rate": 0.0, "mode": "normal"}
+
+$ docker compose run --rm tools python scripts/mockctl.py all reset
+[llm] 已重置：{"latency_ms": 300, "error_rate": 0.0, "mode": "normal"}
+[finance] 跳过（ConnectError：这个 mock 可能还没实现 /admin/reset）
+[platform] 跳过（ConnectError：这个 mock 可能还没实现 /admin/reset）
+```
+额外验证了同一个 `--conv c_test_1` 连续发两轮消息，`sql.py` 查出来 4 条消息（2 轮 user+assistant）全部挂在同一个 `conversation_id` 下，确认多轮对话延续机制正确。
+
+**人工审查与修复点**：
 （等 Jo 验证后再补充）
