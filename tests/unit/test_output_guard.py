@@ -41,3 +41,55 @@ def test_no_banned_phrase_passes_through_unchanged():
 def test_flush_on_empty_buffer_returns_nothing():
     guard = OutputGuard()
     assert guard.flush() == []
+
+
+# ---------- 出处核对 + 出处开头合并（PHASE2.md 2.8 第 4、5 点） ----------
+
+
+def test_sentence_with_allowed_citation_passes_through():
+    guard = OutputGuard(allowed_citations=[("课程服务协议", "4.2")])
+    sentences = guard.feed("寒假班请假需提前 24 小时提交。")
+    assert sentences == ["寒假班请假需提前 24 小时提交。"]
+    assert guard.dropped_sentences == 0
+
+
+def test_sentence_with_disallowed_citation_is_dropped():
+    guard = OutputGuard(allowed_citations=[("课程服务协议", "4.2")])
+    sentences = guard.feed("根据《课程服务协议》第 9.9 条，所有课程都可以随时全额退款。")
+    assert sentences == []
+    assert guard.dropped_sentences == 1
+
+
+def test_citation_without_book_title_brackets_is_not_checked():
+    # "本协议第 5.2 条"没有书名号，不是我们要核对的出处格式，不应该被误伤
+    guard = OutputGuard(allowed_citations=[("课程服务协议", "4.2")])
+    sentences = guard.feed("寒假班的退费规则见本协议第 5.2 条。")
+    assert sentences == ["寒假班的退费规则见本协议第 5.2 条。"]
+    assert guard.dropped_sentences == 0
+
+
+def test_lead_in_is_merged_with_first_successful_sentence_only():
+    guard = OutputGuard(allowed_citations=[("课程服务协议", "4.2")], lead_in="依据《课程服务协议》第 4.2 条：")
+    sentences = guard.feed(
+        "根据《课程服务协议》第 9.9 条，随时可退款。寒假班请假需提前 24 小时提交。后续内容。"
+    )
+    # 第一句因为出处不在允许范围内被丢掉，出处开头不会跟着空句子一起浪费掉，
+    # 而是跟第一句真正发出去的句子拼在一起
+    assert sentences == ["依据《课程服务协议》第 4.2 条：寒假班请假需提前 24 小时提交。", "后续内容。"]
+    assert guard.dropped_sentences == 1
+    assert guard.emitted_any is True
+
+
+def test_all_sentences_dropped_leaves_lead_in_unconsumed():
+    guard = OutputGuard(allowed_citations=[("课程服务协议", "4.2")], lead_in="依据《课程服务协议》第 4.2 条：")
+    sentences = guard.feed("根据《课程服务协议》第 9.9 条，随时可退款。")
+    assert sentences == []
+    assert guard.emitted_any is False  # respond() 靠这个字段判断要不要拼兜底话术
+
+
+def test_no_allowed_citations_means_no_citation_check():
+    # allowed_citations=None（chitchat 等非知识问答场景）不做出处核对，随便写"出处"也不会被丢
+    guard = OutputGuard()
+    sentences = guard.feed("根据《课程服务协议》第 9.9 条，随时可退款。")
+    assert sentences == ["根据《课程服务协议》第 9.9 条，随时可退款。"]
+    assert guard.dropped_sentences == 0

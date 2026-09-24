@@ -14,6 +14,7 @@ from app.common.llm_client import stream_chat_completion
 from app.common.logging import get_logger
 from app.worker.graph.classify import classify
 from app.worker.graph.guard import OutputGuard
+from app.worker.graph.knowledge import knowledge
 from app.worker.graph.nodes import chitchat, fallback, load_context, placeholder, reminder_stub, sensitive
 from app.worker.graph.state import GraphContext, GraphState
 from app.worker.graph.style import FALLBACK_LLM_UNAVAILABLE_REPLY
@@ -22,8 +23,9 @@ from app.worker.pubsub import publish_reply_chunk, publish_reply_end
 
 logger = get_logger(__name__)
 
-# 意图 -> 节点名。knowledge/finance/command/handoff/confirm_action/cancel_action/request_confirmation
-# 本步都还是占位节点（见 nodes.py 的 placeholder），阶段二后续步骤逐个换成真正的业务节点
+# 意图 -> 节点名。finance/command/handoff/confirm_action/cancel_action/request_confirmation
+# 还是占位节点（见 nodes.py 的 placeholder），阶段二后续步骤逐个换成真正的业务节点；
+# knowledge 已在 2.8 接入真正的实现
 _INTENT_TO_NODE = {
     "knowledge_qa": "knowledge",
     "finance_query": "finance",
@@ -67,7 +69,7 @@ def _build_graph():
 
     graph.add_node("load_context", load_context)
     graph.add_node("classify", classify)
-    graph.add_node("knowledge", placeholder)
+    graph.add_node("knowledge", knowledge)
     graph.add_node("finance", placeholder)
     graph.add_node("command", placeholder)
     graph.add_node("request_confirmation", placeholder)
@@ -109,7 +111,9 @@ def _build_meta(state: GraphState, guard: OutputGuard) -> dict[str, Any]:
 
 async def respond(tenant_id: str, user_id: str, reply_to: str, state: GraphState) -> tuple[str, dict[str, Any]]:
     plan = state["reply_plan"]
-    guard = OutputGuard()
+    # allowed_citations/lead_in 只有知识问答的 reply_plan 会带（2.8），其它节点不传就是 None，
+    # OutputGuard 不做出处核对、不拼出处开头，行为跟 2.7 完全一样
+    guard = OutputGuard(allowed_citations=plan.get("allowed_citations"), lead_in=plan.get("lead_in"))
     seq = 0
     chunks: list[str] = []
 
@@ -142,6 +146,13 @@ async def respond(tenant_id: str, user_id: str, reply_to: str, state: GraphState
                 await emit(fallback_guard.feed(FALLBACK_LLM_UNAVAILABLE_REPLY))
                 await emit(fallback_guard.flush())
                 guard = fallback_guard
+
+        # 知识问答专用兜底（2.8 第 5 点）：LLM 生成的句子全被出处检查拦下了（或者干脆没生成出
+        # 任何有效内容），guard 手上一句都没成功发出去——用排名第一的检索结果原文垫底，
+        # 保证"依据……"这个出处开头后面一定跟着真实存在的内容，不会孤零零地漏发
+        if plan.get("lead_in") and not guard.emitted_any and plan.get("fallback_text"):
+            await emit(guard.feed(plan["fallback_text"]))
+            await emit(guard.flush())
 
     meta = _build_meta(state, guard)
     await publish_reply_end(tenant_id, user_id, reply_to, meta)

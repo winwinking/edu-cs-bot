@@ -25,6 +25,17 @@ SENSITIVE_REPLY = "这类操作涉及账号安全，需要人工核实身份后�
 # 日程提醒本阶段只占位，阶段三实现
 REMINDER_STUB_REPLY = "提醒功能即将开放。"
 
-# knowledge/finance/command/handoff/request_confirmation/confirm_action/cancel_action
-# 这几个业务节点本步只占位，阶段二后续步骤逐个接入真正的实现
+# finance/command/handoff/request_confirmation/confirm_action/cancel_action
+# 这几个业务节点还是占位，阶段二后续步骤逐个接入真正的实现（knowledge 已在 2.8 接入）
 PLACEHOLDER_REPLY = "这项功能正在接入，暂时还不能处理，你可以稍后再试。"
+
+# 知识问答检索无命中（PHASE2.md 2.8 第 2 点）：不给 LLM 编的机会，直接回固定话术
+KNOWLEDGE_NO_HIT_REPLY = "我暂时没有查到明确依据，建议转人工确认。回复“转人工”我帮你转接。"
+
+# 知识问答 system prompt 的追加部分（PHASE2.md 2.8 第 3 点）：只根据资料回答，出处由代码加，
+# 不用 LLM 自己写——LLM 编出处这件事本来就防不住，干脆不让它写，交给 OutputGuard 逐句核对
+KNOWLEDGE_SYSTEM_ADDENDUM = (
+    "只根据下面提供的资料回答；资料里没写的内容要明确说没写，不能编造；"
+    "不要自己写出处（比如“根据《xxx》第x条”），出处会由系统自动加在回答最前面；"
+    "直接从结论开始说，不用重复用户的问题。"
+)

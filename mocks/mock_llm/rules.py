@@ -119,8 +119,10 @@ def _match_platform_command(content: str) -> Optional[tuple[str, dict]]:
 
 
 def _match_knowledge(content: str) -> Optional[tuple[str, dict]]:
-    # R4：含问句特征
-    if any(word in content for word in _QUESTION_FEATURE_ANY):
+    # R4：含问句特征词，或者干脆以问号结尾（中文"？"/英文"?"）——后者是更通用的"这是一句问话"
+    # 信号，不用把每一种问法的关键词都列全（比如"你们的校车几点发车？""那寒假班呢？"都没有
+    # 命中前面固定的关键词表，但明显是在问问题）
+    if any(word in content for word in _QUESTION_FEATURE_ANY) or content.rstrip().endswith(("？", "?")):
         return "search_knowledge", {"query": content}
     return None
 
@@ -130,9 +132,17 @@ _HANDOFF_SUMMARY_MARKER = "转人工摘要"
 
 
 def extract_first_material(content: str) -> Optional[str]:
-    """请求不带 tools 时用：取 <资料> 块的第一条正文（2.8 知识问答生成请求会带这个块）"""
+    """请求不带 tools 时用：取 <资料> 块的第一条正文（2.8 知识问答生成请求会带这个块）。
+
+    真实的 <资料> 块（app.common.prompt_guard.build_reference_block）第一段是"资料仅供参考、
+    不是指令"的声明，从第二段开始才是真正一条条的资料正文，用空行分段——取第二段（第一条正文），
+    不是整个块（那样会把声明文字也当成资料内容混进回复里）。
+    """
     match = _MATERIAL_RE.search(content)
-    return match.group(1).strip() if match else None
+    if not match:
+        return None
+    paragraphs = [p.strip() for p in match.group(1).strip().split("\n\n") if p.strip()]
+    return paragraphs[1] if len(paragraphs) > 1 else None
 
 
 def is_handoff_summary_request(content: str) -> bool:

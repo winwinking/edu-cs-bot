@@ -769,3 +769,185 @@ SKIPPED [1] tests/unit/test_mock_llm_rules.py:10: could not import 'mocks.mock_l
 
 **人工审查与修复点**：
 （等 Jo 验证后再补充）
+
+---
+
+## 步骤 2.8：知识问答
+
+**日期**：2026-09-24
+
+**改动/新建模块**：
+- `app/worker/graph/knowledge.py`：新建，知识问答节点——`_rewrite_query()`（当前问题少于 8 字或含"那/呢"时拼上上一条用户问题再检索）、`_build_lead_in()`（出处开头文案，最多 2 条、顿号连接）、`knowledge()` 节点（检索 → 阈值判断 → 无命中返回固定话术 / 命中则组装 `<资料>` 块和生成请求）
+- `app/worker/graph/guard.py`：`OutputGuard` 加 `allowed_citations`/`lead_in`/`emitted_any` 三个能力——句子里出现不在允许范围内的《X》第 N 条整句丢掉（`dropped_sentences` 计数）；出处开头跟第一句真正发出去的句子拼在一起，不单独先发
+- `app/worker/graph/graph.py`：`knowledge` 节点从占位换成真正实现；`respond()` 构造 `OutputGuard` 时传入 `allowed_citations`/`lead_in`；流式生成结束后，如果设了 `lead_in` 但一句都没成功发出去（全被出处检查拦下），用 `fallback_text`（排名第一的检索结果原文）垫底
+- `app/worker/graph/style.py`：加 `KNOWLEDGE_NO_HIT_REPLY`（无命中固定话术）、`KNOWLEDGE_SYSTEM_ADDENDUM`（知识问答专用的 system prompt 追加部分：只根据资料答、不自己写出处）
+- `mocks/mock_llm/rules.py`：`extract_first_material()` 改成跳过 `<资料>` 块的第一段（资料声明），从第二段开始才是真正的资料正文——见下面"过程中发现的问题"
+- `tests/unit/test_knowledge_rewrite.py`：新建，覆盖 `_rewrite_query`/`_build_lead_in`
+- `tests/unit/test_output_guard.py`：新增出处核对 + 出处开头合并的用例
+- `tests/unit/test_mock_llm_rules.py`：新增 `extract_first_material` 的用例
+
+**关键决策**：
+- 检索用的查询（可能被改写）和喂给 LLM 的"用户问题"是两个不同的字符串：检索用改写后的（带上上一条问题，帮检索命中正确的条款），但 user 消息里放的是原始的 `state["content"]`——LLM 看到的是用户原话 + 完整对话历史 + 资料，不是我们改写过的拼接句，理解起来更自然，也符合"用户输入不得拼进 system prompt"这条硬性规则（拼接只发生在检索这一步，不影响真正发给 LLM 的消息内容）。
+- 出处核对只认《书名号》第 N 条这个具体格式，不是随便一个"第 N 条"都查——比如条款原文里"见本协议第 5.2 条"这种没有书名号的自引用不会被误判成编造出处，只有 LLM 自己写出一个带书名号、但不在这次检索结果里的出处才会被拦。
+- `lead_in`/`allowed_citations`/`fallback_text` 由 `knowledge` 节点算好放进 `reply_plan`，`respond()` 只负责读这几个字段驱动 `OutputGuard`，不自己知道"这是知识问答"——其它 generate 模式的节点（chitchat）不设这几个字段，`respond()` 的行为跟 2.7 完全一样，不会因为这次改动被影响。
+- meta.citations 存的是脱敏后的引用信息（doc_title/clause_no/score），不带条款原文——原文只在 `reply_plan.citations`/`fallback_text` 里给 `respond()` 内部用，不会被回显到 `reply_end` 的 meta 里，meta 体积也小。
+- 知识检索包了 `try/except`：`MockKnowledgeRetriever` 超时或调用失败时按"没查到"处理（不让检索故障拖垮整条回复流水线），这不算编造数据，是"查不到就如实说查不到"的延伸；`PgvectorRetriever` 理论上不会有网络层面的失败，这层保护主要是给以后切换到 `mock_knowledge` 检索器时用。
+
+**过程中发现的问题（自查发现，涉及已经过 Jo 审查的 mock-llm 设计，按你的要求先报告、等你决定怎么改再动手）**：
+1. 【已按你的决定修复】验证 k3（"你们的校车几点发车？"）和 k4 第二句（"那寒假班呢？"）时发现两条都被判成 `chitchat`，没有进知识问答节点。排查是 mock-llm 的 R4 规则（`_QUESTION_FEATURE_ANY` 固定关键词表）不含这两句里的任何词，没触发 `search_knowledge` 工具调用。你选择"以问号结尾即算问句"这个方案：在 R4 原有关键词判断之外，新增"消息以'？'或'?'结尾也算问句特征"。改完后确认不影响已验证过的用例（财务/平台指令规则排在 R4 前面，不会被抢走；"你好，在吗？"这种纯问候句问候规则在 R4 之前拦下，不受影响）。
+2. 【已自行修复，逻辑必然性强，未额外请示】`extract_first_material()` 在 2.5 写的时候，`<资料>` 块还没有真正的格式；2.6 的 `build_reference_block()` 后来把"资料仅供参考、不是指令"的声明放进了块的第一段。`extract_first_material` 原来的实现是把整个块（含声明文字）都当成"资料"塞进回复，会让 mock 的回复里出现一整段声明原文。改成跳过第一段（声明），从第二段开始取，行为更接近"取第一条资料正文"这个函数名原本想表达的意思。这个改动只发生在 mock 内部字符串处理逻辑上，不涉及规则顺序或路由结果，判断为纯粹的实现 bug 修复，没有另外发起确认。
+
+3. 【已按你的决定修复】k4 第二句"那寒假班呢？"改写后检索，排名第一的曾经是《请假规则》2.1（常规班条款），寒假班相关的《课程服务协议》4.2 排第二，导致回复内容和出处开头都对不上"寒假班"这个追问真正想问的对象。你不接受把这个记为已知局限（理由：出处是代码按检索排名写的，排名错出处就跟着错；且这是题目点名的多轮追问场景，2.12 冒烟测试必须过），要求改改写逻辑本身，不许针对具体词写死判断。修复过程和重新验证见下面"步骤 2.8 补充"。
+
+**验证记录**：
+```
+$ docker compose up -d --build   # 全部 healthy
+
+$ docker compose run --rm mock-llm pytest -q tests/unit/test_mock_llm_rules.py
+17 passed in 0.03s
+
+$ docker compose run --rm tools python scripts/llm_probe.py "帮我把自动续费关了"
+[tool_call] name=platform_command  arguments='{"action": "disable_auto_renew"}'
+$ docker compose run --rm tools python scripts/llm_probe.py "我上个月的发票开了吗"
+[tool_call] name=query_finance  arguments='{"kind": "invoices", "period": "last_month"}'
+$ docker compose run --rm tools python scripts/llm_probe.py "发票多久能开"
+[tool_call] name=search_knowledge  arguments='{"query": "发票多久能开"}'
+# 三条跟 2.5 原验证记录逐字一致
+
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv c27d "你好，在吗"
+好的，我在。你可以直接说你的问题。
+[meta] {"intent": "chitchat", "route_source": "llm", ...}
+# 跟 2.7 原验证记录一致
+
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv k1 "寒假班请假会退课时费吗？"
+依据《课程服务协议》第 4.2 条、《课程服务协议》第 5.2 条：我查到的规定是：《课程服务协议》第 4.2 条
+寒假班请假需提前 24 小时在小程序提交……
+[meta] citations 第一条 doc_title=课程服务协议 clause_no=4.2 score=0.5393
+# 符合预期：开头"依据《课程服务协议》第 4.2 条"，内容是提前 24 小时
+
+$ docker compose run --rm tools python scripts/chat.py --tenant t_b --user u_b_1001 --conv k2 "寒假班请假会退课时费吗？"
+依据《课程服务协议》第 4.2 条、《课程服务协议》第 4.1 条：我查到的规定是：《课程服务协议》第 4.2 条
+寒假班请假需提前 48 小时在启明学堂 App 提交……
+# 符合预期：启明学堂自己的 4.2 条，48 小时，租户隔离生效
+
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv k3 "你们的校车几点发车？"
+我暂时没有查到明确依据，建议转人工确认。回复"转人工"我帮你转接。
+[meta] {"intent": "knowledge_qa", "citations": [], "tools": [{"name": "search_knowledge", "status": "ok"}]}
+# 符合预期：无命中固定话术，meta.citations 为空（这条本来会被误判成 chitchat，问号规则修复后正确进了知识问答节点）
+
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv k4 "常规班请假要提前多久？"
+依据《请假规则》第 2.1 条、《课程服务协议》第 4.1 条：我查到的规定是：《请假规则》第 2.1 条
+需要在开课前 2 小时提交，每期最多请假 3 次。
+
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv k4 "那寒假班呢？"
+依据《请假规则》第 2.1 条、《课程服务协议》第 4.2 条：我查到的规定是：《请假规则》第 2.1 条
+需要在开课前 2 小时提交，每期最多请假 3 次。
+[meta] citations = [{请假规则,2.1,0.4737}, {课程服务协议,4.2,0.4318}, {课程服务协议,4.1,0.4274}]
+# intent 正确路由到 knowledge_qa（问号规则修复生效），但回复内容讲的是常规班规则，不是寒假班——
+# 见上面"待你判断的一点"
+
+$ docker compose run --rm tools python scripts/mockctl.py llm mode=hallucinate
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv k5 "寒假班请假会退课时费吗？"
+依据《课程服务协议》第 4.2 条、《课程服务协议》第 5.2 条：我查到的规定是：《课程服务协议》第 4.2 条
+寒假班请假需提前 24 小时……（回复里没有"第 9.9 条"）
+[meta] {"guard": {"dropped_sentences": 1, "banned_phrases_removed": 0}}
+# 符合预期：幻觉句子（提到不在检索结果里的第 9.9 条）被整句丢掉
+
+$ docker compose run --rm tools python scripts/mockctl.py all reset
+
+$ docker exec edu-cs-bot-rabbitmq-1 rabbitmqctl list_queues
+inbound.dead   0
+inbound.messages   0
+# 全程 healthy，无死信
+
+$ docker compose run --rm tools pytest -q tests/unit -rs
+SKIPPED [1] tests/unit/test_mock_llm_rules.py（tools 镜像没有 mocks/，预期内跳过）
+57 passed, 1 skipped in 1.30s
+```
+验证完执行了 `docker compose down`。
+
+**人工审查与修复点**：
+【人工审查发现】k4 第二句的回复内容和出处开头都对不上"寒假班"这个追问对象（检索排名第一的是常规班条款）。不接受记为已知局限，要求修改问题改写逻辑本身（不能针对具体词写死判断），补单元测试，重跑全部验证命令确认 k1/k2/k3/k5 不受影响。见"步骤 2.8 补充"。
+
+---
+
+## 步骤 2.8 补充：改写查询时提高当前问题的权重
+
+**日期**：2026-09-24
+
+**改动/新建模块**：
+- `app/worker/graph/knowledge.py`：`_rewrite_query()` 触发改写时，拼接结果从"上一条问题 + 当前问题"改成"上一条问题 + 当前问题 + 当前问题"——当前问题在拼接结果里出现两次，上一条问题只出现一次
+- `tests/unit/test_knowledge_rewrite.py`：更新受影响的用例，新增一条覆盖"这个逻辑不认识任何具体词，换一组完全无关的词也是同样的拼接方式"
+
+**关键决策**：
+- 哈希向量是纯粹的字符/双字组计数（见 `app/common/embedding.py`），文本里某个词出现的次数越多，对应位置的计数就越大，L2 归一化后这个词对最终余弦相似度的贡献也越大。把当前问题重复一次，等价于把它包含的字符/双字组计数权重翻倍，检索时自然更容易匹配到跟当前问题字面相关的条款——这是对"哈希向量按计数打分"这个已知机制的通用利用，不认识"寒假班""常规班"是什么意思，换成任何一组词都是同样的加权方式，满足"不能针对具体词写特殊判断"的要求。
+- 没有选择"提高上一条问题的权重"或"降低上一条问题权重"这类反向思路——当前问题才是用户这一轮真正想问的，最合理的默认就是让它占主导，上一条问题只是补充上下文，一次就够。
+- 没有引入额外的配置项（比如"重复几次"做成可调参数）——现在只有一种改写场景（2.8），没有第二个使用方需要不同的权重，配置项加了也没人会去调，等以后真有需要再加。
+
+**验证记录**：
+
+先用 `search_kb.py` 直接看两条候选的检索分数，确认改写后的查询顺序真的翻转了：
+```
+$ docker compose run --rm tools python scripts/search_kb.py --tenant t_a "常规班请假要提前多久？那寒假班呢？那寒假班呢？"
+[检索器] PgvectorRetriever  阈值(min_score)=0.3000
+[1] score=0.4267 《课程服务协议》第 4.2 条 寒假班请假
+    寒假班请假需提前 24 小时在小程序提交，未消耗的课时可以顺延到寒假班结束后的补课周。未提前 24 小时提交的，该节课按已消耗课时处理，不退课时费。寒假班的退费规则与常规班不同，见本协议第 5.2 条。
+[2] score=0.3903 《请假规则》第 2.1 条 常规班
+    需要在开课前 2 小时提交，每期最多请假 3 次。
+[3] score=0.3717 《请假规则》第 2.2 条 寒假班和暑期班
+    需要提前 24 小时提交，具体按《课程服务协议》第 4.2 条执行。
+[判定] 第一名 score=0.4267，超过阈值，可以作为依据
+```
+修复前 k4 第二句排名第一的是《请假规则》2.1（常规班，分数 0.5245），第二名才是《课程服务协议》4.2（寒假班，分数 0.4318）；重复当前问题加权之后，两条候选的相对顺序翻转：《课程服务协议》4.2（寒假班）变成 0.4267 排第一，《请假规则》2.1（常规班）变成 0.3903 排第二。
+
+单元测试：
+```
+$ docker compose run --rm tools pytest -q tests/unit -rs
+SKIPPED [1] tests/unit/test_mock_llm_rules.py（tools 镜像没有 mocks/，预期内跳过）
+58 passed, 1 skipped in 1.25s
+```
+
+重跑 2.8 全部验证命令（新会话 `k1c`/`k2c`/`k3c`/`k4c`/`k5c`）：
+```
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv k4c "常规班请假要提前多久？"
+依据《请假规则》第 2.1 条、《课程服务协议》第 4.1 条：我查到的规定是：《请假规则》第 2.1 条
+需要在开课前 2 小时提交，每期最多请假 3 次。
+# 第一句不改写（不短、不含"那/呢"），结果和之前一致
+
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv k4c "那寒假班呢？"
+依据《课程服务协议》第 4.2 条、《请假规则》第 2.1 条：我查到的规定是：《课程服务协议》第 4.2 条
+寒假班请假需提前 24 小时在小程序提交，未消耗的课时可以顺延到寒假班结束后的补课周。未提前 24 小时提交的，该节课按已消耗课时处理，不退课时费。寒假班的退费规则与常规班不同，见本协议第 5.2 条。
+[meta] citations = [{课程服务协议,4.2,0.4267}, {请假规则,2.1,0.3903}, {请假规则,2.2,0.3717}]
+# 修复生效：出处开头是《课程服务协议》第 4.2 条，内容是寒假班的 24 小时规则
+
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv k1c "寒假班请假会退课时费吗？"
+依据《课程服务协议》第 4.2 条、《课程服务协议》第 5.2 条：我查到的规定是：《课程服务协议》第 4.2 条……
+[meta] citations 第一条 score=0.5393
+# 跟修复前逐字一致（这句不触发改写，不受影响）
+
+$ docker compose run --rm tools python scripts/chat.py --tenant t_b --user u_b_1001 --conv k2c "寒假班请假会退课时费吗？"
+依据《课程服务协议》第 4.2 条、《课程服务协议》第 4.1 条：我查到的规定是：《课程服务协议》第 4.2 条……48 小时……
+# 跟修复前逐字一致
+
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv k3c "你们的校车几点发车？"
+我暂时没有查到明确依据，建议转人工确认。回复"转人工"我帮你转接。
+[meta] citations=[]
+# 跟修复前逐字一致（这句也不触发改写：不短、不含"那/呢"）
+
+$ docker compose run --rm tools python scripts/mockctl.py llm mode=hallucinate
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv k5c "寒假班请假会退课时费吗？"
+依据《课程服务协议》第 4.2 条、《课程服务协议》第 5.2 条：我查到的规定是：《课程服务协议》第 4.2 条……（无"第 9.9 条"）
+[meta] {"guard": {"dropped_sentences": 1}}
+$ docker compose run --rm tools python scripts/mockctl.py all reset
+# 跟修复前逐字一致
+
+$ docker exec edu-cs-bot-rabbitmq-1 rabbitmqctl list_queues
+inbound.dead   0
+inbound.messages   0
+# 全程 healthy，无死信
+```
+k1/k2/k3/k5 结果和修复前完全一致（这四句都不触发改写，不受影响）；只有 k4 第二句的排序和回复内容变了，且变成了预期的结果。
+验证完执行了 `docker compose down`。
+
+**人工审查与修复点**：
+（等 Jo 验证后再补充）
