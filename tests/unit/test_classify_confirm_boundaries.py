@@ -22,16 +22,25 @@ class _FakeResult:
     def first(self):
         return self._row
 
+    def scalar_one(self):
+        # 只有 _bump_dissatisfied_count 的 UPDATE ... RETURNING 会走到这里，这几个测试场景都
+        # 不含不满意关键词，固定返回 0（清零后的计数），不影响待确认相关的路由判断
+        return 0
+
 
 class _FakeSession:
     """execute() 对任何 select 语句都返回同一个"有没有查到行"的结果——每个测试场景里
-    classify 实际只会走到一种待确认查询，不需要按语句内容区分返回值。"""
+    classify 实际只会走到一种待确认查询，不需要按语句内容区分返回值。commit() 是
+    _bump_dissatisfied_count 每条消息都会调用的无关副作用，这里只需要接受调用、什么都不做。"""
 
     def __init__(self, has_row: bool):
         self._row = ("fake-pending-action-id",) if has_row else None
 
     async def execute(self, stmt):
         return _FakeResult(self._row)
+
+    async def commit(self):
+        pass
 
 
 def _fake_chitchat_response() -> SimpleNamespace:

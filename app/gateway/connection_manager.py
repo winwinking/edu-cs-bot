@@ -52,14 +52,29 @@ class ConnectionManager:
                     task.cancel()
 
     async def _listen(self, key: ConnectionKey) -> None:
+        """cancel() 只是发起取消，不保证任务立刻停止——_listen() 可能正卡在 pubsub.listen()
+        内部某次已经收到但还没处理完的消息上。如果这时正好有新连接冒出来（同一个用户快速断线
+        重连很常见），新连接会看到"当前 0 个连接"从而新建第二个监听任务；旧任务这时还没来得及
+        退订，会和新任务同时订阅同一个频道，导致同一条消息被推给客户端两次（这是 2.12 写冒烟
+        测试连续快速重连同一个用户时复现出来的竞态）。
+
+        这里不去同步等旧任务退订完成（那样得在拿着 self._lock 的时候 await，一旦 unsubscribe
+        卡住会把这把全局锁焊死，后续所有连接都会跟着永久挂起——已经试过这个方案，会导致死锁）。
+        改成每次转发前自己检查一下"当前登记在 _listener_tasks[key] 下的是不是还是我自己"：
+        一旦被换下场（新任务已经顶替了这个 key），旧任务立刻停止转发并退出，不需要等 cancel()
+        真正生效，也不会有两个任务同时转发的窗口。
+        """
         tenant_id, user_id = key
         name = channel_name(tenant_id, user_id)
+        this_task = asyncio.current_task()
         pubsub = redis_client.pubsub()
         await pubsub.subscribe(name)
         try:
             async for message in pubsub.listen():
                 if message["type"] != "message":
                     continue
+                if self._listener_tasks.get(key) is not this_task:
+                    break
                 data = message["data"]
                 # 发送给这个用户当前所有本地连接；某个连接发送失败不影响其他连接，
                 # 失败的连接会在自己的 receive 循环里触发 WebSocketDisconnect 并被清理

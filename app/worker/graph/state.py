@@ -36,6 +36,9 @@ class GraphState(TypedDict, total=False):
 
     pending_action_id: Optional[str]
     handoff_ticket_id: Optional[str]
+    # handoff 节点写 handoff_tickets.trigger 用：keyword（转人工关键词）/ dissatisfied（不满意计数
+    # 到阈值）/ llm（LLM 选了 transfer_to_human 工具），由 classify 按命中的分支设置
+    handoff_trigger: Optional[str]
 
 
 @dataclass

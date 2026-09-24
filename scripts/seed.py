@@ -7,8 +7,8 @@ from app.common.db import AsyncSessionLocal
 from app.common.models import GuardianLink, Tenant, User, UserRole
 
 TENANTS = [
-    {"id": "t_a", "name": "星辰教育"},
-    {"id": "t_b", "name": "启明学堂"},
+    {"id": "t_a", "name": "星辰教育", "service_hours": "9:00 至 21:00"},
+    {"id": "t_b", "name": "启明学堂", "service_hours": "8:30 至 20:30"},
 ]
 
 USERS = [

@@ -8,11 +8,14 @@
 import re
 
 _EMAIL_RE = re.compile(r"([\w.+-])[\w.+-]*(@[\w-]+\.[\w.-]+)")
-_PHONE_RE = re.compile(r"\b(1[3-9]\d)\d{4}(\d{4})\b")
+# 边界用 (?<!\d)/(?!\d)（"前后不是数字"）而不是 \b：Python 的 \b 按 Unicode 词字符判断，
+# 中文字符也算词字符，"手机号是13812345678"里"是"和"1"之间没有单词边界，\b 会导致贴着中文
+# 写的号码完全匹配不上、逃过脱敏——这是写 2.11 摘要脱敏测试时发现的真实 bug，不是本来就该这样
+_PHONE_RE = re.compile(r"(?<!\d)(1[3-9]\d)\d{4}(\d{4})(?!\d)")
 # 中国大陆身份证号固定 18 位：前 3 位 + 中间 11 位 + 后 4 位（最后一位可能是 X）
-_ID_CARD_RE = re.compile(r"\b(\d{3})\d{11}([\dXx]{4})\b")
+_ID_CARD_RE = re.compile(r"(?<!\d)(\d{3})\d{11}([\dXx]{4})(?!\d)")
 # 银行卡号长度不固定（12~19 位常见），只取后 4 位——前面全部丢弃，不像身份证/手机号那样保留前缀
-_BANK_CARD_RE = re.compile(r"\b\d{8,15}(\d{4})\b")
+_BANK_CARD_RE = re.compile(r"(?<!\d)\d{8,15}(\d{4})(?!\d)")
 
 
 def mask_email(email: str) -> str:

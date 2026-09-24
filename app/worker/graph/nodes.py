@@ -1,8 +1,8 @@
 """图节点（PHASE2.md 2.7 第 2、6 点）。
 
-本步只把 chitchat、sensitive、fallback、reminder_stub 做成真正的行为；knowledge、finance、
-command、handoff、request_confirmation、confirm_action、cancel_action 先统一用 `placeholder`
-产出占位回复，阶段二后续步骤（2.8~2.11）逐个替换成真正的实现，不提前实现还没到的业务节点。
+chitchat、sensitive、fallback、reminder_stub（阶段三前只占位）在这里；knowledge/finance/
+command/confirm_action 等业务节点都在各自的步骤（2.8~2.11）实现后放进了各自的模块文件
+（knowledge.py/finance.py/command.py/handoff.py），不集中在这一个文件里。
 """
 from sqlalchemy import select
 
@@ -11,7 +11,6 @@ from app.worker.graph.state import GraphState
 from app.worker.graph.style import (
     FALLBACK_INVALID_OUTPUT_REPLY,
     FALLBACK_LLM_UNAVAILABLE_REPLY,
-    PLACEHOLDER_REPLY,
     REMINDER_STUB_REPLY,
     SENSITIVE_REPLY,
     STYLE_SYSTEM_PROMPT,
@@ -54,7 +53,3 @@ async def fallback(state: GraphState, runtime) -> dict:
 
 async def reminder_stub(state: GraphState, runtime) -> dict:
     return {"reply_plan": {"mode": "template", "text": REMINDER_STUB_REPLY}}
-
-
-async def placeholder(state: GraphState, runtime) -> dict:
-    return {"reply_plan": {"mode": "template", "text": PLACEHOLDER_REPLY}}

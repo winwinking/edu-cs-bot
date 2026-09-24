@@ -15,12 +15,12 @@ import re
 import uuid
 
 from openai import APIConnectionError, APIError, APITimeoutError
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.llm_client import chat_completion
 from app.common.logging import get_logger
-from app.common.models import PendingAction, PendingActionStatus
+from app.common.models import Conversation, PendingAction, PendingActionStatus
 from app.common.prompt_guard import detect_prompt_injection
 from app.common.tools import ParsedToolCall, ToolCallError, parse_tool_call, to_openai_tools
 from app.worker.graph.state import GraphState
@@ -33,6 +33,9 @@ HANDOFF_KEYWORDS = ("转人工", "人工客服", "找人工", "真人")
 
 # 敏感操作关键词（PHASE2.md 2 高风险清单说明的例子）
 SENSITIVE_KEYWORDS = ("注销账号", "改密码", "修改密码", "换绑手机", "解绑手机", "改银行卡", "更换银行卡")
+
+# 不满意关键词（PHASE2.md 2.11 第 1 点给的例子，"等" 意味着不是穷举，后续按实际客服日志再补）
+DISSATISFIED_KEYWORDS = ("没用", "不对", "答非所问", "听不懂", "不满意")
 
 # 确认/取消短句关键词（PHASE2.md 2.10）
 _CONFIRM_KEYWORDS = ("确认",)
@@ -48,6 +51,8 @@ _TOOL_NAME_TO_INTENT = {
     "manage_reminder": "reminder",
     "transfer_to_human": "handoff",
 }
+
+_DISSATISFIED_THRESHOLD = 2
 
 # worker 自己的关键词兜底规则（LLM 挂了时用），跟 mock-llm 里那套只用来测 mock 的规则是两回事：
 # 这套在真接 DeepSeek 时也会用到，覆盖不到具体参数，只负责把意图先判出来，让业务节点先给用户一个
@@ -105,6 +110,25 @@ async def _has_recent_pending_action(session: AsyncSession, tenant_id: str, conv
     )
     result = await session.execute(stmt)
     return result.first() is not None
+
+
+async def _bump_dissatisfied_count(
+    session: AsyncSession, tenant_id: str, conversation_id: str, *, hit: bool
+) -> int:
+    """命中不满意关键词就 +1，其余消息清零（PHASE2.md 2.11 第 1 点）。用一条 UPDATE ... RETURNING
+    做完"改值 + 拿到改完之后的值"，不用先 SELECT 再 UPDATE——这里没有确认执行那种"抢占"语义，
+    单个会话基本不会有并发写，犯不上再上一把锁，跟 confirm_action 的原子抢占不是一回事。"""
+    new_value = Conversation.dissatisfied_count + 1 if hit else 0
+    stmt = (
+        update(Conversation)
+        .where(Conversation.tenant_id == tenant_id, Conversation.id == uuid.UUID(conversation_id))
+        .values(dissatisfied_count=new_value)
+        .returning(Conversation.dissatisfied_count)
+    )
+    result = await session.execute(stmt)
+    count = result.scalar_one()
+    await session.commit()
+    return count
 
 
 def _keyword_fallback_classify(content: str) -> dict:
@@ -165,10 +189,17 @@ async def _classify_with_llm(state: GraphState) -> dict:
         }
 
     intent = _TOOL_NAME_TO_INTENT.get(parsed.name, "fallback")
-    update: dict = {"intent": intent, "route_source": "llm", "tool_call": {"name": parsed.name, "args": parsed.args.model_dump(mode="json")}, "tools_meta": tools_meta}
+    update_fields: dict = {
+        "intent": intent,
+        "route_source": "llm",
+        "tool_call": {"name": parsed.name, "args": parsed.args.model_dump(mode="json")},
+        "tools_meta": tools_meta,
+    }
     if parsed.is_high_risk:
-        update["intent"] = "high_risk"
-    return update
+        update_fields["intent"] = "high_risk"
+    if parsed.name == "transfer_to_human":
+        update_fields["handoff_trigger"] = "llm"
+    return update_fields
 
 
 async def _classify_core(state: GraphState, session: AsyncSession, content: str) -> dict:
@@ -194,9 +225,23 @@ async def _classify_core(state: GraphState, session: AsyncSession, content: str)
 
     # 2. 转人工关键词
     if any(k in content for k in HANDOFF_KEYWORDS):
-        return {"intent": "handoff", "route_source": "rule"}
+        return {"intent": "handoff", "route_source": "rule", "handoff_trigger": "keyword"}
 
-    # 3. 不满意计数：阶段二 2.11 实现，这里先跳过
+    # 3. 不满意关键词计数（PHASE2.md 2.11 第 1 点）：命中就 +1，其它消息清零，累计到 2 次
+    # 触发转人工并清零。放在转人工关键词之后——直接说"转人工"不算"不满意"，不参与这里的计数；
+    # 这一步之前的两条分支（确认/取消、转人工关键词）命中时会直接 return，不会走到这里，
+    # 所以这两类消息不会把计数器清零，只有"看起来是不满意，但也不是在确认/取消/直接要转人工"
+    # 的消息才会真正触发这条计数逻辑——这是当前实现的范围，之后如果要覆盖到全部消息类型再调整
+    dissatisfied_hit = any(k in content for k in DISSATISFIED_KEYWORDS)
+    count = await _bump_dissatisfied_count(
+        session, state["tenant_id"], state["conversation_id"], hit=dissatisfied_hit
+    )
+    if dissatisfied_hit:
+        if count >= _DISSATISFIED_THRESHOLD:
+            # 累计到阈值：触发转人工的同时清零，不然这条会话以后每一次不满意都会立刻转人工
+            await _bump_dissatisfied_count(session, state["tenant_id"], state["conversation_id"], hit=False)
+            return {"intent": "handoff", "route_source": "rule", "handoff_trigger": "dissatisfied"}
+        return {"intent": "dissatisfied_first", "route_source": "rule"}
 
     # 4. 敏感操作关键词
     if any(k in content for k in SENSITIVE_KEYWORDS):

@@ -25,12 +25,12 @@ SENSITIVE_REPLY = "这类操作涉及账号安全，需要人工核实身份后�
 # 日程提醒本阶段只占位，阶段三实现
 REMINDER_STUB_REPLY = "提醒功能即将开放。"
 
-# finance/command/handoff/request_confirmation/confirm_action/cancel_action
-# 这几个业务节点还是占位，阶段二后续步骤逐个接入真正的实现（knowledge 已在 2.8 接入）
-PLACEHOLDER_REPLY = "这项功能正在接入，暂时还不能处理，你可以稍后再试。"
-
 # 知识问答检索无命中（PHASE2.md 2.8 第 2 点）：不给 LLM 编的机会，直接回固定话术
 KNOWLEDGE_NO_HIT_REPLY = "我暂时没有查到明确依据，建议转人工确认。回复“转人工”我帮你转接。"
+
+# 不满意关键词第 1 次命中的道歉引导（PHASE2.md 2.11 第 1 点），第 2 次命中直接触发转人工，
+# 不会再回这句话
+DISSATISFIED_FIRST_REPLY = "抱歉刚才没帮上。你可以说一下具体哪里不对，或者回复“转人工”。"
 
 # 财务查询越权 / 故障固定话术（PHASE2.md 2.9 第 5 点），金额/订单号只来自接口返回值，不进这两句
 FINANCE_FORBIDDEN_REPLY = "这个账号的财务信息不属于你，我这边不能查询。如果需要，请本人登录后再问我。"

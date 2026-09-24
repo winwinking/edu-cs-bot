@@ -48,6 +48,9 @@ class Tenant(Base):
     # 租户 id 用业务可读的字符串（如 t_a），不用自增数字，方便手工测试和日志排查
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # 转人工"坐席不在线"话术里展示的服务时间（阶段二 2.11），只是展示文案，不参与
+    # 在线/不在线的判断——那个判断完全来自 mock-platform 的 /agents/status
+    service_hours: Mapped[str] = mapped_column(String(32), nullable=False)
 
 
 class User(Base):

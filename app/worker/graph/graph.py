@@ -16,8 +16,9 @@ from app.worker.graph.classify import classify
 from app.worker.graph.command import cancel_action, command, confirm_action, confirm_ambiguous, request_confirmation
 from app.worker.graph.finance import finance
 from app.worker.graph.guard import OutputGuard
+from app.worker.graph.handoff import dissatisfied_first, handoff
 from app.worker.graph.knowledge import knowledge
-from app.worker.graph.nodes import chitchat, fallback, load_context, placeholder, reminder_stub, sensitive
+from app.worker.graph.nodes import chitchat, fallback, load_context, reminder_stub, sensitive
 from app.worker.graph.state import GraphContext, GraphState
 from app.worker.graph.style import FALLBACK_LLM_UNAVAILABLE_REPLY
 from app.worker.metrics import first_token_seconds
@@ -25,9 +26,9 @@ from app.worker.pubsub import publish_reply_chunk, publish_reply_end
 
 logger = get_logger(__name__)
 
-# 意图 -> 节点名。handoff 还是占位节点（见 nodes.py 的 placeholder），2.11 会换成真正的实现；
-# knowledge 已在 2.8、finance 已在 2.9、command/request_confirmation/confirm_action/
-# cancel_action/confirm_ambiguous 已在 2.10 接入真正的实现
+# 意图 -> 节点名。knowledge 已在 2.8、finance 已在 2.9、command/request_confirmation/
+# confirm_action/cancel_action/confirm_ambiguous 已在 2.10、handoff/dissatisfied_first
+# 已在 2.11 接入真正的实现，所有业务节点到本步全部落地
 _INTENT_TO_NODE = {
     "knowledge_qa": "knowledge",
     "finance_query": "finance",
@@ -35,6 +36,7 @@ _INTENT_TO_NODE = {
     "reminder": "reminder_stub",
     "chitchat": "chitchat",
     "handoff": "handoff",
+    "dissatisfied_first": "dissatisfied_first",
     "confirm_action": "confirm_action",
     "cancel_action": "cancel_action",
     "confirm_ambiguous": "confirm_ambiguous",
@@ -51,6 +53,7 @@ _BUSINESS_NODES = (
     "confirm_ambiguous",
     "reminder_stub",
     "handoff",
+    "dissatisfied_first",
     "chitchat",
     "sensitive",
     "fallback",
@@ -81,7 +84,8 @@ def _build_graph():
     graph.add_node("cancel_action", cancel_action)
     graph.add_node("confirm_ambiguous", confirm_ambiguous)
     graph.add_node("reminder_stub", reminder_stub)
-    graph.add_node("handoff", placeholder)
+    graph.add_node("handoff", handoff)
+    graph.add_node("dissatisfied_first", dissatisfied_first)
     graph.add_node("chitchat", chitchat)
     graph.add_node("sensitive", sensitive)
     graph.add_node("fallback", fallback)
