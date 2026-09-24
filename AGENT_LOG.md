@@ -368,4 +368,79 @@ $ sql.py "...faq..."
 另外用 `docker compose config` 确认了 `tools`（要加 `--profile tools` 才会显示，因为它默认不在 `up` 的范围里）、`worker`、`mock-knowledge` 三个服务都正确挂载了只读的 `data/knowledge`。
 
 **人工审查与修复点**：
+无
+
+---
+
+## 步骤 2.3：检索与 mock-knowledge
+
+**日期**：2026-09-24
+
+**改动/新建模块**：
+- `app/common/retrieval.py`：新建，`SearchResult`/`Retriever` 接口、`PgvectorRetriever`（一条 SQL 用 `embedding.cosine_distance()` 完成租户过滤+相似度排序，对应 pgvector 的 `<=>` 算子）、`MockKnowledgeRetriever`（调用 mock-knowledge，超时 2 秒）、`get_retriever()` 工厂
+- `mocks/mock_knowledge/main.py`：实现 `GET /search?q=&tenant_id=&top_k=`，读同一套 md 文件，自己复制了一份最简单的 front matter/条款解析（不依赖 `app.common`），用两字片段 Jaccard 相似度打分；缺 `tenant_id` 返回 400
+- `scripts/search_kb.py`：新建，命令行检索，支持 `--retriever`
+- `app/common/config.py` / `.env.example` / `.env`：加 `RETRIEVER=pgvector`、`KNOWLEDGE_MIN_SCORE=0.30`、`MOCK_KNOWLEDGE_BASE_URL`、`MOCK_KNOWLEDGE_TIMEOUT_SECONDS=2`
+- `docs/phase2_threshold.md`：新建，阈值标定过程和结果
+
+**关键决策**：
+- `PgvectorRetriever` 用 pgvector-python 提供的 `Column.cosine_distance()`（生成 `<=>` 算子）而不是手写 `text()` SQL 字符串，租户过滤和排序在同一条 ORM 查询里完成，不给"先查出来再过滤"留任何空档
+- `MockKnowledgeRetriever` 里 `clause_title` 固定为空字符串——mock-knowledge 的契约（附录 C）里只有 `snippet`/`source`/`score`，没有单独的条款标题字段，不编造一个字段出来凑格式
+- mock-knowledge 自己复制了一份精简版的文档解析逻辑，没有导入 `app.common.knowledge_parser`——延续阶段一"mock 服务是假的外部系统，不该依赖内部实现"这条设计原则，换掉真实检索的解析逻辑不该影响这个 mock 的行为
+- 阈值标定时踩了一个坑：t_b 用 t_a 的说法"老带新奖励多少课时"提问，分数（0.2531）比好几条"不该命中"的问题还低——查出来是 t_b 的活动文档根本没有"老带新"这个词，对应的是完全不同名字的"推荐有礼"。这正好验证了 1.5 节写的"哈希向量同义词效果差"这条已知局限，换成 t_b 自己的说法后分数恢复正常。细节写在 `docs/phase2_threshold.md` 的"踩坑记录"里
+
+**验证记录**：
+```
+$ docker compose run --rm tools python scripts/search_kb.py --tenant t_a "寒假班请假会退课时费吗"
+[1] score=0.5538 《课程服务协议》第 4.2 条 寒假班请假
+    寒假班请假需提前 24 小时在小程序提交...
+
+$ docker compose run --rm tools python scripts/search_kb.py --tenant t_b "寒假班请假会退课时费吗"
+[1] score=0.5497 《课程服务协议》第 4.2 条 寒假班请假
+    寒假班请假需提前 48 小时在启明学堂 App 提交...
+
+$ docker compose run --rm tools python scripts/search_kb.py --tenant t_a "你们的校车几点发车"
+[1] score=0.1907 《常见问题》第 Q4 条 学习报告多久出一次？
+    （最高分 0.1907 < 阈值 0.30）
+
+$ docker compose run --rm tools python scripts/search_kb.py --tenant t_a --retriever mock_knowledge "发票多久能开"
+[1] score=0.0233 《发票说明》第 1.3 条
+    付款后 180 天内可以申请开票，超过 180 天不再补开。
+```
+四条都符合 PHASE2.md 预期：t_a/t_b 的 4.2 条内容不同（24 小时 vs 48 小时），校车问题分数低于阈值，`mock_knowledge` 检索器返回的是 t_a 的《发票说明》。
+
+**人工审查与修复点**：
+【人工审查发现】pgvector 和 mock-knowledge 两种检索器打分尺度不同（mock-knowledge 命中时最高分仅 0.02 左右），却共用按 pgvector 标定的阈值 0.30。切换检索器后所有问题都会被判定为无命中，知识问答静默失效。已改为按检索器分别设置阈值，并对 mock-knowledge 单独标定。
+
+---
+
+## 步骤 2.3 补充：按检索器区分阈值
+
+**日期**：2026-09-24
+
+**改动/新建模块**：
+- `app/common/retrieval.py`：`Retriever` 接口加 `min_score` 属性，`PgvectorRetriever`/`MockKnowledgeRetriever` 各自在 `__init__` 里从对应的配置项取值，调用方（以后 2.8 的知识问答节点）从检索器实例上取阈值，不再假设只有一个全局阈值
+- `app/common/config.py` / `.env.example` / `.env`：新增 `MOCK_KNOWLEDGE_MIN_SCORE=0.04`，`KNOWLEDGE_MIN_SCORE` 保留给 pgvector 用
+- `scripts/search_kb.py`：输出里加一行当前检索器名字、阈值，以及第一名有没有超过阈值
+- `docs/phase2_threshold.md`：追加 mock_knowledge 的标定结果
+
+**关键决策/发现**：
+- 用同样 15 条问题给 `MockKnowledgeRetriever` 标定，**两组分数没有干净分开**：应该命中区间 0.0227~0.1136，不该命中区间 0.0000~0.0392，中间有重叠（"发票多久能开"等 3 条应该命中的问题分数比"校区附近哪里可以停车"这条不该命中的问题还低）
+- 排查出两个根因：① Jaccard 分数按并集算，文档内容长、问题短，分母被文档内容长度主导，短问题（比如"发票多久能开"只有 6 字）天然吃亏；② "可以""哪里"这类几乎每个条款都会出现的高频片段会让不相关的问题也蹭到分数（"校区附近哪里可以停车"命中是因为撞上了"可以"和"哪里"这两个通用词，不是真的语义相关）
+- 因为两组分不开，`MOCK_KNOWLEDGE_MIN_SCORE=0.04` 不是像 `KNOWLEDGE_MIN_SCORE=0.30` 那样有干净分界的标定值，是"零假阳性、接受 3/20 假阴性"的保守止损值——选择宁可多说几次"没查到依据"也不让不相关内容被当依据，对应题目负面清单"无依据编造"的扣分项。给 mock-knowledge 打分方式本身提了两个改进建议（过滤高频片段 / 只用正文不用标题参与打分），没有直接实现，因为这是要不要动 mock 行为的设计决定，留给 Jo 确认
+
+**验证记录**：
+```
+$ docker compose run --rm tools python scripts/search_kb.py --tenant t_a "寒假班请假会退课时费吗"
+[检索器] PgvectorRetriever  阈值(min_score)=0.3000
+[1] score=0.5538 ...
+[判定] 第一名 score=0.5538，超过阈值，可以作为依据
+
+$ docker compose run --rm tools python scripts/search_kb.py --tenant t_a --retriever mock_knowledge "发票多久能开"
+[检索器] MockKnowledgeRetriever  阈值(min_score)=0.0400
+[1] score=0.0233 ...
+[判定] 第一名 score=0.0233，低于阈值，判定为没有查到明确依据
+```
+
+**人工审查与修复点**：
 （等 Jo 验证后再补充）

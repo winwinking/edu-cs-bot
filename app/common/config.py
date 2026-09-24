@@ -65,6 +65,18 @@ class Settings(BaseSettings):
     # 阶段二默认用不依赖网络/模型的哈希向量（见 app/common/embedding.py），做成可切换的接口，
     # 以后换成真实 embedding 模型只需要新增一个 EMBEDDING_PROVIDER 的实现，不用改调用方代码
     embedding_provider: str = "hash"
+    # pgvector 是主路径；mock_knowledge 用来验证"检索也可以是外部系统"这条设计不是硬编码死的
+    retriever: str = "pgvector"
+    # 低于这个分数就认为"没查到明确依据"，直接走固定话术，不给 LLM 编的机会；具体标定过程见
+    # docs/phase2_threshold.md
+    knowledge_min_score: float = 0.30
+    mock_knowledge_base_url: str = "http://mock-knowledge:8000"
+    mock_knowledge_timeout_seconds: float = 2
+    # mock_knowledge 的打分方式（两字片段 Jaccard）和 pgvector 完全不是一个尺度，必须单独标定，
+    # 不能共用 knowledge_min_score。标定结果显示两组分数没有干净分开（有重叠），这个值是
+    # "宁可漏判也不误判"的保守取值，不是像 knowledge_min_score 那样有干净分界的标定结果，
+    # 细节和原因见 docs/phase2_threshold.md
+    mock_knowledge_min_score: float = 0.04
 
     # ---------- 服务端口 ----------
     gateway_host_port: int = 8000
