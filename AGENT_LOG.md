@@ -23,7 +23,7 @@
 - `Makefile` 里的 `migrate`/`seed`/`demo` 已经把命令接好，但依赖的脚本和服务要到 1.4/1.8 才会真正存在，现在跑会失败，这是预期的（结构先行）。
 
 **人工审查与修复点**：
-（留空，由 Jo 填写）
+无
 
 ---
 
@@ -47,8 +47,7 @@
 - 验证完后执行了 `docker compose down`（保留数据卷，未清理），需要的话可以再 `make up` 拉起来看
 
 **人工审查与修复点**：
-- Jo 发现：本机之前做图谱项目时装过一个开机自启的原生 Redis，同样占 6379 端口。容器和它都能各自启动，但本机脚本连 `localhost:6379` 时可能悄悄连到那个原生 Redis 而不是容器里的这个，排查起来会很晕。
-- 处理：`.env.example`/`.env` 的 `REDIS_HOST_PORT` 默认值从 6379 改成 6380（仅宿主机映射端口，容器内部互联仍是标准的 6379，不影响 gateway/worker 的连接方式），并在 README 端口表里写明原因，避免以后忘记为什么用了非标准端口。
+【人工审查发现】Redis 宿主机端口 6379 与本机已安装的 Redis 服务冲突，从宿主机连接可能连到错误实例，已改为 6380。
 
 ---
 
@@ -85,8 +84,7 @@
 - 验证完执行了 `docker compose down`
 
 **人工审查与修复点**：
-- Jo 发现：脱敏只靠内容正则去猜格式，存在漏判风险——只要值的格式不标准（比如手机号存成非标准格式、token 不是 JWT 形态），正则就可能匹配不上，敏感信息照样原样进日志。
-- 处理：`logging.py` 的 `desensitize_processor` 加了一层按字段名脱敏，key 里只要包含 `password`/`token`/`phone`/`email`/`id_card`/`bank_card`（大小写不敏感、子串匹配，如 `access_token`、`user_phone`、`bank_card_no` 都能命中），不管值是什么格式，整体替换成 `***REDACTED***`，作为第一道防线；原来的内容正则退化为兜底，负责处理敏感信息混在普通文本字段里的情况（比如 `detail: "用户手机号是 13812345678"`）。已用非标准格式的 password/token/phone/id_card/bank_card 值验证过，字段名这层确实能兜住正则漏判的场景。
+【人工审查发现】日志脱敏只靠正则匹配，存在漏判风险，要求增加按字段名脱敏（password、token、phone、email、id_card、bank_card），正则作为兜底。
 
 ---
 
@@ -126,17 +124,9 @@
 - 验证完执行了 `docker compose down`
 
 **人工审查与修复点**：
-CC 验证时未走 make migrate / make seed，实际执行因依赖尚未创建的 worker 服务而失败。已要求改为独立的一次性 tools 服务，并按用户真实操作路径重新验证。
-
-**补充修复（同一次审查里一起改的）**：
-- `docker-compose.yml` 新增 `tools` 服务：跟 gateway/worker/scheduler 共用 `docker/app.Dockerfile`，打了 `edu-cs-bot/app:latest` 镜像标签方便以后复用；`profiles: ["tools"]` 让它不随 `make up`/`docker compose up` 启动，只有显式 `docker compose run --rm tools ...` 才会被叫起来，干完活自动退出（`--rm`）；`depends_on: postgres: condition: service_healthy` 保证迁移/种子脚本不会在数据库还没就绪时跑。
-- `Makefile` 的 `migrate`/`seed` 目标从 `docker compose run --rm worker ...` 改成 `docker compose run --rm tools ...`。
-- 用真实命令重新走了一遍 `make up → make migrate → make seed → make seed`：
-  - `make up`（`docker compose up -d --build`）确认没有把 `tools` 一起建出来/启动（`profiles` 生效）
-  - `make migrate` 第一次跑要现场 build `tools` 镜像（约 3.5 分钟，纯下载依赖的时间），之后 `alembic upgrade head` 成功
-  - `make seed` 跑两次，两次都打印"2 个租户，6 个用户"，确认幂等
-  - `docker compose ps -a` 确认 `tools` 容器跑完即被移除，不会常驻
-- 顺带确认了 `logging.py` 的按字段名脱敏（`_SENSITIVE_FIELD_RE`/`_REDACTED_FIELD`）确实还在，没有被后续改动带丢。
+【agent 自查修复】迁移脚本中 ENUM 类型被重复创建，加 create_type=False 修复。
+【agent 自查修复】scripts 直接运行时找不到 app 模块，在 app.Dockerfile 加 PYTHONPATH 修复。
+【agent 做错】agent 报告验证通过，但验证时没有走 make migrate / make seed，我实际执行时因依赖尚未创建的 worker 服务而失败。已改为一次性 tools 服务，并按真实命令重新验证。
 
 ---
 
@@ -165,18 +155,7 @@ CC 验证时未走 make migrate / make seed，实际执行因依赖尚未创建�
 - 验证完执行了 `docker compose down`
 
 **人工审查与修复点**：
-Jo 手工测试时发现：mock-im 发消息后 ack 只出现一次，但每个 reply_chunk 和 reply_end 都出现两次，文字变成"您您好好"这种逐字重复。Jo 提出两个排查方向：① 页面重复点连接导致同一页面挂两个 WebSocket；② gateway 的 ConnectionManager 单连接下也重复推送。已排查并修复，属于①。
-
-**排查过程**：
-- 先用真实容器验证②：单个 Python WebSocket 客户端连接、发一条消息，统计收到的 `reply_chunk`/`reply_end` 数量——结果是 83 个 chunk（跟回复字数一致）、`reply_end` 恰好 1 次，`reply_end` 之后再等 1.5 秒也没有多余消息。**排除了 gateway/worker 端重复推送的可能**。
-- 再用两个 Python WebSocket 客户端模拟"同一个 token 连了两次、旧连接没关掉"的场景（`conn_a` 模拟按钮第一次点击留下的旧连接，`conn_b` 模拟第二次点击、页面变量实际指向的新连接，只用 `conn_b` 发送消息）：`conn_b` 收到 1 次 ack（跟 Jo 报告的"ack 只出现一次"吻合），`conn_a`/`conn_b` **各自**收到完整的 83 个 chunk 和 1 次 `reply_end`——如果页面把两个连接的 `onmessage` 都接到同一套共享 DOM 状态（`bubblesByReplyTo`、`logEl`）上，就会变成每个字都被追加写入两次、"回复结束"打印两次，跟 Jo 报告的现象完全对应。**复现了①的机制**。
-- 回头看 `mocks/mock_im/templates/index.html` 的 connect 按钮逻辑：`connectBtn.disabled = true` 只在 `ws.onopen`（异步，等 WebSocket 握手完成才触发）里执行，握手完成前如果按钮又被点一次（连点、或者上一次连接还没握手完成又点了一次），就会创建第二个 `WebSocket` 对象，旧对象的 `onmessage` 也还活着，两个连接会同时被 gateway 转发同一份回复到同一套共享 DOM 状态里。
-
-**处理**：`mocks/mock_im/templates/index.html` 的 connect 按钮点击逻辑改成：同步禁用按钮（不等 `onopen`）+ 如果已经有一个 `ws` 对象，先把它的四个事件处理器都置空再 `close()` 掉，再创建新连接。这样不管是连点两下还是别的什么原因导致 connect 被触发第二次，旧连接都会被立刻切断且不再往共享 DOM 状态里写东西。
-
-**验证**：改完之后重新 build 了 `mocks` 镜像、重启 mock-im 容器，`curl http://localhost:8080/` 确认新逻辑已经在服务的页面里生效。浏览器里的连点场景没有用工具复现（没有可用的浏览器自动化工具），这部分麻烦 Jo 手工连点 2~3 次"连接"按钮确认不再重复。
-
-**另外确认**：`mock-llm` 的 `latency_ms` 已经是默认值 300（`GET /admin/config` 返回 `{"latency_ms":300,...}`）——之前排查幂等漏洞时改到过 15000，但那次验证之后整个技术栈被 `docker compose down` 过，容器内的运行时状态（包括 `/admin/config` 改的值）不会跨这次 down/up 保留，新起的容器会重新从 `.env` 里的 `MOCK_LLM_LATENCY_MS=300` 初始化，不会带着旧值。
+无
 
 ---
 
@@ -214,7 +193,7 @@ Jo 手工测试时发现：mock-im 发消息后 ack 只出现一次，但每个 
 - 验证完执行了 `docker compose down`
 
 **人工审查与修复点**：
-（留空，由 Jo 填写）
+【agent 自查修复】WebSocket 鉴权失败时直接拒绝连接，客户端只收到 HTTP 403 而不是 4401。原因是关闭码只能在握手完成后发送，改为先 accept 再 close(4401)。
 
 ---
 
@@ -246,18 +225,8 @@ Jo 手工测试时发现：mock-im 发消息后 ack 只出现一次，但每个 
 - 验证完执行了 `docker compose down`
 
 **人工审查与修复点**：
-设计审查时发现幂等判断把"已接收"当成"已处理"，worker 中途崩溃会导致消息被跳过、用户收不到回复，已增加 status 字段区分。
-
-**修复细节**：
-- 问题场景：原设计里 worker 先 `INSERT` 用户消息（这时就已经"占用"了 `(tenant_id, message_id)` 这个唯一约束的名额），然后才调 LLM、写 assistant 回复、ack 队列消息。如果 worker 在插入用户消息之后、写完回复之前崩溃（进程被杀、容器重启等），消息不会被 ack，RabbitMQ 会重新投递；但重新投递时 `INSERT ... ON CONFLICT DO NOTHING` 会因为那一行已经存在而插入失败，被原逻辑直接判定成"已处理过的重复消息"而跳过——用户消息实际上从来没有被回复过，但永远不会再被处理了。
-- 处理：
-  - `messages` 表加了 `status` 字段（Postgres 原生 ENUM：`received`/`replied`），迁移见 `migrations/versions/202609231000_add_message_status.py`（`app/common/models.py` 同步加了 `MessageStatus`）
-  - `app/worker/handler.py`：`_insert_user_message` 改名 `_upsert_user_message`，插入时带上 `status=received`；插入冲突时不再直接判定为重复，而是多查一次已有记录的 `status`——`replied` 才是真正的重复（返回 `"done"`），`received` 说明上次处理到一半崩了，要重新走一遍生成回复的流程（返回 `"retry"`）；新增 `_mark_user_message_replied`，在 assistant 回复真正写完（含降级回复）之后才把 `status` 改成 `replied`，这样"标记为 replied"和"用户拿到回复"永远是同一时刻
-- 验证方法：把 mock-llm 的 `latency_ms` 调到 15000（拉长首 token 前的等待时间），发一条消息，在 worker 已经发起 LLM 调用、但还没收到任何 token（也就还没写回复）的时候执行 `docker compose kill -s SIGKILL worker` 模拟硬崩溃，随后 `docker compose start worker` 拉起一个全新的 worker 进程；同一个 WebSocket 连接全程没断开，等重新投递的消息被新 worker 处理完
-  - worker 日志实测打出了 `消息之前处理到一半就中断了（用户消息已入库但未回复），重新生成回复`，命中了新加的 `retry` 分支，并且带着和第一次完全相同的 `message_id`
-  - 客户端在原连接上收到了完整的 `reply_chunk` + `reply_end`，拼出来的回复内容正常（不是空的、也不是重复触发了两次降级）
-  - 查数据库确认：这条用户消息的 `status` 是 `replied`，这个会话下的 assistant 回复只有 1 行（没有因为重投递而产生重复的助手消息）
-  - 额外跑了一遍之前的回归用例（正常发消息全链路、同租户/跨租户越权、绕开 gateway 直接投递重复消息到数据库唯一约束层面）确认没有破坏原有行为
+【人工审查发现】幂等判断把"用户消息已入库"当成"已处理完成"。worker 在入库后、回复前崩溃时，重新投递的消息会被跳过，用户永远收不到回复。已给 messages 增加 status 字段（received / replied），只有 replied 才跳过。
+【agent 做错】验证这个修复时，前两次崩溃模拟实际没有杀掉 worker，只测到了正常流程，结果却显示通过。经我追问验证方法后，改为 mock-llm 设置 15 秒延迟、发消息 4 秒后强制杀掉 worker，用时间戳日志和数据库查询证明修复有效。
 
 ---
 
@@ -282,7 +251,7 @@ Jo 手工测试时发现：mock-im 发消息后 ack 只出现一次，但每个 
 - 验证完执行了 `docker compose down`
 
 **人工审查与修复点**：
-（留空，由 Jo 填写）
+【人工审查发现】make demo 显示完整回复耗时 3004ms，超出题目"完整回复 P95 < 3s"指标。初步判断主要来自 mock-llm 的默认延迟和逐字输出速度，待压测阶段拆分 mock 耗时与系统自身耗时。
 
 ---
 
@@ -298,8 +267,14 @@ Jo 手工测试时发现：mock-im 发消息后 ack 只出现一次，但每个 
 - 没有为阶段一临时加自动化测试（`make test` 依然是占位），README 里也如实写清楚"阶段一暂无自动化测试"，不打没做过的事的埋伏笔。
 
 **验证记录**：
-- Mermaid 图语法用 mermaid.live 风格手工核对过节点和箭头方向，没有实际用工具渲染截图，若有语法问题请指出
 - 端口表、启动步骤里给的每条命令都是这一路验证下来真实跑过的命令，不是凭空写的
 
 **人工审查与修复点**：
-（留空，由 Jo 填写）
+【人工审查发现】README 中的 Mermaid 架构图 agent 无法渲染确认，我推送到 GitHub 后确认渲染正常。
+
+---
+
+## 阶段一收尾
+
+**人工审查与修复点**：
+【人工审查发现】我在浏览器手动测试时发现 mock-im 页面回复每个字重复显示两次，ack 只出现一次。排查确认是连接按钮在握手完成前可重复点击，同一页面建立了两个 WebSocket 连接。已改为点击后立即禁用按钮，新建连接前先关闭旧连接。我已在浏览器中快速连点验证，不再重复。系统本身单连接无重复推送。
