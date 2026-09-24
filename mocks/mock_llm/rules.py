@@ -18,6 +18,10 @@ _FINANCE_KIND_MAP = [
 ]
 _FINANCE_REQUIRE_ANY = ("我", "帮", "查")
 _FINANCE_EXCLUDE_ANY = ("规则", "政策", "怎么", "多久", "流程", "说明")
+# 消息里含明确的查询动作时，不应用排除词——"帮我查""查一下""帮我看看"已经是清楚的查询请求，
+# 不会是在问政策/流程，不该被排除词表拦下（排除词表是为了不把"退费规则是什么"这种问政策的句子
+# 误判成财务操作，跟"明确要查"这件事不冲突）
+_FINANCE_EXPLICIT_QUERY_ANY = ("帮我查", "查一下", "帮我看看")
 
 # R3：触发平台指令的口语前缀
 _PLATFORM_TRIGGER_ANY = ("帮我", "给我", "替我", "请帮")
@@ -69,13 +73,15 @@ def _match_reminder(content: str) -> Optional[tuple[str, dict]]:
 
 
 def _match_finance(content: str) -> Optional[tuple[str, dict]]:
-    # R2：含财务词 + 含(我/帮/查)之一 + 不含(规则/政策/怎么/多久/流程/说明)任一
+    # R2：含财务词 + 含(我/帮/查)之一 + 不含(规则/政策/怎么/多久/流程/说明)任一——
+    # 但消息里如果含明确的查询动作（帮我查/查一下/帮我看看），跳过排除词这一条
     kind = next((k for word, k in _FINANCE_KIND_MAP if word in content), None)
     if kind is None:
         return None
     if not any(word in content for word in _FINANCE_REQUIRE_ANY):
         return None
-    if any(word in content for word in _FINANCE_EXCLUDE_ANY):
+    has_explicit_query_action = any(word in content for word in _FINANCE_EXPLICIT_QUERY_ANY)
+    if not has_explicit_query_action and any(word in content for word in _FINANCE_EXCLUDE_ANY):
         return None
 
     args: dict = {"kind": kind}

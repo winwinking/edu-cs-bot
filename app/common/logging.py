@@ -5,7 +5,8 @@
 1. 按字段名——只要 key 里包含 password/token/phone/email/id_card/bank_card 这类词，不管值长什么样，整体打码。
    这是第一道防线，因为业务字段名是我们自己定的，比正则猜值的格式更可靠。
 2. 按内容正则——防止敏感信息混在一段普通文本里（比如 detail: "手机号 138xxx 验证失败"），
-   字段名那层不会覆盖到这种情况，所以正则作为兜底，两层都要。
+   字段名那层不会覆盖到这种情况，所以正则作为兜底，两层都要。这一层复用 app.common.masking
+   （阶段二 2.9 财务回复脱敏用的同一套函数），日志和财务回复的脱敏格式不会出现两套标准。
 """
 import logging
 import re
@@ -14,14 +15,9 @@ from typing import Any
 import structlog
 
 from app.common.config import get_settings
+from app.common.masking import mask_text as _mask_sensitive_text
 
-# 顺序有讲究：先匹配更"具体"的模式（邮箱、JWT、身份证），再匹配容易和别的数字串混淆的手机号/银行卡，
-# 避免一个 18 位身份证号先被手机号规则误处理成一半脱敏一半不脱敏
-_EMAIL_RE = re.compile(r"([\w.+-])[\w.+-]*(@[\w-]+\.[\w.-]+)")
 _JWT_RE = re.compile(r"\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b")
-_ID_CARD_RE = re.compile(r"\b(\d{6})\d{8}(\d{3}[\dXx])\b")
-_BANK_CARD_RE = re.compile(r"\b(\d{4})\d{8,11}(\d{4})\b")
-_PHONE_RE = re.compile(r"\b(1[3-9]\d)\d{4}(\d{4})\b")
 
 # 字段名脱敏用的关键词，大小写不敏感、只要 key 里包含就命中（如 access_token、user_phone、bank_card_no）
 _SENSITIVE_FIELD_RE = re.compile(r"(password|token|phone|email|id_card|bank_card)", re.IGNORECASE)
@@ -29,12 +25,9 @@ _REDACTED_FIELD = "***REDACTED***"
 
 
 def _mask_text(value: str) -> str:
+    # JWT 是日志场景特有的（token 形态字符串），跟财务脱敏无关，留在这里单独处理
     value = _JWT_RE.sub("***REDACTED_TOKEN***", value)
-    value = _EMAIL_RE.sub(r"\1***\2", value)
-    value = _ID_CARD_RE.sub(r"\1********\2", value)
-    value = _PHONE_RE.sub(r"\1****\2", value)
-    value = _BANK_CARD_RE.sub(r"\1********\2", value)
-    return value
+    return _mask_sensitive_text(value)
 
 
 def _mask_value(value: Any, key: str | None = None) -> Any:

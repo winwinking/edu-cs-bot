@@ -78,6 +78,15 @@ class Settings(BaseSettings):
     # 细节和原因见 docs/phase2_threshold.md
     mock_knowledge_min_score: float = 0.04
 
+    # ---------- 财务查询（阶段二 2.9） ----------
+    # worker 和 mock-finance 之间的服务令牌，不是用户的登录 token；mock 服务专用，不是真实密钥，
+    # 但同样只从环境变量读，不写死在代码里
+    finance_service_token: str
+    mock_finance_base_url: str = "http://mock-finance:8000"
+    finance_timeout_seconds: float = 1.5
+    mock_finance_latency_ms: int = 50
+    mock_finance_mode: str = "normal"
+
     # ---------- 服务端口 ----------
     gateway_host_port: int = 8000
     worker_health_host_port: int = 8001

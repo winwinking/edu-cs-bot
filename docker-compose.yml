@@ -171,6 +171,10 @@ services:
   mock-finance:
     <<: [*mocks-build, *mocks-healthcheck]
     command: ["python", "-m", "mocks.mock_finance.main"]
+    environment:
+      FINANCE_SERVICE_TOKEN: ${FINANCE_SERVICE_TOKEN}
+      MOCK_FINANCE_LATENCY_MS: ${MOCK_FINANCE_LATENCY_MS}
+      MOCK_FINANCE_MODE: ${MOCK_FINANCE_MODE}
     ports:
       - "${MOCK_FINANCE_HOST_PORT}:8000"
 

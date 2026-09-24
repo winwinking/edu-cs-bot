@@ -32,6 +32,10 @@ PLACEHOLDER_REPLY = "这项功能正在接入，暂时还不能处理，你可�
 # 知识问答检索无命中（PHASE2.md 2.8 第 2 点）：不给 LLM 编的机会，直接回固定话术
 KNOWLEDGE_NO_HIT_REPLY = "我暂时没有查到明确依据，建议转人工确认。回复“转人工”我帮你转接。"
 
+# 财务查询越权 / 故障固定话术（PHASE2.md 2.9 第 5 点），金额/订单号只来自接口返回值，不进这两句
+FINANCE_FORBIDDEN_REPLY = "这个账号的财务信息不属于你，我这边不能查询。如果需要，请本人登录后再问我。"
+FINANCE_UPSTREAM_ERROR_REPLY = "财务系统暂时查不到你的信息，这次查询我已记录，稍后回复你。"
+
 # 知识问答 system prompt 的追加部分（PHASE2.md 2.8 第 3 点）：只根据资料回答，出处由代码加，
 # 不用 LLM 自己写——LLM 编出处这件事本来就防不住，干脆不让它写，交给 OutputGuard 逐句核对
 KNOWLEDGE_SYSTEM_ADDENDUM = (

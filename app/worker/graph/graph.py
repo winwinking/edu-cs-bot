@@ -13,6 +13,7 @@ from openai import APIConnectionError, APIError, APITimeoutError
 from app.common.llm_client import stream_chat_completion
 from app.common.logging import get_logger
 from app.worker.graph.classify import classify
+from app.worker.graph.finance import finance
 from app.worker.graph.guard import OutputGuard
 from app.worker.graph.knowledge import knowledge
 from app.worker.graph.nodes import chitchat, fallback, load_context, placeholder, reminder_stub, sensitive
@@ -23,9 +24,9 @@ from app.worker.pubsub import publish_reply_chunk, publish_reply_end
 
 logger = get_logger(__name__)
 
-# 意图 -> 节点名。finance/command/handoff/confirm_action/cancel_action/request_confirmation
-# 还是占位节点（见 nodes.py 的 placeholder），阶段二后续步骤逐个换成真正的业务节点；
-# knowledge 已在 2.8 接入真正的实现
+# 意图 -> 节点名。command/handoff/confirm_action/cancel_action/request_confirmation 还是占位节点
+# （见 nodes.py 的 placeholder），阶段二后续步骤逐个换成真正的业务节点；
+# knowledge 已在 2.8、finance 已在 2.9 接入真正的实现
 _INTENT_TO_NODE = {
     "knowledge_qa": "knowledge",
     "finance_query": "finance",
@@ -70,7 +71,7 @@ def _build_graph():
     graph.add_node("load_context", load_context)
     graph.add_node("classify", classify)
     graph.add_node("knowledge", knowledge)
-    graph.add_node("finance", placeholder)
+    graph.add_node("finance", finance)
     graph.add_node("command", placeholder)
     graph.add_node("request_confirmation", placeholder)
     graph.add_node("confirm_action", placeholder)

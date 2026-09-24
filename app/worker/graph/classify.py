@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.common.llm_client import chat_completion
 from app.common.logging import get_logger
 from app.common.models import PendingAction, PendingActionStatus
+from app.common.prompt_guard import detect_prompt_injection
 from app.common.tools import ParsedToolCall, ToolCallError, parse_tool_call, to_openai_tools
 from app.worker.graph.state import GraphState
 from app.worker.graph.style import STYLE_SYSTEM_PROMPT
@@ -142,10 +143,7 @@ async def _classify_with_llm(state: GraphState) -> dict:
     return update
 
 
-async def classify(state: GraphState, runtime) -> dict:
-    session = runtime.context.session
-    content = state["content"]
-
+async def _classify_core(state: GraphState, session: AsyncSession, content: str) -> dict:
     # 1. 确认/取消（去掉标点后不超过 8 个字，且当前会话有未过期的待确认操作才生效）
     stripped = _strip_punctuation(content)
     if len(stripped) <= _CONFIRM_CANCEL_MAX_LEN:
@@ -167,3 +165,21 @@ async def classify(state: GraphState, runtime) -> dict:
 
     # 5. LLM function calling
     return await _classify_with_llm(state)
+
+
+async def classify(state: GraphState, runtime) -> dict:
+    session = runtime.context.session
+    content = state["content"]
+    result = await _classify_core(state, session, content)
+
+    # Prompt injection 检测只打标记，不改变上面判出来的路由结果（2.6 app.common.prompt_guard 的
+    # 检测函数一直没有实际接线，2.9 财务场景的验证要求补上）；不管命中哪条路由分支都要检查，
+    # 所以放在最外层统一处理，而不是散在每个分支里各自判断一次
+    if detect_prompt_injection(content):
+        logger.warning("疑似 prompt injection，仅打标记，不影响正常的权限校验和白名单防线")
+        risk_flags = list(result.get("risk_flags", []))
+        if "prompt_injection_suspected" not in risk_flags:
+            risk_flags.append("prompt_injection_suspected")
+        result["risk_flags"] = risk_flags
+
+    return result
