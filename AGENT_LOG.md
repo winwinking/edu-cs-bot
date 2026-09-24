@@ -278,3 +278,35 @@
 
 **人工审查与修复点**：
 【人工审查发现】我在浏览器手动测试时发现 mock-im 页面回复每个字重复显示两次，ack 只出现一次。排查确认是连接按钮在握手完成前可重复点击，同一页面建立了两个 WebSocket 连接。已改为点击后立即禁用按钮，新建连接前先关闭旧连接。我已在浏览器中快速连点验证，不再重复。系统本身单连接无重复推送。
+
+---
+
+## 步骤 2.1：数据库迁移、种子补充、只读查询工具
+
+**日期**：2026-09-24
+
+**改动/新建模块**：
+- `app/common/models.py`：新增 7 张阶段二业务表的 ORM 模型——`KnowledgeDocument`/`KnowledgeChunk`（知识库文档和条款块）、`GuardianLink`（家长-学员关联）、`PendingAction`（待确认操作）、`AuditLog`（审计日志）、`HandoffTicket`（转人工工单）、`FollowupTask`（故障跟进任务）；`Conversation` 加 `dissatisfied_count`，`Message` 加 `intent`/`meta`
+- `migrations/versions/202609240001_phase2_business_tables.py`：对应的建表/加列迁移，只新增不改阶段一的迁移
+- `scripts/seed.py`：新增学生 `u_a_1004`（和张小明无关联，用于越权演示），新增 `guardian_links` 种子（`u_a_1002`→`u_a_1001`、`u_b_1002`→`u_b_1001`）
+- `scripts/sql.py`：新建，只读 SQL 查询工具
+- `requirements.txt`：加 `pgvector`（`knowledge_chunks.embedding` 用 pgvector 的 `Vector(512)` 类型）
+
+**关键决策**：
+- `knowledge_documents` 没有代理主键，直接用 `(tenant_id, doc_id)` 复合主键——PHASE2.md 的表定义里本来就没有单独的 id 字段，复合主键正好等价于文档要求的唯一约束，不用多加一层没用的抽象
+- `knowledge_chunks` 用复合外键关联 `knowledge_documents(tenant_id, doc_id)`，保证不会出现"块存在但文档已被删除"的孤儿数据，这个约束是 2.2 增量重建索引（删旧文档连带删块）能安全跑的前提
+- `audit_logs.actor_role` 复用阶段一已经建好的 `user_role` 数据库枚举类型，不新建一套同样取值的枚举
+- `scripts/sql.py` 做了两层防护：应用层先检查语句是不是以 `select`/`with` 开头（且不含分号，防止一次塞多条语句），再在数据库事务里执行一次 `SET TRANSACTION READ ONLY`——就算应用层的字符串检查将来出现漏判，数据库这一层也写不进任何东西
+- `guardian_links` 种子和阶段一的 users/tenants 一样用 `ON CONFLICT DO NOTHING`，保证脚本可以重复跑
+
+**验证记录**：
+- `make migrate`：成功跑到 `202609240001`
+- `make migrate` 后用 `alembic revision --autogenerate` 做一致性检查，diff 为空（`upgrade`/`downgrade` 都是 `pass`），说明 `models.py` 和手写迁移完全对得上；生成的临时文件是在没有挂载宿主机目录的 `tools` 容器里生成的，随 `--rm` 一起销毁，没有落到仓库里
+- `make seed` 连续跑两次，都输出"2 个租户，7 个用户，2 条家长-学员关联"，确认幂等
+- `sql.py "select id, tenant_id, role from users order by id"`：7 个用户，角色分布和 PHASE2.md 第 3 节目标完全一致（含新增的 `u_a_1004`）
+- `sql.py "select * from guardian_links"`：2 条记录，`u_a_1002→u_a_1001`、`u_b_1002→u_b_1001`
+- `sql.py "delete from users"`：被拒绝，报错"只允许 SELECT 查询"
+- 额外用 `information_schema` 确认 7 张新表和 `conversations.dissatisfied_count`/`messages.intent`/`messages.meta` 都建出来了（PHASE2.md 没要求这几条，是我自己加的确认）
+
+**人工审查与修复点**：
+（等 Jo 验证后再补充）

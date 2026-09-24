@@ -4,7 +4,7 @@ import asyncio
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.common.db import AsyncSessionLocal
-from app.common.models import Tenant, User, UserRole
+from app.common.models import GuardianLink, Tenant, User, UserRole
 
 TENANTS = [
     {"id": "t_a", "name": "星辰教育"},
@@ -60,6 +60,21 @@ USERS = [
         "email": "u_b_1003@example.com",
         "phone": "13800002003",
     },
+    {
+        # 阶段二新增：和张小明没有关联的学生，用来演示"学生 A 查学生 B"被拒绝
+        "id": "u_a_1004",
+        "tenant_id": "t_a",
+        "name": "王小华",
+        "role": UserRole.student,
+        "email": "u_a_1004@example.com",
+        "phone": "13800001004",
+    },
+]
+
+# 家长-学员关联（阶段二）：家长能查关联学员的财务，见 app/common/models.py 的 GuardianLink
+GUARDIAN_LINKS = [
+    {"tenant_id": "t_a", "parent_user_id": "u_a_1002", "student_user_id": "u_a_1001"},
+    {"tenant_id": "t_b", "parent_user_id": "u_b_1002", "student_user_id": "u_b_1001"},
 ]
 
 
@@ -72,8 +87,13 @@ async def main() -> None:
         for user in USERS:
             stmt = pg_insert(User).values(**user).on_conflict_do_nothing(index_elements=["id"])
             await session.execute(stmt)
+        for link in GUARDIAN_LINKS:
+            stmt = pg_insert(GuardianLink).values(**link).on_conflict_do_nothing(
+                index_elements=["tenant_id", "parent_user_id", "student_user_id"]
+            )
+            await session.execute(stmt)
         await session.commit()
-    print(f"种子数据完成：{len(TENANTS)} 个租户，{len(USERS)} 个用户")
+    print(f"种子数据完成：{len(TENANTS)} 个租户，{len(USERS)} 个用户，{len(GUARDIAN_LINKS)} 条家长-学员关联")
 
 
 if __name__ == "__main__":
