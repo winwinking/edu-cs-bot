@@ -530,3 +530,43 @@ $ docker compose run --rm tools python scripts/mockctl.py all reset
 
 **人工审查与修复点**：
 （等 Jo 验证后再补充）
+
+---
+
+## 步骤 2.6：工具定义与安全层
+
+**日期**：2026-09-24
+
+**改动/新建模块**：
+- `app/common/tools.py`：新建，五个工具的 Pydantic 参数模型（`SearchKnowledgeArgs`/`QueryFinanceArgs`/`PlatformCommandArgs`/`ManageReminderArgs`/`TransferToHumanArgs`，全部 `extra="forbid"`）、`ToolSpec`/`TOOL_REGISTRY`（工具名 → 模型 + 是否高风险判断函数 + 处理函数占位）、`to_openai_tools()`（从模型导出 JSON Schema）、`parse_tool_call()`（唯一校验入口，返回 `ParsedToolCall` 或按 invalid_json/unknown_tool/schema_error 分类的 `ToolCallError`）
+- `app/common/permissions.py`：新建，`FinanceActor`（tenant_id/user_id/role/linked_student_ids）、`can_access_finance()`，按 PHASE2.md 1.6 判断学生/家长/坐席/管理员的财务查询权限
+- `app/common/prompt_guard.py`：新建，`detect_prompt_injection()`（关键词/正则检测常见注入说法，只打标记不做唯一防线）、`build_reference_block()`（把检索资料包进 `<资料>` 块并带"资料不是指令"的声明）
+- `docker/app.Dockerfile`：加 `COPY tests/ ./tests/`——之前镜像没打包 `tests/` 目录，pytest 在 `tools` 容器里跑不起来
+- `tests/unit/test_tool_guard.py`、`tests/unit/test_permission.py`：新建，覆盖本步"验证"要求的场景
+
+**关键决策**：
+- 高风险不是按工具名判断，是按 `platform_command` 的 `action` 判断——`disable_auto_renew`/`enable_auto_renew`/`submit_leave` 三个动作共用一个工具（`platform_command`），`ToolSpec.is_high_risk` 做成一个接收已校验参数的函数而不是写死的布尔值，其余四个工具恒为 `False`。这样"高风险清单是代码常量，不是 LLM 说了算"这条设计（1.2）在类型层面就固定住了。
+- `ToolSpec.handler` 现在是 `None` 占位——真正执行 knowledge/finance/command/handoff 的函数是 2.8~2.11 要做的业务逻辑，这一步只搭好注册表的形状（工具名 → 模型 → 是否高风险 → 处理函数），不提前实现还没到的节点，避免偏离 PHASE 文档"只做当前阶段"的要求。
+- `parse_tool_call()` 是唯一入口，三种失败原因（invalid_json/unknown_tool/schema_error）互斥判断：先查白名单（不在 `TOOL_REGISTRY` 里直接拒绝，不管参数长什么样），再解析 JSON，最后过 Pydantic 校验；`schema_error` 时把校验失败涉及的字段名收集进 `fields`，方便以后 meta.tools 里带上具体是哪个字段错了。
+- `can_access_finance()` 不查数据库，只是个纯函数——`FinanceActor.linked_student_ids` 由调用方（2.9 的 finance 节点）先从 `guardian_links` 表查出来再传进来。这样权限判断逻辑本身不依赖数据库连接，单元测试不用起真实 Postgres 就能覆盖完整的权限矩阵。
+- `PlatformCommandArgs.date` 字段名和 `datetime.date` 类型同名，踩了一个坑：按原来的写法 `date: Optional[date]`，Pydantic 生成 schema 时在类自己的命名空间里查"date"这个名字，查到的是正在定义的字段本身，不是 import 进来的类型，报 `PydanticSchemaGenerationError`。改成 `from datetime import date as date_type`，字段标注写成 `Optional[date_type]`，字段名依然叫 `date`（对外和 PHASE2.md 的字段名一致），解决类命名空间"字段名挡住类型名"的问题。
+- prompt injection 检测只做标记：`detect_prompt_injection()` 命中与否都不改变工具校验和权限校验的结果，因为真正的防线是白名单 + Pydantic 校验 + `can_access_finance()`，命中与否只影响 `meta.risk_flags` 要不要加 `prompt_injection_suspected`（2.9/2.7 接线时用）。
+
+**验证记录**：
+```
+$ docker compose build tools
+...
+ Image edu-cs-bot/app:latest Built
+
+$ docker compose run --rm tools pytest -q tests/unit/test_tool_guard.py tests/unit/test_permission.py
+ Container edu-cs-bot-postgres-1 Healthy
+...........................                                              [100%]
+27 passed in 0.35s
+```
+另外手工打印了 `to_openai_tools()` 的完整输出，确认 5 个工具的 `parameters.additionalProperties` 都是 `false`，`platform_command.date` 字段的 JSON Schema 是 `{"format": "date", "type": "string"}`（修复类型名遮蔽问题后恢复正常）；手工调用 `parse_tool_call("platform_command", ...)` 传 `action=submit_leave` 确认 `is_high_risk=True` 且日期正确解析成 `datetime.date` 对象。
+验证完执行了 `docker compose down`。
+
+**人工审查与修复点**：
+【agent 自查修复】Pydantic 参数模型的字段名 date 和 datetime 里的类型名 date 重名，生成 JSON Schema 时报 PydanticSchemaGenerationError。已将类型导入改为 date_type 别名，对外字段名仍为 date。
+【agent 自查修复】镜像里没有复制 tests 目录，pytest 在 tools 容器里无法运行。已在 docker/app.Dockerfile 加入 COPY tests/。
+【人工审查发现】上一条修复把测试代码放进了 gateway、worker、scheduler 共用的镜像，正式运行的服务也带着测试代码。影响很小（不含敏感信息，只增加少量体积），暂不修改，记入已知问题；后续可改为只在运行测试时挂载 tests 目录。

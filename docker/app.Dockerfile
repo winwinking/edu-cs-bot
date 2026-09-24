@@ -13,6 +13,7 @@ COPY app/ ./app/
 COPY alembic.ini .
 COPY migrations/ ./migrations/
 COPY scripts/ ./scripts/
+COPY tests/ ./tests/
 
 # gateway / worker / scheduler 共用本镜像，实际启动哪个服务由 docker-compose 的 command 决定
 CMD ["python", "-m", "app.gateway.main"]
