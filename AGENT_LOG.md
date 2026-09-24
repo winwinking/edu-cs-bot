@@ -570,3 +570,202 @@ $ docker compose run --rm tools pytest -q tests/unit/test_tool_guard.py tests/un
 【agent 自查修复】Pydantic 参数模型的字段名 date 和 datetime 里的类型名 date 重名，生成 JSON Schema 时报 PydanticSchemaGenerationError。已将类型导入改为 date_type 别名，对外字段名仍为 date。
 【agent 自查修复】镜像里没有复制 tests 目录，pytest 在 tools 容器里无法运行。已在 docker/app.Dockerfile 加入 COPY tests/。
 【人工审查发现】上一条修复把测试代码放进了 gateway、worker、scheduler 共用的镜像，正式运行的服务也带着测试代码。影响很小（不含敏感信息，只增加少量体积），暂不修改，记入已知问题；后续可改为只在运行测试时挂载 tests 目录。
+
+---
+
+## 步骤 2.7：LangGraph 编排骨架
+
+**日期**：2026-09-24
+
+**改动/新建模块**：
+- `app/worker/graph/`：新建包
+  - `state.py`：`GraphState`（TypedDict，图节点间传的决策数据）、`GraphContext`（dataclass，装 `session`，通过 LangGraph 的 `context_schema` 机制注入，不放进 state——state 要保持可序列化，资源类对象不塞进去）
+  - `style.py`：统一风格 system prompt、三句固定话术（兜底/敏感操作/LLM 不可用）、reminder 占位话术、通用占位话术
+  - `guard.py`：`OutputGuard`——按句末标点（。！？；换行）缓冲成句再输出，去掉禁用套话（子串删除，不是整句丢弃），套话删完只剩标点的句子不发给用户
+  - `classify.py`：意图识别，按 1.1 的顺序（确认/取消 → 转人工 → [不满意计数，本步跳过] → 敏感操作 → LLM function calling），LLM 失败时降级为 worker 自己的关键词规则（`_keyword_fallback_classify`），关键词也判断不出来则标记 `fallback_reason=llm_unavailable`
+  - `nodes.py`：`load_context`（查 users 表拿 role）、`chitchat`、`sensitive`、`fallback`、`reminder_stub`、`placeholder`（knowledge/finance/command/handoff/request_confirmation/confirm_action/cancel_action 共用）
+  - `graph.py`：`StateGraph` 编图（load_context → classify → 条件路由 → 11 个业务节点之一 → END）、`respond()`（图外统一出口，template 按句发，generate 流式调 LLM 经 OutputGuard 后发，最后发 reply_end 带 meta）
+- `app/common/llm_client.py`：新增 `chat_completion()`，非流式、可带 `tools`/`tool_choice`，给 classify 用
+- `app/common/schemas.py`：`ReplyEndMessage` 加 `meta` 字段
+- `app/worker/pubsub.py`：`publish_reply_end()` 加 `meta` 参数
+- `app/worker/handler.py`：重写 `process_inbound_message`——去掉原来直接调 `stream_chat_completion` 拼回复的逻辑，改成跑 `COMPILED_GRAPH.ainvoke()` 拿到最终 state，再调 `respond()` 发消息；`_load_recent_messages` 加 `exclude_message_id` 参数把当前这条消息从"历史"里排除；`_insert_assistant_message` 加 `intent`/`meta` 参数，写库时一并存
+- `tests/unit/test_output_guard.py`、`tests/unit/test_keyword_fallback.py`：新建
+
+**关键决策**：
+- LangGraph 用的是新版 API（`context_schema` + `Runtime[T]` 注入依赖，不是旧版 `config["configurable"]` 那一套）——先写了个十几行的最小示例在容器里跑通确认了这套注入机制真的有效，再往正式代码里写，没有凭经验硬编码一个可能装不对的旧接口。
+- state 和"跑图用的资源"分开：`GraphState` 只放意图、路由来源等可序列化的决策数据，数据库 session 通过 `GraphContext`（`context_schema`）传，不塞进 state——为以后要接 LangGraph 的 checkpoint/调试工具留了余地，也避免 state 里出现"打印不出来"的对象。
+- 分类和生成是两次独立的 LLM 调用：`classify` 节点用非流式调用只为了拿到"选了哪个工具/要不要走 chitchat"的判断结果；真正要发给用户的文字（不管是 chitchat 还是以后 2.8 的知识问答）由 `respond()` 统一再调一次流式 LLM 生成。这是"图只负责决策，respond() 统一负责发消息"这条设计（2.7 第 4 点）在代码里的直接体现，代价是 chitchat 场景要调两次 LLM，用 mock/开发阶段这个代价可以接受。
+- 区分"LLM 输出非法"和"LLM 调用本身失败"两种兜底：PHASE2.md 2.7 第 9 点给了两句不同的固定话术，但意图列表里只列了一个 `fallback` 内部去向。用 `fallback_reason`（`invalid_output` / `llm_unavailable`）区分该发哪句，不新增意图种类，跟文档"只有一个 fallback 去向"的说法保持一致。
+- `_load_recent_messages` 新增 `exclude_message_id`，而不是把"查历史"挪到插入当前消息之前——这样"消息处理到一半崩溃、重新投递"的 retry 场景也能正确排除当前这条（不管这条消息是刚插入的还是数据库里已经躺了一阵子的），不用为 retry 单独写一套查询逻辑。
+- worker 自己的关键词兜底规则（`_keyword_fallback_classify`）和 mock-llm 里那套规则是两套独立实现，不是一回事：mock-llm 那套（2.5）只用来让假 LLM 产生确定的 tool_calls，验证"路由/校验/执行"管线；这一套是真给"LLM 完全联系不上"时用的最后一道防线，以后接真实 DeepSeek 时也会用到，两者故意不共享代码。规则里"平台指令关键词要求同时出现帮我/给我/替我/请帮才算数"是照抄 mock-llm R3 的思路，避免"寒假班请假会退课时费吗"这种问政策的问题里带了"请假"两个字就被误判成要请假。
+- `worker_messages_total` 这个指标的 `result` 标签从阶段一的 `ok/forbidden/duplicate/llm_degraded/dead_letter` 改成了跑完图之后的具体 `intent`（`forbidden`/`duplicate` 两种提前返回的情况不变）——旧的标签在阶段二已经不够用（不能区分"这轮到底路由去了哪"），新标签基数不大（意图种类是个位数），信息量更大。这是我主动做的改动，不是 PHASE2.md 点名要求的，专门在这里说明。
+
+**跟 PHASE2.md 对不上的地方（按文档要求"想改设计先说原因"，这里还没改，先如实汇报）**：
+验证脚本第一条 `"你好，在吗"` 预期 `intent=chitchat`，但实际跑出来是 `intent=knowledge_qa`（见下面验证记录）。排查确认不是 2.7 的 bug：mock-llm 在 2.5 就定好的 R4 规则是"含问句特征词（吗/怎么/多久/……）→ search_knowledge"，"在吗"两个字带了"吗"，R4 命中，mock-llm 真的返回了 `search_knowledge` 的 tool_call，`classify()` 如实按这个结果路由，是正确行为。换成不带"吗"的 `"你好"`（ai_flavor 那组验证里用的就是这句）能稳定拿到 `intent=chitchat`，已在验证记录里体现。这是 2.5 已经定型的 mock 规则和 2.7 验证文档用例之间的一个巧合冲突，没有修改任何代码去"凑" chitchat 的结果，是否要改验证文档的测试短语或者 mock-llm 的 R4 规则，请你定。
+
+**验证记录**：
+```
+$ docker compose up -d --build   # 全量启动，postgres/redis/rabbitmq/5 个 mock/gateway/worker 全部 healthy
+
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv c27 "你好，在吗"
+[ack] status=accepted ...
+这项功能正在接入，暂时还不能处理，你可以稍后再试。
+[meta] {"intent": "knowledge_qa", "route_source": "llm", "tools": [{"name": "search_knowledge", "status": "ok"}], ...}
+# 与预期不符，原因见上面"跟 PHASE2.md 对不上的地方"
+
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv c27 "帮我把自动续费关了"
+这项功能正在接入，暂时还不能处理，你可以稍后再试。
+[meta] {"intent": "high_risk", "route_source": "llm", "tools": [{"name": "platform_command", "status": "ok"}], ...}
+# 符合预期
+
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv c27 "我要注销账号"
+这类操作涉及账号安全，需要人工核实身份后才能办理。回复"转人工"，我帮你转接。
+[meta] {"intent": "high_risk", "route_source": "rule", "risk_flags": ["sensitive_request"], ...}
+# 符合预期
+
+$ docker compose run --rm tools python scripts/mockctl.py llm mode=invalid_json
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv c27 "帮我把自动续费关了"
+这句话我没能准确理解，为了避免误操作，我先不做任何处理。你可以换个说法再说一次，或者回复"转人工"。
+[meta] {"intent": "fallback", "tools": [{"name": "platform_command", "status": "invalid_json"}], ...}
+# 符合预期
+
+$ docker compose run --rm tools python scripts/mockctl.py llm mode=ai_flavor
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv c27 "你好"
+好的，我在。你可以直接说你的问题。
+[meta] {"intent": "chitchat", "guard": {"banned_phrases_removed": 1, ...}, ...}
+# 回复里没有"希望对你有帮助"，符合预期；这句不带"吗"，intent 也确实是 chitchat
+
+$ docker compose run --rm tools python scripts/mockctl.py llm mode=error500
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv c27 "你好"
+系统这会儿有点忙，我暂时没法处理这个问题。你可以稍后再试，或者回复"转人工"。
+[meta] {"intent": "fallback", "route_source": "rule_fallback", ...}
+# 符合预期；worker 日志确认 openai SDK 重试 2 次后放弃，降级为关键词规则，关键词也没判出来，用了"LLM 不可用"话术
+
+$ docker compose run --rm tools python scripts/mockctl.py all reset
+
+$ curl -s http://localhost:8001/metrics | grep worker_messages_total
+worker_messages_total{result="knowledge_qa"} 1.0
+worker_messages_total{result="high_risk"} 2.0
+worker_messages_total{result="fallback"} 2.0
+worker_messages_total{result="chitchat"} 1.0
+
+$ docker exec edu-cs-bot-rabbitmq-1 rabbitmqctl list_queues
+inbound.dead   0
+inbound.messages   0
+# 整轮测试（含 3 种故障模式）跑下来没有任何消息进死信，worker/gateway 全程 healthy
+
+$ docker compose run --rm tools pytest -q tests/unit
+41 passed in 0.78s   （27 个 2.6 的 + 14 个本步新增：OutputGuard 6 个、关键词兜底 8 个）
+```
+重启 gateway/worker 用最新镜像后，把上面除了 error500/ai_flavor 那两条以外的场景在新 `--conv c27b` 下重新跑了一遍，结果完全一致（含 `"你好，在吗"` 仍然是 `knowledge_qa`，确认不是偶发）。
+验证完执行了 `docker compose down`。
+
+**人工审查与修复点**：
+【人工审查发现】"你好，在吗"被 mock-llm 的 R4 规则误判成知识问答（"在吗"带了"吗"字）。要求调整 mock-llm，不改验证文档：在 R4 之前新增一条问候规则拦截。
+【人工审查发现】`worker_messages_total` 的 `result` 标签被我从阶段一定下来的取值改成了具体 intent，会影响阶段三错误率统计和阶段四压测报告（两边都要靠 result 标签算错误率）。要求恢复 result 标签（阶段一取值），新增 intent 作为第二个标签，不影响 result。
+
+---
+
+## 步骤 2.7 补充：mock-llm 问候规则 + worker_messages_total 标签修正
+
+**日期**：2026-09-24
+
+**改动/新建模块**：
+- `mocks/mock_llm/rules.py`：`match_tool_call` 在 R3（平台指令）和 R4（知识问答）之间插入问候检查——消息去掉标点和空格后，如果完全由问候词（你好/您好/在吗/在不在/hi/hello，不区分大小写）拼成，直接返回 `None`（走 R5 闲聊文字回复），不再往下试 R4；R1~R3 的顺序和行为不变
+- `docker/mocks.Dockerfile`：加 `COPY tests/ ./tests/` 和 `ENV PYTHONPATH=/app`——之前 mocks 镜像没打包 `tests/`，也没设 `PYTHONPATH`，pytest 跑不了、也 import 不到 `mocks.*`
+- `app/worker/metrics.py`：`messages_total` 的注释改成说明 `result` 取值恢复成阶段一的 `ok/duplicate/forbidden/llm_degraded/dead_letter`，标签维度变成 `["result", "intent"]`
+- `app/worker/handler.py`：新增 `_metric_result(route_source)` 纯函数——`route_source=rule_fallback`（LLM 调用本身失败，降级成关键词兜底）映射成 `llm_degraded`，`rule`/`llm` 都映射成 `ok`；`process_inbound_message` 返回值从单个字符串改成 `(result, intent)` 元组
+- `app/worker/consumer.py`：`messages_total.labels(...)` 全部改成同时传 `result` 和 `intent` 两个标签；`forbidden`/`duplicate`/`dead_letter` 场景图还没跑，`intent` 传空字符串
+- `tests/unit/test_mock_llm_rules.py`：新建，覆盖问候规则；因为 `mocks/` 只打进 mocks 镜像、不在 tools 镜像里，文件开头用 `pytest.importorskip` 优雅跳过，tools 镜像跑整个 `tests/unit` 目录不会因为这一个文件报错
+- `tests/unit/test_metrics_result.py`：新建，覆盖 `_metric_result` 的映射关系
+
+**目前仓库里读取/依赖 `worker_messages_total` 的地方（改动前排查结果，回答你的提问）**：
+用 `grep -rn "worker_messages_total\|messages_total"` 排查过，唯一的写入点是 `app/worker/consumer.py`；唯一的读取方式是 `worker` 自己 8001 端口的 `/metrics`（Prometheus 文本格式），目前仓库里没有 Grafana 面板、没有告警规则、没有压测脚本引用它——阶段三/阶段四要用到的这些东西现在都还没建，也没有任何测试断言过具体标签取值。`AGENT_LOG.md` 里步骤 1.7/2.7 的历史记录提到过它的取值，是文字说明，不是代码依赖。结论：这次改动只影响 `app/worker/metrics.py`、`app/worker/handler.py`、`app/worker/consumer.py` 三个文件，不影响其他任何已有代码，也不影响任何人（阶段三/阶段四相关的读取方还没写）。
+
+**关键决策**：
+- 问候规则判断"是不是纯问候"，不是"含不含问候词"——用去掉标点空格后能不能被问候词的重复拼接完全 `fullmatch` 掉来判断，"你好，在吗"能被"你好"+"在吗"拼满，算纯问候；"你好，我想问一下"拼不满，不算，继续走后面的规则，不会误伤带问候语开头的正常问题。
+- mock 相关的单元测试改成需要用 `mock-llm` 镜像单独跑（`docker compose run --rm mock-llm pytest -q tests/unit/test_mock_llm_rules.py`），没有把 `mocks/` 也塞进 tools/app 镜像——沿用阶段一"mock 是假的外部系统，不该和内部代码耦合"这条设计原则，宁可多一条单独的验证命令，也不让 gateway/worker 的镜像里出现 mocks 的源码。
+- `result` 恢复成阶段一的五个取值后，"LLM 输出非法"（invalid_json 场景）和"LLM 调用失败"（error500 场景）需要能区分开：前者 LLM 链路是通的，只是输出没过校验，系统正确地没执行、给用户答复完了，算 `ok`；后者是 LLM 真的连不上，算 `llm_degraded`。用 `route_source` 是不是 `rule_fallback` 来判断——`rule_fallback` 只有一种触发条件（`classify` 里 LLM 调用抛异常），语义唯一，不会误判。
+- `_metric_result` 单独拆成一个纯函数（不写在 `process_inbound_message` 里），方便直接写单元测试覆盖这个映射关系，不用起一整套 DB/LLM 环境。
+
+**验证记录**：
+
+先确认 2.5 的三条 `llm_probe` 验证不受影响：
+```
+$ docker compose run --rm tools python scripts/llm_probe.py "帮我把自动续费关了"
+[tool_call] name=platform_command
+  arguments(原文)='{"action": "disable_auto_renew"}'
+
+$ docker compose run --rm tools python scripts/llm_probe.py "我上个月的发票开了吗"
+[tool_call] name=query_finance
+  arguments(原文)='{"kind": "invoices", "period": "last_month"}'
+
+$ docker compose run --rm tools python scripts/llm_probe.py "发票多久能开"
+[tool_call] name=search_knowledge
+  arguments(原文)='{"query": "发票多久能开"}'
+```
+三条结果和 2.5 原来的验证记录逐字一致。
+
+再跑 2.7 全部验证命令（新会话 `--conv c27c`）：
+```
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv c27c "你好，在吗"
+好的，我在。你可以直接说你的问题。
+[meta] {"intent": "chitchat", "route_source": "llm", "tools": [], "guard": {"dropped_sentences": 0, "banned_phrases_removed": 0}, "risk_flags": []}
+# 修复后符合预期：intent=chitchat，route_source=llm
+
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv c27c "帮我把自动续费关了"
+这项功能正在接入，暂时还不能处理，你可以稍后再试。
+[meta] {"intent": "high_risk", "route_source": "llm", "tools": [{"name": "platform_command", "status": "ok"}], ...}
+# 符合预期
+
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv c27c "我要注销账号"
+这类操作涉及账号安全，需要人工核实身份后才能办理。回复"转人工"，我帮你转接。
+[meta] {"intent": "high_risk", "route_source": "rule", "risk_flags": ["sensitive_request"], ...}
+# 符合预期
+
+$ docker compose run --rm tools python scripts/mockctl.py llm mode=invalid_json
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv c27c "帮我把自动续费关了"
+这句话我没能准确理解，为了避免误操作，我先不做任何处理。你可以换个说法再说一次，或者回复"转人工"。
+[meta] {"intent": "fallback", "route_source": "llm", "tools": [{"name": "platform_command", "status": "invalid_json"}], ...}
+# 符合预期
+
+$ docker compose run --rm tools python scripts/mockctl.py llm mode=ai_flavor
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv c27c "你好"
+好的，我在。你可以直接说你的问题。
+[meta] {"intent": "chitchat", "guard": {"banned_phrases_removed": 1, ...}, ...}
+# 符合预期
+
+$ docker compose run --rm tools python scripts/mockctl.py llm mode=error500
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv c27c "你好"
+系统这会儿有点忙，我暂时没法处理这个问题。你可以稍后再试，或者回复"转人工"。
+[meta] {"intent": "fallback", "route_source": "rule_fallback", ...}
+# 符合预期
+
+$ docker compose run --rm tools python scripts/mockctl.py all reset
+[llm] 已重置：{"latency_ms": 300, "error_rate": 0.0, "mode": "normal"}
+[finance] 跳过（HTTPStatusError：这个 mock 可能还没实现 /admin/reset）
+[platform] 跳过（HTTPStatusError：这个 mock 可能还没实现 /admin/reset）
+
+$ curl -s http://localhost:8001/metrics | grep worker_messages_total
+worker_messages_total{intent="chitchat",result="ok"} 2.0
+worker_messages_total{intent="high_risk",result="ok"} 2.0
+worker_messages_total{intent="fallback",result="ok"} 1.0
+worker_messages_total{intent="fallback",result="llm_degraded"} 1.0
+# result 只有 ok/llm_degraded 两种取值（阶段一定义的取值），intent 区分具体路由，两个维度都对
+
+$ docker exec edu-cs-bot-rabbitmq-1 rabbitmqctl list_queues
+inbound.dead   0
+inbound.messages   0
+# worker/gateway 全程 healthy，无死信
+
+$ docker compose run --rm mock-llm pytest -q tests/unit/test_mock_llm_rules.py
+7 passed in 0.02s
+
+$ docker compose run --rm tools pytest -q tests/unit -rs
+SKIPPED [1] tests/unit/test_mock_llm_rules.py:10: could not import 'mocks.mock_llm.rules': No module named 'mocks'
+45 passed, 1 skipped in 1.22s
+```
+验证完执行了 `docker compose down`。
+
+**人工审查与修复点**：
+（等 Jo 验证后再补充）

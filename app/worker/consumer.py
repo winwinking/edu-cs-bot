@@ -32,13 +32,13 @@ async def _on_message(message: aio_pika.IncomingMessage) -> None:
     except (json.JSONDecodeError, KeyError, TypeError):
         logger.error("消息体格式不对，进死信", exc_info=True)
         await message.reject(requeue=False)
-        messages_total.labels(result="dead_letter").inc()
+        messages_total.labels(result="dead_letter", intent="").inc()
         process_seconds.observe(time.monotonic() - start)
         clear_trace_context()
         return
 
     try:
-        result = await process_inbound_message(
+        result, intent = await process_inbound_message(
             tenant_id=tenant_id,
             user_id=user_id,
             conversation_id_raw=conversation_id_raw,
@@ -47,12 +47,12 @@ async def _on_message(message: aio_pika.IncomingMessage) -> None:
             trace_id=trace_id,
         )
         await message.ack()
-        messages_total.labels(result=result).inc()
+        messages_total.labels(result=result, intent=intent or "").inc()
     except Exception:
         # process_inbound_message 已经把"可预期"的情况都处理掉了，走到这里说明是真正的 bug 或数据损坏
         logger.error("处理消息出现不可预期异常，进死信", exc_info=True)
         await message.reject(requeue=False)
-        messages_total.labels(result="dead_letter").inc()
+        messages_total.labels(result="dead_letter", intent="").inc()
     finally:
         process_seconds.observe(time.monotonic() - start)
         clear_trace_context()

@@ -1,5 +1,5 @@
 """WebSocket 消息协议。客户端内容只能出现在这些结构化字段里，网关校验完才会往下传。"""
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, field_validator
 
@@ -48,6 +48,8 @@ class ReplyEndMessage(BaseModel):
 
     type: Literal["reply_end"] = "reply_end"
     reply_to: str
+    # 调试/测试/阶段三演示控制台用：意图、路由来源、工具调用情况、引用出处等，见 PHASE2.md 1.9
+    meta: Optional[dict[str, Any]] = None
 
 
 class ErrorMessage(BaseModel):

@@ -28,15 +28,37 @@ _QUESTION_FEATURE_ANY = ("吗", "怎么", "多久", "能不能", "是否", "什�
 # 财务参数里 target_user_id 的格式：u_<租户字母>_<数字>，如 u_a_1002
 _TARGET_USER_ID_RE = re.compile(r"u_[a-z]_\d+")
 
+# 问候规则（插在 R4 之前）：单纯的问候语不该被 R4 的问句特征词（比如"在吗"里的"吗"）误判成
+# 知识问答。去掉标点和空格后，如果整条消息完全由问候词拼成，就不调工具，走 R5 闲聊文字回复
+_GREETING_WORDS = ("你好", "您好", "在吗", "在不在", "hi", "hello")
+_GREETING_STRIP_RE = re.compile(r"[，。！？、；：\s,.!?;:]+")
+_GREETING_FULLMATCH_RE = re.compile(
+    "(?:" + "|".join(sorted(_GREETING_WORDS, key=len, reverse=True)) + ")+", re.IGNORECASE
+)
+
+
+def _is_greeting(content: str) -> bool:
+    stripped = _GREETING_STRIP_RE.sub("", content)
+    if not stripped:
+        return False
+    return bool(_GREETING_FULLMATCH_RE.fullmatch(stripped))
+
 
 def match_tool_call(content: str) -> Optional[tuple[str, dict]]:
-    """按 R1→R4 顺序检查，返回 (tool_name, args)；都不命中（R5）返回 None，调用方应该走闲聊文字回复"""
-    return (
-        _match_reminder(content)
-        or _match_finance(content)
-        or _match_platform_command(content)
-        or _match_knowledge(content)
-    )
+    """按 R1→R4 顺序检查，返回 (tool_name, args)；问候语和都不命中（R5）时返回 None，
+    调用方应该走闲聊文字回复。"""
+    reminder = _match_reminder(content)
+    if reminder is not None:
+        return reminder
+    finance = _match_finance(content)
+    if finance is not None:
+        return finance
+    platform = _match_platform_command(content)
+    if platform is not None:
+        return platform
+    if _is_greeting(content):
+        return None
+    return _match_knowledge(content)
 
 
 def _match_reminder(content: str) -> Optional[tuple[str, dict]]:

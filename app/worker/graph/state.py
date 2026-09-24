@@ -1,0 +1,45 @@
+"""LangGraph 编排的 state 定义和跑图时注入的依赖（PHASE2.md 2.7 第 1 点）。
+
+state 只负责在节点之间传递"决策"用得到的数据，不放数据库 session 这类资源——资源通过
+GraphContext（LangGraph 的 context_schema）传，节点用 runtime.context 拿，state 保持可序列化、
+方便以后要接 LangGraph 的 checkpoint/调试工具时不会因为塞了不可序列化的对象而出问题。
+"""
+from dataclasses import dataclass
+from typing import Any, List, Optional, TypedDict
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+
+class GraphState(TypedDict, total=False):
+    tenant_id: str
+    user_id: str
+    role: str
+    conversation_id: str
+    message_id: str
+    trace_id: Optional[str]
+
+    content: str  # 当前这条用户消息
+    history: List[dict]  # 历史消息（不含当前这条），[{"role": ..., "content": ...}]
+
+    intent: Optional[str]
+    route_source: Optional[str]  # rule | llm | rule_fallback
+    # LLM 输出非法/调用失败时用来区分该用哪句固定话术：invalid_output（非法 JSON/未知工具/schema 不对）
+    # 或 llm_unavailable（LLM 调用本身失败，关键词兜底也判断不出来）
+    fallback_reason: Optional[str]
+
+    tool_call: Optional[dict]  # {"name": str, "args": dict}，已经过 parse_tool_call 校验
+    tools_meta: List[dict]  # meta.tools：本轮尝试解析/调用过的工具，[{"name", "status", ...}]
+
+    reply_plan: Optional[dict]  # {"mode": "template", "text": ...} 或 {"mode": "generate", "messages": ...}
+    citations: List[dict]
+    risk_flags: List[str]
+
+    pending_action_id: Optional[str]
+    handoff_ticket_id: Optional[str]
+
+
+@dataclass
+class GraphContext:
+    """跑一次图用得到的依赖，通过 `.ainvoke(..., context=GraphContext(session=session))` 注入。"""
+
+    session: AsyncSession

@@ -1,26 +1,22 @@
-"""单条入站消息的业务处理：校验会话归属 -> 去重插入 -> 读取上下文 -> 调 LLM -> 写回复 -> 推流式分片。"""
-import time
+"""单条入站消息的业务处理：校验会话归属 -> 去重插入 -> 读取上下文 -> 跑 LangGraph 编排 -> 写回复。"""
 import uuid
-from typing import List, Optional
+from typing import Any, List, Optional
 
-from openai import APIConnectionError, APIError, APITimeoutError
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
 from app.common.config import get_settings
 from app.common.db import AsyncSessionLocal
-from app.common.llm_client import stream_chat_completion
 from app.common.logging import get_logger
 from app.common.models import Conversation, Message, MessageRole, MessageStatus
 
-from app.worker.metrics import first_token_seconds
-from app.worker.pubsub import publish_error, publish_reply_chunk, publish_reply_end
+from app.worker.graph.graph import COMPILED_GRAPH, respond
+from app.worker.graph.state import GraphContext, GraphState
+from app.worker.pubsub import publish_error
 
 settings = get_settings()
 logger = get_logger(__name__)
-
-_DEGRADED_REPLY = "系统有点忙，我稍后再回复你，也可以回复'转人工'"
 
 
 class ConversationForbidden(Exception):
@@ -92,13 +88,16 @@ async def _upsert_user_message(
     return "done" if status == MessageStatus.replied else "retry"
 
 
-async def _load_recent_messages(session, tenant_id: str, conversation_id: uuid.UUID, limit: int) -> List[dict]:
-    stmt = (
-        select(Message.role, Message.content)
-        .where(Message.tenant_id == tenant_id, Message.conversation_id == conversation_id)
-        .order_by(Message.created_at.desc())
-        .limit(limit)
-    )
+async def _load_recent_messages(
+    session, tenant_id: str, conversation_id: uuid.UUID, limit: int, exclude_message_id: Optional[str] = None
+) -> List[dict]:
+    """历史消息不包含当前这条——LangGraph 的 state 把"历史"和"当前用户消息"分开放
+    （PHASE2.md 2.7 第 1 点），排除掉当前 message_id 避免这条消息在 LLM 的上下文里出现两次。
+    """
+    conditions = [Message.tenant_id == tenant_id, Message.conversation_id == conversation_id]
+    if exclude_message_id is not None:
+        conditions.append(Message.message_id != exclude_message_id)
+    stmt = select(Message.role, Message.content).where(*conditions).order_by(Message.created_at.desc()).limit(limit)
     result = await session.execute(stmt)
     rows = list(result.all())
     rows.reverse()  # 数据库按时间倒序取出的，喂给 LLM 前要反转成"旧的在前，新的在后"
@@ -106,7 +105,13 @@ async def _load_recent_messages(session, tenant_id: str, conversation_id: uuid.U
 
 
 async def _insert_assistant_message(
-    session, tenant_id: str, conversation_id: uuid.UUID, content: str, trace_id: Optional[str]
+    session,
+    tenant_id: str,
+    conversation_id: uuid.UUID,
+    content: str,
+    trace_id: Optional[str],
+    intent: Optional[str],
+    meta: dict[str, Any],
 ) -> None:
     session.add(
         Message(
@@ -119,6 +124,8 @@ async def _insert_assistant_message(
             role=MessageRole.assistant,
             content=content,
             trace_id=trace_id,
+            intent=intent,
+            meta=meta,
         )
     )
 
@@ -133,20 +140,13 @@ async def _mark_user_message_replied(session, tenant_id: str, client_message_id:
     )
 
 
-async def _stream_and_publish_reply(tenant_id: str, user_id: str, reply_to: str, history: List[dict]) -> str:
-    start = time.monotonic()
-    first_token_seen = False
-    chunks: List[str] = []
-    seq = 0
-    async for delta in stream_chat_completion(history):
-        if not first_token_seen:
-            first_token_seconds.observe(time.monotonic() - start)
-            first_token_seen = True
-        chunks.append(delta)
-        await publish_reply_chunk(tenant_id, user_id, reply_to, seq, delta)
-        seq += 1
-    await publish_reply_end(tenant_id, user_id, reply_to)
-    return "".join(chunks)
+def _metric_result(route_source: Optional[str]) -> str:
+    """算错误率用的粗粒度结果：route_source=rule_fallback 说明 LLM 调用本身失败了（不管关键词
+    兜底最后判没判出意图），跟阶段一"llm_degraded"是同一件事；rule/llm 都是 LLM 链路正常，算 ok。
+    LLM 返回非法输出（invalid_output）不算这里的"降级"——LLM 本身是通的，系统只是正确地没有
+    执行未经校验的输出，请求依然端到端处理完了，所以也算 ok。
+    """
+    return "llm_degraded" if route_source == "rule_fallback" else "ok"
 
 
 async def process_inbound_message(
@@ -157,12 +157,14 @@ async def process_inbound_message(
     client_message_id: str,
     content: str,
     trace_id: Optional[str],
-) -> str:
-    """返回本次处理结果的标签，只用来打指标。
+) -> tuple[str, Optional[str]]:
+    """返回 (result, intent) 打指标用：result 是阶段一定下来的粗粒度取值（ok/forbidden/duplicate/
+    llm_degraded），给错误率统计用；intent 是跑完图之后的具体意图（forbidden/duplicate 场景还没
+    跑图，intent 是 None）。
 
-    所有"预期内"的情况（越权、去重命中、LLM 失败）都在这里处理完并正常返回，不往外抛异常；
-    真正往外抛的异常（数据库挂了、conversation_id 格式非法等）由上层（consumer）判定为
-    不可预期异常，reject 进死信，这里不用关心队列层面的 ack/reject。
+    所有"预期内"的情况（越权、去重命中、LLM 失败）都在这里或 LangGraph 编排（app/worker/graph）
+    内部处理完并正常返回，不往外抛异常；真正往外抛的异常（数据库挂了、conversation_id 格式非法
+    等）由上层（consumer）判定为不可预期异常，reject 进死信，这里不用关心队列层面的 ack/reject。
     """
     async with AsyncSessionLocal() as session:
         try:
@@ -171,7 +173,7 @@ async def process_inbound_message(
             await session.rollback()
             await publish_error(tenant_id, user_id, client_message_id, "forbidden", "该会话不属于当前用户")
             logger.warning("越权访问会话", conversation_id=conversation_id_raw)
-            return "forbidden"
+            return "forbidden", None
 
         outcome = await _upsert_user_message(
             session, tenant_id, conversation_id, client_message_id, content, trace_id
@@ -179,7 +181,7 @@ async def process_inbound_message(
         await session.commit()
         if outcome == "done":
             logger.info("消息已完整回复过，跳过", message_id=client_message_id)
-            return "duplicate"
+            return "duplicate", None
         if outcome == "retry":
             logger.warning(
                 "消息之前处理到一半就中断了（用户消息已入库但未回复），重新生成回复",
@@ -187,26 +189,40 @@ async def process_inbound_message(
             )
 
         history = await _load_recent_messages(
-            session, tenant_id, conversation_id, settings.conversation_history_limit
+            session,
+            tenant_id,
+            conversation_id,
+            settings.conversation_history_limit,
+            exclude_message_id=client_message_id,
         )
         await session.commit()
 
-    # LLM 调用挪到 session 外面：流式请求可能要好几秒，不能一直占着数据库连接
-    try:
-        reply_text = await _stream_and_publish_reply(tenant_id, user_id, client_message_id, history)
-        result = "ok"
-    except (APIError, APITimeoutError, APIConnectionError) as exc:
-        # 可预期的失败：LLM 超时/报错，推一条降级回复给用户，不进死信
-        reply_text = _DEGRADED_REPLY
-        await publish_reply_chunk(tenant_id, user_id, client_message_id, 0, reply_text)
-        await publish_reply_end(tenant_id, user_id, client_message_id)
-        logger.warning("LLM 调用失败，已发送降级回复", error=str(exc))
-        result = "llm_degraded"
+    initial_state: GraphState = {
+        "tenant_id": tenant_id,
+        "user_id": user_id,
+        "conversation_id": str(conversation_id),
+        "message_id": client_message_id,
+        "trace_id": trace_id,
+        "content": content,
+        "history": history,
+    }
+
+    # classify 节点要查 users/pending_actions 表，还要调一次非流式 LLM 判断意图，这段会占用一个
+    # 数据库连接；真正可能耗时更久的流式生成挪到 respond()，respond() 在这个 session 关闭之后才跑，
+    # 不占数据库连接
+    async with AsyncSessionLocal() as graph_session:
+        final_state: GraphState = await COMPILED_GRAPH.ainvoke(
+            initial_state, context=GraphContext(session=graph_session)
+        )
+
+    reply_text, meta = await respond(tenant_id, user_id, client_message_id, final_state)
 
     async with AsyncSessionLocal() as session:
-        await _insert_assistant_message(session, tenant_id, conversation_id, reply_text, trace_id)
-        # 降级回复也算"已经给用户答复过"，同样标记 replied，不需要也不应该之后再重新生成一次真回复
+        await _insert_assistant_message(
+            session, tenant_id, conversation_id, reply_text, trace_id, meta.get("intent"), meta
+        )
+        # respond() 跑完就代表已经给用户答复过了（不管走的是哪条分支），标记 replied
         await _mark_user_message_replied(session, tenant_id, client_message_id)
         await session.commit()
 
-    return result
+    return _metric_result(meta.get("route_source")), meta.get("intent")
