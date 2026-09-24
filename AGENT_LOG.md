@@ -483,4 +483,50 @@ $ docker compose run --rm tools python scripts/mockctl.py all reset
 额外验证了同一个 `--conv c_test_1` 连续发两轮消息，`sql.py` 查出来 4 条消息（2 轮 user+assistant）全部挂在同一个 `conversation_id` 下，确认多轮对话延续机制正确。
 
 **人工审查与修复点**：
+无
+
+---
+
+## 步骤 2.5：mock-llm 扩展
+
+**日期**：2026-09-24
+
+**改动/新建模块**：
+- `mocks/mock_llm/rules.py`：新建，R1~R4 确定性 tool_calls 规则（R5 不命中任何规则时返回 `None`，调用方走闲聊文字回复），以及 `<资料>` 块提取、转人工摘要请求识别
+- `mocks/mock_llm/main.py`：重写 `/v1/chat/completions`——请求带 `tools` 时按规则匹配返回 `tool_calls`（流式/非流式都支持），不带 `tools` 或规则落到 R5 时走文字生成；新增 `hallucinate`/`ai_flavor`/`error500` 三种故障模式（在原有 `invalid_json` 占位、`latency_ms`、`error_rate` 之外）；响应带 `usage`（按字数估算）
+- `scripts/llm_probe.py`：新建，带一份手写的最小工具 JSON Schema 请求一次 LLM，打印 `tool_calls` 原文
+
+**关键决策**：
+- `error500` 是确定性故障（只要是这个 mode 就必定 500），和已有的 `error_rate`（概率性故障）分开处理，两者语义不一样：`error_rate` 测的是"偶尔失败系统会不会整体受影响"，`error500` 测的是"这一次一定失败，兜底逻辑对不对"
+- `invalid_json` 模式下的坏 JSON 是把正确算出来的 `arguments` 字符串直接截断（切掉结尾几个字符），不是写死一个固定的坏字符串——这样不管命中哪条规则、参数是什么，截断后必然是非法 JSON，不用为每个工具单独造一个坏例子
+- `llm_probe.py` 里的工具 JSON Schema 是手写的最小版本，不是从 2.6 的 Pydantic 模型生成的正式注册表——2.6 还没做，这个探针脚本只是用来独立验证 mock-llm 的规则引擎，跟以后 worker 真正用的工具定义是两回事，2.6/2.7 接上以后 worker 走的是那一份，不会用这里手写的
+- R3 平台指令规则如果匹配到触发词（帮我/给我/替我/请帮/打开开头）但里面没有任何一个具体动作关键词（自动续费/请假/课程表/学习报告/课程提醒），按"没有命中 R3"处理，继续往下走 R4/R5，不会返回一个残缺的 `platform_command` 调用
+
+**验证记录**：
+```
+$ docker compose run --rm tools python scripts/llm_probe.py "帮我把自动续费关了"
+[tool_call] name=platform_command
+  arguments(原文)='{"action": "disable_auto_renew"}'
+
+$ docker compose run --rm tools python scripts/llm_probe.py "我上个月的发票开了吗"
+[tool_call] name=query_finance
+  arguments(原文)='{"kind": "invoices", "period": "last_month"}'
+
+$ docker compose run --rm tools python scripts/llm_probe.py "发票多久能开"
+[tool_call] name=search_knowledge
+  arguments(原文)='{"query": "发票多久能开"}'
+
+$ docker compose run --rm tools python scripts/mockctl.py llm mode=invalid_json
+$ docker compose run --rm tools python scripts/llm_probe.py "帮我把自动续费关了"
+[tool_call] name=platform_command
+  arguments(原文)='{"action": "disable_auto_rene'
+  arguments 不是合法 JSON：Unterminated string starting at: line 1 column 12 (char 11)
+
+$ docker compose run --rm tools python scripts/mockctl.py all reset
+```
+四条 tool_calls 结果和 PHASE2.md 预期完全一致；invalid_json 模式下 arguments 确实是截断的坏 JSON。
+
+额外自测了 `hallucinate`（回复开头加第 9.9 条退款话术）、`ai_flavor`（回复结尾加"希望对你有帮助！"）、`error500`（openai SDK 抛 `InternalServerError`）三种故障模式，行为都符合预期（文档本步没要求测这三个，是我自己顺带验证的，因为代码是这一步一起写的）。
+
+**人工审查与修复点**：
 （等 Jo 验证后再补充）
