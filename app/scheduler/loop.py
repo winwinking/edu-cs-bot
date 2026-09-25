@@ -24,6 +24,7 @@ from app.common.db import AsyncSessionLocal
 from app.common.logging import get_logger
 from app.common.models import Message, MessageRole, Reminder, ReminderStatus
 from app.common.reminder_rules import advance_after_trigger, resolve_timezone
+from app.scheduler.metrics import reminder_push_delay_seconds, reminder_push_total
 from app.scheduler.pubsub import publish_reminder_push
 
 settings = get_settings()
@@ -75,7 +76,13 @@ async def _process_due_reminders() -> int:
                     reminder_id=str(item.id),
                     error=str(exc),
                 )
+                reminder_push_total.labels(result="error").inc()
                 continue
+
+            reminder_push_total.labels(result="ok").inc()
+            # 这里读 next_trigger_at 还是这一条本来到期的时间——下面 advance_after_trigger()
+            # 才会把它改成下一次触发时间，晚一步读就量不出真实的推送延迟了
+            reminder_push_delay_seconds.observe((now - item.next_trigger_at).total_seconds())
 
             session.add(
                 Message(

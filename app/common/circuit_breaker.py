@@ -10,9 +10,16 @@
 import time
 from dataclasses import dataclass, field
 
+from prometheus_client import Gauge
+
 from app.common.logging import get_logger
 
 logger = get_logger(__name__)
+
+# 0=closed 1=half_open 2=open（阶段三第 6 步）：数值化是因为 Prometheus Gauge 只能存数字，
+# 具体含义只在这三个值之间切换，画图/告警时按数值区间判断就行，不需要额外的映射表
+_STATE_VALUE = {"closed": 0, "half_open": 1, "open": 2}
+circuit_breaker_state = Gauge("worker_circuit_breaker_state", "熔断器状态：0=closed 1=half_open 2=open", ["service"])
 
 
 class CircuitBreakerOpenError(Exception):
@@ -36,9 +43,16 @@ class CircuitBreaker:
     # half_open 时只放一个试探请求，其余并发请求在试探结果出来之前一律当成还在熔断
     _probing: bool = field(default=False, init=False)
 
+    def __post_init__(self) -> None:
+        circuit_breaker_state.labels(service=self.name).set(_STATE_VALUE[self._state])
+
+    def _set_state(self, new_state: str) -> None:
+        self._state = new_state
+        circuit_breaker_state.labels(service=self.name).set(_STATE_VALUE[new_state])
+
     def _refresh_state(self) -> None:
         if self._state == "open" and time.monotonic() - self._opened_at >= self.open_seconds:
-            self._state = "half_open"
+            self._set_state("half_open")
             logger.info("熔断进入半开，等待试探请求", service=self.name)
 
     @property
@@ -58,19 +72,19 @@ class CircuitBreaker:
     def record_success(self) -> None:
         if self._state != "closed":
             logger.info("熔断恢复", service=self.name)
-        self._state = "closed"
+        self._set_state("closed")
         self._failure_count = 0
         self._probing = False
 
     def record_failure(self) -> None:
         self._probing = False
         if self._state == "half_open":
-            self._state = "open"
+            self._set_state("open")
             self._opened_at = time.monotonic()
             logger.warning("熔断试探请求失败，继续熔断", service=self.name)
             return
         self._failure_count += 1
         if self._failure_count >= self.failure_threshold and self._state != "open":
-            self._state = "open"
+            self._set_state("open")
             self._opened_at = time.monotonic()
             logger.warning("连续失败达到阈值，熔断打开", service=self.name, failures=self._failure_count)

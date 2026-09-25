@@ -19,7 +19,8 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.circuit_breaker import CircuitBreakerOpenError
-from app.common.llm_client import chat_completion
+from app.common.llm_client import LLM_MODEL, chat_completion, estimate_tokens, extract_usage_from_response
+from app.common.llm_usage import add_tokens_used, get_daily_budget, is_budget_exceeded, record_llm_usage
 from app.common.logging import get_logger
 from app.common.models import Conversation, PendingAction, PendingActionStatus
 from app.common.prompt_guard import detect_prompt_injection
@@ -158,12 +159,28 @@ def _tool_meta_entry(name: str, parsed: "ParsedToolCall | ToolCallError") -> dic
     return {"name": name, "status": "ok"}
 
 
-async def _classify_with_llm(state: GraphState) -> dict:
+async def _classify_with_llm(state: GraphState, session: AsyncSession) -> dict:
     # 当前时间是代码算出来的事实，不是用户输入，放进 system prompt 没问题（关键设计决定 6）；
     # <提醒列表> 块拼进 user 消息（不是 system），跟 <资料>/<历史摘要> 这类"资料性"内容一个
     # 位置——修改/取消提醒时 LLM 要从这里挑 id。两者都是 load_context 这一步统一查好放进
     # state 的，这里不用再连数据库
+    tenant_id = state["tenant_id"]
     tenant_timezone = state.get("tenant_timezone") or "Asia/Shanghai"
+
+    budget = await get_daily_budget(session, tenant_id)
+    if await is_budget_exceeded(tenant_id, tenant_timezone, budget):
+        logger.warning("机构今日 token 预算已用完，意图识别降级为关键词规则", tenant_id=tenant_id)
+        result = _keyword_fallback_classify(state["content"])
+        result["budget_exceeded"] = True
+        if result.get("intent") == "fallback":
+            # 人审发现：关键词规则也没命中时，_keyword_fallback_classify 统一给的
+            # fallback_reason="llm_unavailable" 对应"系统这会儿有点忙，稍后再试"——这句话在
+            # 预算耗尽的场景下是错的，预算要等到第二天才恢复，"稍后再试"只会让用户反复重试。
+            # 熔断打开走的还是上面 except CircuitBreakerOpenError 那条分支，不受这里影响，
+            # 继续用"系统这会儿有点忙"（那种情况确实是"过一会儿再试"就可能好了）
+            result["fallback_reason"] = "budget_exceeded"
+        return result
+
     system_content = f"{STYLE_SYSTEM_PROMPT}\n{build_current_time_note(tenant_timezone)}"
     user_content = append_summary_block(state["content"], state.get("history_summary"))
     reminder_block = state.get("reminder_list_block") or ""
@@ -184,6 +201,23 @@ async def _classify_with_llm(state: GraphState) -> dict:
     except (APIError, APITimeoutError, APIConnectionError) as exc:
         logger.warning("LLM 分类调用失败，降级为关键词规则", error=str(exc))
         return _keyword_fallback_classify(state["content"])
+
+    usage = extract_usage_from_response(response)
+    estimated = usage is None
+    completion_text = getattr(response.choices[0].message, "content", None) or ""
+    prompt_tokens, completion_tokens = usage or estimate_tokens(messages, completion_text)
+    await add_tokens_used(tenant_id, tenant_timezone, prompt_tokens + completion_tokens)
+    await record_llm_usage(
+        session,
+        tenant_id=tenant_id,
+        conversation_id=state.get("conversation_id"),
+        trace_id=state.get("trace_id"),
+        purpose="intent",
+        model=LLM_MODEL,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        estimated=estimated,
+    )
 
     message = response.choices[0].message
     tool_calls = message.tool_calls or []
@@ -265,7 +299,7 @@ async def _classify_core(state: GraphState, session: AsyncSession, content: str)
         return {"intent": "high_risk", "route_source": "rule", "risk_flags": ["sensitive_request"]}
 
     # 5. LLM function calling
-    result = await _classify_with_llm(state)
+    result = await _classify_with_llm(state, session)
 
     # 短句 + 有未过期的待确认操作 + LLM/mock-llm 也没判出任何真实意图（chitchat）——这才是
     # "对/是的/好的"这类模糊回应的通用特征，PHASE2.md 2.10 第 6 点要求提醒回复确切的确认短语，

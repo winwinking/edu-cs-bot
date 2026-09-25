@@ -5,6 +5,7 @@ inbound.dead；处理中出现意外异常（比如数据库连不上），读�
 小于 DLQ_MAX_RETRIES 就把消息重新投回原队列、次数加 1，等于就进 inbound.dead——重试之间没有
 等待间隔（已知问题，写进 AGENT_LOG）。
 """
+import asyncio
 import json
 import time
 from functools import partial
@@ -14,10 +15,10 @@ from aio_pika.abc import AbstractExchange, AbstractRobustConnection
 
 from app.common.config import get_settings
 from app.common.logging import bind_trace_context, clear_trace_context, get_logger
-from app.common.mq import INBOUND_ROUTING_KEY, declare_topology, get_confirm_channel, get_connection
+from app.common.mq import DEAD_QUEUE, INBOUND_QUEUE, INBOUND_ROUTING_KEY, declare_topology, get_confirm_channel, get_connection
 
 from app.worker.handler import process_inbound_message
-from app.worker.metrics import messages_total, process_seconds
+from app.worker.metrics import message_dead_letter_total, message_retry_total, messages_total, process_seconds, queue_backlog
 
 settings = get_settings()
 logger = get_logger(__name__)
@@ -63,6 +64,7 @@ async def _on_message(message: aio_pika.IncomingMessage, *, inbound_exchange: Ab
         logger.error("消息体格式不对，进死信", exc_info=True)
         await message.reject(requeue=False)
         messages_total.labels(result="dead_letter", intent="").inc()
+        message_dead_letter_total.inc()
         process_seconds.observe(time.monotonic() - start)
         clear_trace_context()
         return
@@ -87,13 +89,41 @@ async def _on_message(message: aio_pika.IncomingMessage, *, inbound_exchange: Ab
             )
             await _requeue_with_retry(inbound_exchange, message, retry_count + 1)
             messages_total.labels(result="retry", intent="").inc()
+            message_retry_total.inc()
         else:
             logger.error("处理消息出现不可预期异常，重试次数用完，进死信", retry_count=retry_count, exc_info=True)
             await message.reject(requeue=False)
             messages_total.labels(result="dead_letter", intent="").inc()
+            message_dead_letter_total.inc()
     finally:
         process_seconds.observe(time.monotonic() - start)
         clear_trace_context()
+
+
+_BACKLOG_POLL_SECONDS = 5
+
+
+async def run_queue_backlog_poller(connection: AbstractRobustConnection) -> None:
+    """每 5 秒查一次两个队列的深度（阶段三第 6 步：队列积压指标），给告警/演示控制台看排队情况。
+    用被动声明（passive=True）只读队列当前状态，每轮开一个新 channel、用完就关——量小，
+    没必要跟消费用的那个 channel 共用，也不用担心某一轮查询失败把 channel 搞坏影响下一轮。
+    """
+    try:
+        while True:
+            try:
+                channel = await connection.channel()
+                inbound = await channel.declare_queue(INBOUND_QUEUE, passive=True)
+                dead = await channel.declare_queue(DEAD_QUEUE, passive=True)
+                queue_backlog.labels(queue=INBOUND_QUEUE).set(inbound.declaration_result.message_count)
+                queue_backlog.labels(queue=DEAD_QUEUE).set(dead.declaration_result.message_count)
+                await channel.close()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("查询队列积压失败", exc_info=True)
+            await asyncio.sleep(_BACKLOG_POLL_SECONDS)
+    except asyncio.CancelledError:
+        pass
 
 
 async def run_consumer() -> AbstractRobustConnection:
@@ -103,4 +133,5 @@ async def run_consumer() -> AbstractRobustConnection:
     inbound_exchange, inbound_queue, _ = await declare_topology(channel)
     await inbound_queue.consume(partial(_on_message, inbound_exchange=inbound_exchange))
     logger.info("worker 开始消费 inbound.messages", prefetch_count=settings.mq_prefetch_count)
+    asyncio.create_task(run_queue_backlog_poller(connection))
     return connection

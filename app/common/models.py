@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Enum,
     ForeignKey,
@@ -54,6 +55,8 @@ class Tenant(Base):
     # 提醒计算"明天 9 点""每天"这类相对时间要用的时区（阶段三 1）；数据库里事件时间存 UTC，
     # 这一列决定了 UTC 换算成用户能看懂的本地时间/日期时该用哪个时区
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, server_default="Asia/Shanghai")
+    # 每天的 token 上限（阶段三第 6 步，设计决定 13）；留空就用 .env 的 DEFAULT_DAILY_TOKEN_BUDGET
+    daily_token_budget: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
 
 class User(Base):
@@ -281,6 +284,31 @@ class ConversationSummary(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+class LlmUsage(Base):
+    """每次 LLM 调用记一条（阶段三第 6 步，设计决定 13）：按 (tenant_id, created_at) 统计成本，
+    写入失败只打日志、不影响回复（见 app/common/llm_usage.py），所以这张表允许有极少数漏记。"""
+
+    __tablename__ = "llm_usage"
+    __table_args__ = (Index("ix_llm_usage_tenant_created", "tenant_id", "created_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    # 摘要/转人工摘要不一定挂在某条正在处理的用户消息上，允许为空
+    conversation_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    trace_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # intent（意图识别）/ chat（闲聊生成）/ knowledge（知识问答生成）/ summary（历史摘要）/
+    # handoff（转人工摘要）——跟 mock-llm 无关，是 worker 这边发起调用的目的，用字符串就够，
+    # 不需要单独建数据库枚举类型
+    purpose: Mapped[str] = mapped_column(String(32), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    completion_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    # mock-llm/真实 LLM 没返回 usage 时按字数估算，这里标出来，避免估算值和真实值混在一起
+    # 被误当成精确成本汇总
+    estimated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class ReminderRepeat(str, enum.Enum):

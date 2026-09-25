@@ -15,6 +15,26 @@ import pytest
 from app.worker.graph import classify as classify_module
 
 
+@pytest.fixture(autouse=True)
+def _no_budget_limit(monkeypatch):
+    """阶段三第 6 步给 `_classify_with_llm` 加了 token 预算检查和用量记录，这两步都要连
+    数据库/Redis，这份文件手写的假 session 不支持，统一 monkeypatch 成"预算没超、记录是
+    空操作"，不影响这里测的"确认/取消边界判断"。"""
+
+    async def fake_get_daily_budget(session, tenant_id):
+        return None
+
+    async def fake_add_tokens_used(*args, **kwargs):
+        return None
+
+    async def fake_record_llm_usage(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(classify_module, "get_daily_budget", fake_get_daily_budget)
+    monkeypatch.setattr(classify_module, "add_tokens_used", fake_add_tokens_used)
+    monkeypatch.setattr(classify_module, "record_llm_usage", fake_record_llm_usage)
+
+
 class _FakeResult:
     def __init__(self, row):
         self._row = row
@@ -41,6 +61,18 @@ class _FakeSession:
 
     async def commit(self):
         pass
+
+    async def rollback(self):
+        pass
+
+    def add(self, obj):
+        pass
+
+    async def get(self, model, pk):
+        # _classify_with_llm 的 token 预算检查会查一次 tenants 表（阶段三第 6 步）；
+        # 这里没有 tenant 数据可查，返回 None 让预算检查落回默认值（未配置=不限额），
+        # 跟这份文件测的"确认/取消边界判断"没关系
+        return None
 
 
 def _fake_chitchat_response() -> SimpleNamespace:

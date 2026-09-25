@@ -1,5 +1,6 @@
 """统一配置入口：全项目任何地方需要配置，只能从这里的 Settings 拿，不允许各模块自己读环境变量。"""
 from functools import lru_cache
+from typing import Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -126,6 +127,11 @@ class Settings(BaseSettings):
     # ---------- 死信（阶段三 5，设计决定 12）----------
     # 消息头 x-retry-count 达到这个值还失败，就不再重新投回队列，直接进 inbound.dead
     dlq_max_retries: int = 3
+
+    # ---------- token 预算（阶段三 6，设计决定 13）----------
+    # 机构没在 tenants.daily_token_budget 里单独设置时用这个值；留空（None）就是不限额，
+    # 开发/测试环境默认不设，演示预算降级时才通过 mockctl 之外的方式（改这个机构的这一列）单独打开
+    default_daily_token_budget: Optional[int] = None
 
     # ---------- 服务端口 ----------
     gateway_host_port: int = 8000

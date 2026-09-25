@@ -11,7 +11,9 @@ from langgraph.graph import END, StateGraph
 from openai import APIConnectionError, APIError, APITimeoutError
 
 from app.common.circuit_breaker import CircuitBreakerOpenError
-from app.common.llm_client import stream_chat_completion
+from app.common.db import AsyncSessionLocal
+from app.common.llm_client import LLM_MODEL, estimate_tokens, stream_chat_completion
+from app.common.llm_usage import add_tokens_used, record_llm_usage
 from app.common.logging import get_logger
 from app.worker.graph.classify import classify
 from app.worker.graph.command import cancel_action, command, confirm_action, confirm_ambiguous, request_confirmation
@@ -23,7 +25,7 @@ from app.worker.graph.nodes import chitchat, fallback, load_context, sensitive
 from app.worker.graph.reminder import reminder
 from app.worker.graph.state import GraphContext, GraphState
 from app.worker.graph.style import FALLBACK_LLM_UNAVAILABLE_REPLY
-from app.worker.metrics import first_token_seconds
+from app.worker.metrics import first_token_seconds, reply_seconds, tool_calls_total
 from app.worker.pubsub import publish_reply_chunk, publish_reply_end
 
 logger = get_logger(__name__)
@@ -105,6 +107,11 @@ COMPILED_GRAPH = _build_graph()
 
 
 def _build_meta(state: GraphState, guard: OutputGuard) -> dict[str, Any]:
+    # 工具调用计数（阶段三第 6 步）：集中在这一个地方按 tools_meta 打点，不用在每个业务节点
+    # （knowledge/finance/command/reminder/handoff）各自调一遍这个 Counter
+    for tool in state.get("tools_meta", []):
+        tool_calls_total.labels(tool=tool["name"], status=tool["status"]).inc()
+
     return {
         "intent": state.get("intent"),
         "route_source": state.get("route_source"),
@@ -124,10 +131,51 @@ def _build_meta(state: GraphState, guard: OutputGuard) -> dict[str, Any]:
         },
         # 本轮因为熔断打开被跳过的服务（阶段三第 5 步），没有就是空列表
         "circuit_breaker": state.get("circuit_breaker", []),
+        # 本轮因为机构今日 token 预算用完而跳过 LLM 调用（阶段三第 6 步，设计决定 13）
+        "budget_exceeded": state.get("budget_exceeded", False),
     }
 
 
+# reply_plan 走 generate 模式的节点只有这两个（chitchat/knowledge），预算检查已经在各自节点里
+# 做完了——respond() 只要能走到这个分支，就说明这次是真的要调 LLM，用 intent 反推 purpose，
+# 记 token 用量的时候不用每个节点各自传一遍
+_USAGE_PURPOSE_BY_INTENT = {"chitchat": "chat", "knowledge_qa": "knowledge"}
+
+
+async def _record_generate_usage(state: GraphState, plan: dict, chunks: list[str], usage_holder: dict) -> None:
+    tenant_id = state["tenant_id"]
+    tenant_timezone = state.get("tenant_timezone") or "Asia/Shanghai"
+    purpose = _USAGE_PURPOSE_BY_INTENT.get(state.get("intent"), "chat")
+
+    if usage_holder:
+        prompt_tokens = usage_holder["prompt_tokens"]
+        completion_tokens = usage_holder["completion_tokens"]
+        estimated = False
+    else:
+        # mock-llm/真实 LLM 没吐出 usage（提供方不支持，或者中途报错没能收到最后那个 usage
+        # chunk）时按字数估算，标 estimated=True，不能当精确成本汇总
+        prompt_tokens, completion_tokens = estimate_tokens(plan["messages"], "".join(chunks))
+        estimated = True
+
+    await add_tokens_used(tenant_id, tenant_timezone, prompt_tokens + completion_tokens)
+    # respond() 故意不占用跑图时那个 session（见 app/worker/handler.py 的注释：生成阶段可能
+    # 耗时较久，不该一直攥着一个数据库连接），这里只在生成结束之后临时开一个短连接写这一行记录
+    async with AsyncSessionLocal() as session:
+        await record_llm_usage(
+            session,
+            tenant_id=tenant_id,
+            conversation_id=state.get("conversation_id"),
+            trace_id=state.get("trace_id"),
+            purpose=purpose,
+            model=LLM_MODEL,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            estimated=estimated,
+        )
+
+
 async def respond(tenant_id: str, user_id: str, reply_to: str, state: GraphState) -> tuple[str, dict[str, Any]]:
+    reply_start = time.monotonic()
     plan = state["reply_plan"]
     # allowed_citations/lead_in 只有知识问答的 reply_plan 会带（2.8），其它节点不传就是 None，
     # OutputGuard 不做出处核对、不拼出处开头，行为跟 2.7 完全一样
@@ -148,13 +196,16 @@ async def respond(tenant_id: str, user_id: str, reply_to: str, state: GraphState
     else:
         first_token_seen = False
         start = time.monotonic()
+        usage_holder: dict[str, int] = {}
+        stream_ok = False
         try:
-            async for delta in stream_chat_completion(plan["messages"]):
+            async for delta in stream_chat_completion(plan["messages"], usage_holder=usage_holder):
                 if not first_token_seen:
                     first_token_seconds.observe(time.monotonic() - start)
                     first_token_seen = True
                 await emit(guard.feed(delta))
             await emit(guard.flush())
+            stream_ok = True
         except CircuitBreakerOpenError:
             logger.warning("LLM 熔断打开，生成回复降级为固定话术")
             state["circuit_breaker"] = list(state.get("circuit_breaker", [])) + ["llm"]
@@ -180,6 +231,12 @@ async def respond(tenant_id: str, user_id: str, reply_to: str, state: GraphState
             await emit(guard.feed(plan["fallback_text"]))
             await emit(guard.flush())
 
+        # 只有真的成功调用了 LLM（没被熔断拦下、没有中途报错）才记账——被熔断拦下/调用失败的
+        # 这次请求，mock-llm/真实 LLM 根本没收到或者没处理完，没有真实成本可记
+        if stream_ok:
+            await _record_generate_usage(state, plan, chunks, usage_holder)
+
     meta = _build_meta(state, guard)
     await publish_reply_end(tenant_id, user_id, reply_to, meta)
+    reply_seconds.observe(time.monotonic() - reply_start)
     return "".join(chunks), meta

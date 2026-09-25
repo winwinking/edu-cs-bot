@@ -75,6 +75,25 @@ def test_build_offline_reply_includes_service_hours():
     assert "服务时间是每天 8:30 至 20:30" in reply
 
 
+@pytest.fixture(autouse=True)
+def _no_budget_limit(monkeypatch):
+    """阶段三第 6 步给 `_generate_summary` 加了 token 预算检查和用量记录，这两步都要连数据库/
+    Redis，这里统一 monkeypatch 成"预算没超、记录是空操作"，不影响本文件其它纯函数测试。"""
+
+    async def fake_get_daily_budget(session, tenant_id):
+        return None
+
+    async def fake_add_tokens_used(*args, **kwargs):
+        return None
+
+    async def fake_record_llm_usage(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(handoff_module, "get_daily_budget", fake_get_daily_budget)
+    monkeypatch.setattr(handoff_module, "add_tokens_used", fake_add_tokens_used)
+    monkeypatch.setattr(handoff_module, "record_llm_usage", fake_record_llm_usage)
+
+
 @pytest.mark.asyncio
 async def test_generate_summary_masks_phone_number_when_falling_back_to_template(monkeypatch):
     """chat_completion 调用失败 -> 走 _fallback_summary 模板兜底 -> mask_text() 脱敏，
@@ -87,11 +106,13 @@ async def test_generate_summary_masks_phone_number_when_falling_back_to_template
     monkeypatch.setattr(handoff_module, "chat_completion", fake_chat_completion)
 
     state = {
+        "tenant_id": "t_a",
+        "tenant_timezone": "Asia/Shanghai",
         "content": "我的手机号是13812345678，麻烦联系我",
         "history": [],
     }
 
-    summary = await _generate_summary(state)
+    summary = await _generate_summary(state, session=None)
 
     assert "13812345678" not in summary
     assert "138****5678" in summary
@@ -105,8 +126,8 @@ async def test_generate_summary_falls_back_when_llm_returns_empty_content(monkey
 
     monkeypatch.setattr(handoff_module, "chat_completion", fake_chat_completion)
 
-    state = {"content": "发票多久能开", "history": []}
-    summary = await _generate_summary(state)
+    state = {"tenant_id": "t_a", "tenant_timezone": "Asia/Shanghai", "content": "发票多久能开", "history": []}
+    summary = await _generate_summary(state, session=None)
 
     assert summary == "发票多久能开"
 

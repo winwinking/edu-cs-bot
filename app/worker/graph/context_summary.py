@@ -16,7 +16,8 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.config import get_settings
-from app.common.llm_client import chat_completion
+from app.common.llm_client import LLM_MODEL, chat_completion, estimate_tokens, extract_usage_from_response
+from app.common.llm_usage import add_tokens_used, get_daily_budget, is_budget_exceeded, record_llm_usage
 from app.common.logging import get_logger
 from app.common.masking import mask_text
 from app.common.models import ConversationSummary, Message
@@ -64,15 +65,46 @@ def build_summary_messages(old_summary: Optional[str], transcript_messages: list
     ]
 
 
-async def _generate_summary_text(old_summary: Optional[str], transcript_messages: list[dict]) -> Optional[str]:
+async def _generate_summary_text(
+    session: AsyncSession,
+    tenant_id: str,
+    tenant_timezone: str,
+    conversation_id: uuid.UUID,
+    old_summary: Optional[str],
+    transcript_messages: list[dict],
+) -> Optional[str]:
+    # 机构今日 token 预算用完就跳过这一轮生成（PHASE3.md 第 6 步，设计决定 13："摘要跳过"）：
+    # 旧摘要留着不动，待覆盖的消息数只会越攒越多，下一条消息处理完之后会再检查一次，不会漏
+    budget = await get_daily_budget(session, tenant_id)
+    if await is_budget_exceeded(tenant_id, tenant_timezone, budget):
+        logger.info("机构今日 token 预算已用完，跳过本轮历史摘要生成", tenant_id=tenant_id)
+        return None
+
+    messages = build_summary_messages(old_summary, transcript_messages)
     try:
-        response = await chat_completion(messages=build_summary_messages(old_summary, transcript_messages))
+        response = await chat_completion(messages=messages)
         text = (response.choices[0].message.content or "").strip()
     except (APIError, APITimeoutError, APIConnectionError) as exc:
         logger.warning("生成历史摘要失败，保留旧摘要，下次再试", error=str(exc))
         return None
     if not text:
         return None
+
+    usage = extract_usage_from_response(response)
+    estimated = usage is None
+    prompt_tokens, completion_tokens = usage or estimate_tokens(messages, text)
+    await add_tokens_used(tenant_id, tenant_timezone, prompt_tokens + completion_tokens)
+    await record_llm_usage(
+        session,
+        tenant_id=tenant_id,
+        conversation_id=str(conversation_id),
+        trace_id=None,
+        purpose="summary",
+        model=LLM_MODEL,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        estimated=estimated,
+    )
     # 摘要要长期存库、还会被拼进以后每一轮的 LLM 请求里，必须先脱敏（硬性规则）
     return mask_text(text)
 
@@ -89,7 +121,9 @@ async def load_history_summary(
     return row[0] if row else None
 
 
-async def maybe_update_summary(session: AsyncSession, tenant_id: str, conversation_id: uuid.UUID) -> None:
+async def maybe_update_summary(
+    session: AsyncSession, tenant_id: str, conversation_id: uuid.UUID, tenant_timezone: str
+) -> None:
     """回复发完之后调用。找出"最近 limit 条之前、还没被摘要覆盖"的消息，够阈值就重新生成，
     不够或者生成失败都保持现状。"""
     limit = settings.conversation_history_limit
@@ -135,7 +169,12 @@ async def maybe_update_summary(session: AsyncSession, tenant_id: str, conversati
 
     transcript_messages = [{"role": row.role.value, "content": row.content} for row in pending_rows]
     new_summary = await _generate_summary_text(
-        summary_row.summary if summary_row else None, transcript_messages
+        session,
+        tenant_id,
+        tenant_timezone,
+        conversation_id,
+        summary_row.summary if summary_row else None,
+        transcript_messages,
     )
     if new_summary is None:
         return  # 保留旧摘要，不在这里重试

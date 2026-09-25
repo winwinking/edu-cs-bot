@@ -7,6 +7,7 @@ from typing import List, Optional
 
 import httpx
 
+from app.common.llm_usage import get_daily_budget, is_budget_exceeded
 from app.common.logging import get_logger
 from app.common.prompt_guard import build_reference_block
 from app.common.retrieval import SearchResult, get_retriever
@@ -76,6 +77,22 @@ async def knowledge(state: GraphState, runtime) -> dict:
         }
 
     lead_in = _build_lead_in(qualifying[:_MAX_LEAD_IN_CITATIONS])
+    citations_meta = [
+        {"doc_title": c.doc_title, "clause_no": c.clause_no, "score": round(c.score, 4)} for c in qualifying
+    ]
+
+    # token 预算用完时不调 LLM 组织语言，直接把命中条款原文带出处发出去（PHASE3.md 第 6 步，
+    # 设计决定 13：知识问答"直接给出命中条款原文并带出处"）——出处、条款内容都来自检索结果，
+    # 不是编的，这条路径本来就比 LLM 生成更"保真"，只是少了 LLM 把多条资料揉成一段话的润色
+    budget = await get_daily_budget(runtime.context.session, state["tenant_id"])
+    if await is_budget_exceeded(state["tenant_id"], state.get("tenant_timezone") or "Asia/Shanghai", budget):
+        return {
+            "reply_plan": {"mode": "template", "text": f"{lead_in}{qualifying[0].content}"},
+            "citations": citations_meta,
+            "tools_meta": [{"name": "search_knowledge", "status": tool_status}],
+            "budget_exceeded": True,
+        }
+
     snippets = [f"《{c.doc_title}》第 {c.clause_no} 条\n{c.content}" for c in qualifying]
     reference_block = build_reference_block(snippets)
 
@@ -97,8 +114,6 @@ async def knowledge(state: GraphState, runtime) -> dict:
             "fallback_text": f"我查到的相关规定是：{qualifying[0].content}",
         },
         # meta.citations 给客户端/调试用，不带正文内容，只带出处和分数
-        "citations": [
-            {"doc_title": c.doc_title, "clause_no": c.clause_no, "score": round(c.score, 4)} for c in qualifying
-        ],
+        "citations": citations_meta,
         "tools_meta": [{"name": "search_knowledge", "status": tool_status}],
     }

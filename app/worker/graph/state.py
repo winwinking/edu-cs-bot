@@ -54,6 +54,10 @@ class GraphState(TypedDict, total=False):
     # 比如 ["llm"]、["finance"]；给 reply_end 的 meta 用，客户端/演示控制台标出"熔断降级"
     circuit_breaker: List[str]
 
+    # 本轮因为机构当天 token 预算用完而跳过 LLM 调用（阶段三第 6 步，设计决定 13）；
+    # 给 reply_end 的 meta 用，跟 circuit_breaker 是并列但不同原因的两种"没真的调 LLM"
+    budget_exceeded: bool
+
 
 @dataclass
 class GraphContext:

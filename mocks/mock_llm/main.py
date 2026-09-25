@@ -51,6 +51,7 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
     stream: bool = False
+    stream_options: Optional[dict] = None
     tools: Optional[List[dict]] = None
     tool_choice: Optional[Union[str, dict]] = None
 
@@ -142,7 +143,22 @@ def _tool_call_arguments(name: str, args: dict) -> str:
     return arguments
 
 
-async def _stream_text_chunks(reply: str, completion_id: str, model: str) -> AsyncIterator[str]:
+def _usage_chunk(completion_id: str, model: str, created: int, usage: dict) -> str:
+    # 跟真实 OpenAI 传 stream_options={"include_usage": True} 时的行为一致：usage 单独放最后
+    # 一个 choices 为空的 chunk 里，不夹在正文/finish_reason 那个 chunk 里（PHASE3.md 第 6 步：
+    # "流式调用要拿到 usage；mock-llm 如果不返回 usage，就补上"）
+    chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [],
+        "usage": usage,
+    }
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+
+async def _stream_text_chunks(reply: str, completion_id: str, model: str, usage: dict) -> AsyncIterator[str]:
     await asyncio.sleep(_config["latency_ms"] / 1000)
     created = int(time.time())
     for ch in reply:
@@ -163,11 +179,12 @@ async def _stream_text_chunks(reply: str, completion_id: str, model: str) -> Asy
         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
     }
     yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
+    yield _usage_chunk(completion_id, model, created, usage)
     yield "data: [DONE]\n\n"
 
 
 async def _stream_tool_call_chunks(
-    name: str, arguments: str, completion_id: str, model: str
+    name: str, arguments: str, completion_id: str, model: str, usage: dict
 ) -> AsyncIterator[str]:
     await asyncio.sleep(_config["latency_ms"] / 1000)
     created = int(time.time())
@@ -204,6 +221,7 @@ async def _stream_tool_call_chunks(
         "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
     }
     yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
+    yield _usage_chunk(completion_id, model, created, usage)
     yield "data: [DONE]\n\n"
 
 
@@ -237,7 +255,9 @@ async def chat_completions(req: ChatCompletionRequest):
 
         if req.stream:
             return StreamingResponse(
-                _stream_tool_call_chunks(name, arguments, completion_id, req.model),
+                _stream_tool_call_chunks(
+                    name, arguments, completion_id, req.model, _usage(req.messages, arguments)
+                ),
                 media_type="text/event-stream",
             )
 
@@ -272,7 +292,7 @@ async def chat_completions(req: ChatCompletionRequest):
 
     if req.stream:
         return StreamingResponse(
-            _stream_text_chunks(reply, completion_id, req.model),
+            _stream_text_chunks(reply, completion_id, req.model, _usage(req.messages, reply)),
             media_type="text/event-stream",
         )
 

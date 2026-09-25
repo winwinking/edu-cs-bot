@@ -92,7 +92,7 @@ async def handle_inbound_message(
     except json.JSONDecodeError:
         bind_trace_context(trace_id=trace_id, tenant_id=tenant_id)
         await _send_error(websocket, None, "invalid_json", "消息不是合法的 JSON")
-        inbound_messages_total.labels(status="error").inc()
+        inbound_messages_total.labels(tenant_id=tenant_id, status="error").inc()
         logger.warning("收到非 JSON 消息")
         return
 
@@ -102,7 +102,7 @@ async def handle_inbound_message(
         message_id = data.get("message_id") if isinstance(data, dict) else None
         bind_trace_context(trace_id=trace_id, tenant_id=tenant_id)
         await _send_error(websocket, message_id, "invalid_message", str(exc))
-        inbound_messages_total.labels(status="error").inc()
+        inbound_messages_total.labels(tenant_id=tenant_id, status="error").inc()
         logger.warning("消息校验失败", errors=exc.errors())
         return
 
@@ -111,7 +111,7 @@ async def handle_inbound_message(
     allowed = await check_user_and_tenant_rate_limit(tenant_id, user_id)
     if not allowed:
         await _send_ack(websocket, msg.message_id, "rate_limited", trace_id, detail=RATE_LIMITED_REPLY)
-        inbound_messages_total.labels(status="rate_limited").inc()
+        inbound_messages_total.labels(tenant_id=tenant_id, status="rate_limited").inc()
         logger.info("消息被限流", message_id=msg.message_id)
         return
 
@@ -129,7 +129,7 @@ async def handle_inbound_message(
 
     if not is_new:
         await _send_ack(websocket, msg.message_id, "duplicate", trace_id)
-        inbound_messages_total.labels(status="duplicate").inc()
+        inbound_messages_total.labels(tenant_id=tenant_id, status="duplicate").inc()
         logger.info("重复消息", message_id=msg.message_id)
         return
 
@@ -144,10 +144,10 @@ async def handle_inbound_message(
         except RedisError:
             pass
         await _send_error(websocket, msg.message_id, "mq_publish_failed", "消息投递失败，请重试")
-        inbound_messages_total.labels(status="error").inc()
+        inbound_messages_total.labels(tenant_id=tenant_id, status="error").inc()
         logger.error("投递到 MQ 失败", message_id=msg.message_id, exc_info=True)
         return
 
     await _send_ack(websocket, msg.message_id, "accepted", trace_id)
-    inbound_messages_total.labels(status="accepted").inc()
+    inbound_messages_total.labels(tenant_id=tenant_id, status="accepted").inc()
     ack_latency_seconds.observe(time.monotonic() - start)

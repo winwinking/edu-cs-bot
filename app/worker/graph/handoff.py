@@ -10,7 +10,8 @@ from typing import Any, Optional
 from openai import APIConnectionError, APIError, APITimeoutError
 from sqlalchemy import func, select
 
-from app.common.llm_client import chat_completion
+from app.common.llm_client import LLM_MODEL, chat_completion, estimate_tokens, extract_usage_from_response
+from app.common.llm_usage import add_tokens_used, get_daily_budget, is_budget_exceeded, record_llm_usage
 from app.common.logging import get_logger
 from app.common.masking import mask_text
 from app.common.models import (
@@ -42,19 +43,45 @@ def _fallback_summary(messages: list[dict]) -> str:
     return "；".join(text[:50] for text in user_texts[-3:])
 
 
-async def _generate_summary(state: GraphState) -> str:
+async def _generate_summary(state: GraphState, session) -> str:
     history = list(state.get("history", []))
     transcript_messages = history + [{"role": "user", "content": state["content"]}]
     transcript = "\n".join(
         f"{'用户' if m['role'] == 'user' else '客服'}：{m['content']}" for m in transcript_messages
     )
 
+    tenant_id = state["tenant_id"]
+    tenant_timezone = state.get("tenant_timezone") or "Asia/Shanghai"
     summary = ""
-    try:
-        response = await chat_completion(messages=[{"role": "user", "content": _HANDOFF_SUMMARY_PROMPT_PREFIX + transcript}])
-        summary = (response.choices[0].message.content or "").strip()
-    except (APIError, APITimeoutError, APIConnectionError) as exc:
-        logger.warning("生成转人工摘要失败，改用模板拼接", error=str(exc))
+    # 预算用完时复用已有的兜底拼接（跟"LLM 调用失败"走同一条路径）：转人工摘要不是给用户看的
+    # 正式回复，少一次 LLM 润色不影响转接本身，没必要为这一条单独设计新的降级文案
+    budget = await get_daily_budget(session, tenant_id)
+    if await is_budget_exceeded(tenant_id, tenant_timezone, budget):
+        logger.info("机构今日 token 预算已用完，转人工摘要改用模板拼接", tenant_id=tenant_id)
+    else:
+        messages = [{"role": "user", "content": _HANDOFF_SUMMARY_PROMPT_PREFIX + transcript}]
+        try:
+            response = await chat_completion(messages=messages)
+            summary = (response.choices[0].message.content or "").strip()
+        except (APIError, APITimeoutError, APIConnectionError) as exc:
+            logger.warning("生成转人工摘要失败，改用模板拼接", error=str(exc))
+
+        if summary:
+            usage = extract_usage_from_response(response)
+            estimated = usage is None
+            prompt_tokens, completion_tokens = usage or estimate_tokens(messages, summary)
+            await add_tokens_used(tenant_id, tenant_timezone, prompt_tokens + completion_tokens)
+            await record_llm_usage(
+                session,
+                tenant_id=tenant_id,
+                conversation_id=state.get("conversation_id"),
+                trace_id=state.get("trace_id"),
+                purpose="handoff",
+                model=LLM_MODEL,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                estimated=estimated,
+            )
 
     if not summary:
         summary = _fallback_summary(transcript_messages)
@@ -191,7 +218,7 @@ async def handoff(state: GraphState, runtime) -> dict[str, Any]:
     # 不让转接这件事本身因为一个次要字段没设就失败
     trigger_value = state.get("handoff_trigger") or "keyword"
 
-    summary = await _generate_summary(state)
+    summary = await _generate_summary(state, session)
     intent = await _last_business_intent(session, tenant_id, conversation_id)
     attempted_actions = await _collect_attempted_actions(session, tenant_id, conversation_id)
     risk_flags = await _collect_risk_flags(session, tenant_id, conversation_id, state)

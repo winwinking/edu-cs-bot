@@ -8,11 +8,14 @@ import uuid
 
 from sqlalchemy import select
 
+from app.common.llm_usage import get_daily_budget, is_budget_exceeded
 from app.common.models import Tenant, User
 from app.worker.graph.context_summary import append_summary_block, load_history_summary
 from app.worker.graph.reminder import format_reminder_list_block, load_active_reminders
 from app.worker.graph.state import GraphState
 from app.worker.graph.style import (
+    BUDGET_EXCEEDED_CHITCHAT_REPLY,
+    FALLBACK_BUDGET_EXCEEDED_REPLY,
     FALLBACK_INVALID_OUTPUT_REPLY,
     FALLBACK_LLM_UNAVAILABLE_REPLY,
     SENSITIVE_REPLY,
@@ -50,6 +53,18 @@ async def load_context(state: GraphState, runtime) -> dict:
 
 
 async def chitchat(state: GraphState, runtime) -> dict:
+    # token 预算检查放在这里（而不是 respond()）：这里有 session，判断结果直接决定
+    # reply_plan 走 generate 还是 template，respond() 不用关心"这次要不要真的调 LLM"
+    # 这层业务判断（阶段三第 6 步，设计决定 13）
+    tenant_id = state["tenant_id"]
+    tenant_timezone = state.get("tenant_timezone") or "Asia/Shanghai"
+    budget = await get_daily_budget(runtime.context.session, tenant_id)
+    if await is_budget_exceeded(tenant_id, tenant_timezone, budget):
+        return {
+            "reply_plan": {"mode": "template", "text": BUDGET_EXCEEDED_CHITCHAT_REPLY},
+            "budget_exceeded": True,
+        }
+
     user_content = append_summary_block(state["content"], state.get("history_summary"))
     messages = (
         [{"role": "system", "content": STYLE_SYSTEM_PROMPT}]
@@ -63,7 +78,16 @@ async def sensitive(state: GraphState, runtime) -> dict:
     return {"reply_plan": {"mode": "template", "text": SENSITIVE_REPLY}}
 
 
+# fallback_reason -> 话术：llm_unavailable 是"LLM 调用失败/熔断打开"（过一会儿再试可能好），
+# budget_exceeded 是"机构今日预算用完"（要等第二天，不能说"稍后再试"，见人审记录），
+# 其余（invalid_output）用兜底文案
+_FALLBACK_REASON_TO_REPLY = {
+    "llm_unavailable": FALLBACK_LLM_UNAVAILABLE_REPLY,
+    "budget_exceeded": FALLBACK_BUDGET_EXCEEDED_REPLY,
+}
+
+
 async def fallback(state: GraphState, runtime) -> dict:
     reason = state.get("fallback_reason")
-    text = FALLBACK_LLM_UNAVAILABLE_REPLY if reason == "llm_unavailable" else FALLBACK_INVALID_OUTPUT_REPLY
+    text = _FALLBACK_REASON_TO_REPLY.get(reason, FALLBACK_INVALID_OUTPUT_REPLY)
     return {"reply_plan": {"mode": "template", "text": text}}

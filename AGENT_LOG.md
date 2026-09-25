@@ -2140,8 +2140,8 @@ $ docker compose run --rm tools python scripts/phase3_smoke.py
 全部 2 个场景 PASS
 ```
 
-**建议记为已知问题**：
-- gateway 订阅回复的重连退避日志（"订阅 Redis 频道时断线，将重连"）会随 Redis 持续故障按翻倍间隔（封顶 30 秒）反复打印，不是"只打一条"——跟设计决定 9 里特指的"可用→不可用/不可用→恢复"这一对转折点日志是两回事，这条是每次重连尝试都打，目的是让人能看到重连还在进行。如果这个频率仍然嫌多，可以改成"只在第一次断线和真正重连成功时各打一条，中间的重试不打日志"，但那样故障期间完全看不到"系统还在正常重试"的信号，权衡后先保留现在的做法，让 Jo 决定要不要改。
+**设计说明**：
+- gateway 订阅回复的重连退避日志（"订阅 Redis 频道时断线，将重连"）会随 Redis 持续故障按翻倍间隔（封顶 30 秒）反复打印，不是"只打一条"——跟设计决定 9 里特指的"可用→不可用/不可用→恢复"这一对转折点日志是两回事，这条是每次重连尝试都打。Jo 审查后确认接受，不算刷屏：排障时正需要看到系统还在正常重试，最长间隔 16 秒之后就恢复到 30 秒一次，频率可接受。这条记为设计说明，不列入下面的已知问题清单。
 
 **人工审查与修复点**：
 无（本步骤是按 PHASE3.md 第 4 步开发，不是审查驱动的修复）。
@@ -2252,6 +2252,327 @@ $ docker compose run --rm tools python scripts/phase3_smoke.py
 - 熔断状态每个 worker 进程各自维护，不共享（同样是 PHASE3.md 预设的已知问题）：开 3 个 worker 时，同一个 LLM 故障要让 3 个 worker 分别各自攒够 5 次失败才会都熔断，中间那几秒还是会有请求打到已经挂了的上游。
 
 **人工审查与修复点**：
-无（本步骤是按 PHASE3.md 第 5 步开发，不是审查驱动的修复）。
+无（本步骤是按 PHASE3.md 第 5 步开发，不是审查驱动的修复）；上面财务熔断验证里"第 5~6 条开始 circuit_breaker=["finance"]"这句记录是错的，见下面"步骤 3 检查点 C 修复"第 3 条的更正。
+
+---
+
+## 步骤 3 检查点 C 修复
+
+**日期**：2026-09-25
+
+**触发**：Jo 审查检查点 C（步骤 4、5）时提出四件事，见下面逐条记录。
+
+### 1. 检查点 B 四件事结论重贴
+
+见上面"步骤 3 检查点 B 修复"一节，内容没有变化，四件事（`test_context_summary.py` 9 条测试覆盖关系、`covered_until` 的 SQL 证明、`tools.py` 里补的"保留原日期"规则、mock-llm 固定文案的已知问题）当时已经全部处理完，不是占位。
+
+### 2. 第 4 步"计划外改动"重贴（未被截断）
+
+原文完整内容：
+
+> 无，`docker-compose.yml`、`Makefile`、`Dockerfile` 都没有改动——新配置项走 `env_file: .env`，四个服务（gateway/worker/scheduler/tools）共用同一份 `.env`，不用在 compose 里逐个声明 `environment:`。
+
+第 4、5 步全程没有改 `docker-compose.yml`/`Makefile`/`Dockerfile`，不涉及"影响哪些服务"的问题。
+
+### 3. 熔断计数方式核查（【人工审查发现】）
+
+**问题**：步骤 3.5 记录里，LLM 熔断从第 6 条消息开始打开，财务熔断从第 5 条开始——两边阈值都是 5，理应表现一致，数字对不上。
+
+**核查结论**：重新用干净的进程状态（`docker compose restart worker`，让熔断计数器归零）分别重测，两边其实是一致的，都是"第 6 条消息才第一次看到 `circuit_breaker` 标记"，都符合"连续失败 5 次（5 次调用，不是 5 次 HTTP 尝试）才打开"。之前 3.5 节里财务那次"第 5 条就打开"的记录是当时没有在两次测试之间重启 worker、财务熔断器的失败计数上还带着别的测试留下的残留值，属于测试步骤的失误，不是代码问题，不需要改代码。
+
+**计数方式本身**（读 `app/common/llm_client.py`、`app/common/finance_client.py` 源码确认）：两边都是"每次调用（`chat_completion`/`stream_chat_completion`/`fetch_finance_data` 各算一次）失败才计一次"，不是"每次 HTTP 尝试失败都计一次"——调用内部自己的重试（LLM、财务都配的重试 1 次，即最多 2 次 HTTP 尝试）失败了也只算 1 次。两边写法一致，不用统一，也不需要改测试。
+
+**重新验证（真实 docker，原样输出）**：
+
+LLM（`docker compose restart worker` 之后，`mockctl.py llm mode=error500`，连发 8 条"今天天气不错"）：
+```
+message 1~5: [meta] circuit_breaker: []
+message 6~8: [meta] circuit_breaker: ["llm"]
+
+$ docker compose logs worker --since 3m | grep -E "LLM 调用失败，重试|连续失败达到阈值"
+{"attempt": 1, ..., "event": "LLM 调用失败，重试", "trace_id": "8a1bd211d9..."}
+{"attempt": 1, ..., "event": "LLM 调用失败，重试", "trace_id": "fe6d5ba7f6..."}
+{"attempt": 1, ..., "event": "LLM 调用失败，重试", "trace_id": "0702690263..."}
+{"attempt": 1, ..., "event": "LLM 调用失败，重试", "trace_id": "e04b1e27d6..."}
+{"attempt": 1, ..., "event": "LLM 调用失败，重试", "trace_id": "f19d021aa9..."}
+{"service": "llm", "failures": 5, "event": "连续失败达到阈值，熔断打开", "trace_id": "f19d021aa9..."}
+
+$ docker compose logs mock-llm --since 3m | grep "POST /v1/chat/completions" | wc -l
+10
+```
+5 条消息各重试 1 次（`attempt: 1` 各出现一次）= 每条消息 2 次 HTTP 请求，5 条消息共 10 次，跟 mock-llm 日志的 10 条 500 完全对上；第 6~8 条 mock-llm 完全没收到新请求。
+
+财务（`mockctl.py llm mode=normal` 恢复、再 `docker compose restart worker` 归零、`mockctl.py finance mode=error500`，连发 8 条"我上个月的发票开了吗"）：
+```
+message 1~5: [meta] circuit_breaker: []
+message 6~8: [meta] circuit_breaker: ["finance"]
+
+$ docker compose logs worker --since 3m | grep -E "财务系统查询失败|连续失败达到阈值"
+{"kind": "invoices", "circuit_open": false, ..., "trace_id": "411ec64aa2..."}
+{"kind": "invoices", "circuit_open": false, ..., "trace_id": "2e3fadb975..."}
+{"kind": "invoices", "circuit_open": false, ..., "trace_id": "b6840c7f17..."}
+{"kind": "invoices", "circuit_open": false, ..., "trace_id": "e269757de8..."}
+{"service": "finance", "failures": 5, "event": "连续失败达到阈值，熔断打开", "trace_id": "9cdbe728cf..."}
+{"kind": "invoices", "circuit_open": false, ..., "trace_id": "9cdbe728cf..."}   # 第 5 条：熔断在这条调用失败之后才打开，这条本身仍然是真打了请求
+{"kind": "invoices", "circuit_open": true,  ..., "trace_id": "3874b9af40..."}  # 第 6 条：开始被熔断拦下，没有真的发请求
+
+$ docker compose logs mock-finance --since 3m | grep "GET /invoices" | wc -l
+10
+```
+跟 LLM 一模一样的节奏：前 5 条各重试 1 次（10 次 HTTP 请求），第 5 条失败后计数刚好到 5、熔断随即打开，第 6 条开始才真正被拦截、`circuit_open` 才变成 `true`。
+
+**Jo 确认**：检查点 B 原指令要求"如果两边计数方式不一致，统一成每次尝试失败都计一次"；核查后两边本来就一致（每次调用计一次），Jo 审查后决定保留按调用计数，不改成按每次 HTTP 尝试计数——理由：重试成功说明这次调用最终是通的、服务是可用的，不应该因为中间有一次失败的尝试就也算进失败次数；上一轮观察到"财务第 5 条就打开"的差异，根因是测试前没有重启 worker、熔断计数器带着上一次测试的残留值，不是计数方式本身的问题。
+
+单元测试不用改（`tests/unit/test_circuit_breaker.py`、`test_llm_retry.py`、`test_finance_circuit.py` 断言的都是计数方式，不是具体第几条消息，跟这次核查的结论本来就一致）：
+```
+$ docker compose run --rm tools pytest -q tests/unit -rs
+169 passed, 1 skipped in 6.9s
+```
+
+### 4. gateway 重连日志：设计说明，不算已知问题
+
+已按此意见处理，见上面"步骤 3.4"节末尾的"设计说明"（原来的"建议记为已知问题"改成了"设计说明"，不再放进已知问题清单）。
+
+**人工审查与修复点**：
+【人工审查发现】步骤 3.5 财务熔断验证记录的"第 5 条开始熔断"是错的，原因是两次熔断测试之间没有重启 worker 清空熔断计数器，属于测试步骤失误；已用干净状态重新验证，LLM 和财务两边熔断计数方式本来就一致（每次调用失败计一次，不是每次 HTTP 尝试），不需要改代码或改测试，详见上面第 3 条。
+
+---
+
+## 步骤 6：成本和指标
+
+**日期**：2026-09-25
+
+**改动/新建模块**：
+- `migrations/versions/202609251200_llm_usage_and_budget.py`：新建。`tenants` 加 `daily_token_budget`（可空整数）；新建 `llm_usage` 表（tenant_id/conversation_id/trace_id/purpose/model/prompt_tokens/completion_tokens/estimated/created_at），`(tenant_id, created_at)` 加索引。
+- `app/common/models.py`：`Tenant.daily_token_budget`；新建 `LlmUsage` 模型。
+- `app/common/config.py`/`.env.example`：新增 `default_daily_token_budget`（`DEFAULT_DAILY_TOKEN_BUDGET`，留空=不限额）。
+- `app/common/llm_usage.py`：新建。`get_daily_budget()`（机构自己设了就用那个值，没设才落回 `.env` 默认值）；`is_budget_exceeded()`（Redis 键 `llm:budget:{tenant_id}:{机构时区当天日期}`，过期 2 天，Redis 报错放行）；`add_tokens_used()`（调用后累加）；`record_llm_usage()`（写 `llm_usage` 表，失败只打日志不影响回复，同时打 `worker_llm_tokens_total{tenant_id, direction}` 计数）。
+- `mocks/mock_llm/main.py`：`ChatCompletionRequest` 加 `stream_options` 字段；流式响应（文字和工具调用两条路径）末尾都补一个 `choices=[]` 的 usage-only chunk，跟真实 OpenAI 传 `stream_options={"include_usage": true}` 时的行为一致（原来流式响应完全不带 usage）。
+- `app/common/llm_client.py`：`stream_chat_completion` 请求带 `stream_options={"include_usage": True}`，加 `usage_holder` 参数（调用方传字典进来，收到 usage chunk 时原地写入，流式生成器没法直接 return 带 usage 的对象）；新增 `estimate_tokens()`（字数估算兜底，跟 mock-llm 自己估算的口径一样）、`extract_usage_from_response()`（非流式取 `.usage`）；新增 `worker_llm_requests_total{result}` 计数（ok/error/circuit_open）。
+- `app/common/circuit_breaker.py`：加 `worker_circuit_breaker_state{service}` Gauge（0=closed/1=half_open/2=open），状态每次切换都同步更新。
+- `app/worker/graph/state.py`：`GraphState` 加 `budget_exceeded: bool`。
+- `app/worker/graph/classify.py`：`_classify_with_llm` 改成接收 `session`；调 LLM 前先查预算，超了就直接走关键词兜底（复用熔断打开时那条路径）并标 `budget_exceeded=True`；调用成功后记录 token 用量（purpose=`intent`）。
+- `app/worker/graph/nodes.py`：`chitchat` 节点调 LLM 前先查预算，超了就把 `reply_plan` 直接改成 `template` 模式、话术是新加的 `BUDGET_EXCEEDED_CHITCHAT_REPLY`，标 `budget_exceeded=True`，根本不进 `respond()` 的 generate 分支。
+- `app/worker/graph/knowledge.py`：同样在生成 `reply_plan` 之前查预算，超了就直接把命中条款第一条原文（带出处）当 `template` 回复发出去——这段文字本来就是给"guard 全丢时的兜底"用的，超预算复用同一份文本，不用另外拼。
+- `app/worker/graph/style.py`：新增 `BUDGET_EXCEEDED_CHITCHAT_REPLY`。
+- `app/worker/graph/context_summary.py`：`_generate_summary_text`/`maybe_update_summary` 加 `tenant_id`/`tenant_timezone` 参数，生成摘要前先查预算，超了就跳过本轮生成（旧摘要保留），成功时记录用量（purpose=`summary`）。
+- `app/worker/graph/handoff.py`：`_generate_summary` 加 `session` 参数，生成转人工摘要前先查预算，超了就直接走原有的"LLM 调用失败"模板拼接兜底（`_fallback_summary`），不用为这一条单独设计降级文案；成功时记录用量（purpose=`handoff`）。
+- `app/worker/graph/graph.py`：`respond()` 生成模式下传 `usage_holder` 给 `stream_chat_completion`，流成功结束后记用量（purpose 按 `intent` 反推 chat/knowledge，没拿到真实 usage 就按字数估算并标 `estimated=True`）；`_build_meta` 加 `budget_exceeded` 字段，同时在这里集中打 `worker_tool_calls_total{tool, status}`；新增 `worker_reply_seconds` 直方图（只测 `respond()` 本身的耗时，不含 classify 阶段）。
+- `app/worker/handler.py`：`maybe_update_summary` 调用带上 `tenant_timezone`。
+- `app/worker/metrics.py`：新增 `tool_calls_total`、`message_retry_total`、`message_dead_letter_total`、`queue_backlog`、`reply_seconds`。
+- `app/worker/consumer.py`：重试/死信分支各自额外打一次专用计数器（跟 `messages_total` 按 result 过滤是同一件事，单独开方便直接画图）；新增 `run_queue_backlog_poller()`，每 5 秒被动声明 `inbound.messages`/`inbound.dead` 读消息数，`run_consumer()` 里用 `asyncio.create_task` 启动。
+- `app/gateway/metrics.py`：`inbound_messages_total` 加 `tenant_id` 标签（原来只有 `status`）。
+- `app/gateway/message_handler.py`：6 处 `.labels(status=...)` 都补上 `tenant_id=tenant_id`。
+- `app/scheduler/metrics.py`：新建。`reminder_push_total{result}`、`reminder_push_delay_seconds`（实际推送时间 − `next_trigger_at`）。
+- `app/scheduler/loop.py`：推送成功/失败各打一次 `reminder_push_total`，成功时在 `advance_after_trigger()` 改写 `next_trigger_at` 之前算一次延迟。
+- `tests/unit/test_llm_usage.py`：新建 8 条，覆盖预算取值优先级、`budget=None`/`0`/命中/未命中/Redis 报错、`add_tokens_used` 对 0/负数的短路。
+- `tests/unit/test_context_summary.py`、`test_handoff.py`、`test_classify_confirm_boundaries.py`：因为 `_generate_summary_text`/`_generate_summary`/`_classify_with_llm` 签名加了预算相关参数，这三个文件的假 session/假调用都补了 `get_daily_budget`/`add_tokens_used`/`record_llm_usage` 的 monkeypatch，不影响原来测的逻辑。
+
+**计划外改动**：`docker-compose.yml`、`Makefile`、`Dockerfile` 都没有改动；逐个改动文件对哪些服务的影响见下面"步骤 6 审查修复"第 3 条（Jo 审查后要求把这份清单展开重贴，不是这里省略）。
+
+**验证**：
+
+token 记录+按机构汇总（真实 docker，正常聊天）：
+```
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv usage_test1 "今天天气不错"
+...正常收到流式回复...
+$ docker compose run --rm tools python scripts/sql.py "select tenant_id, purpose, model, prompt_tokens, completion_tokens, estimated from llm_usage order by created_at desc limit 5"
+tenant_id  purpose  model     prompt_tokens  completion_tokens  estimated
+t_a        chat     mock-gpt  206            17                 False
+t_a        intent   mock-gpt  347            17                 False
+...
+$ docker compose run --rm tools python scripts/sql.py "select tenant_id, sum(prompt_tokens+completion_tokens) as total_tokens, count(*) as calls from llm_usage where created_at::date=current_date group by tenant_id order by tenant_id"
+tenant_id  total_tokens  calls
+t_a        112871        206
+t_b        1176          4
+```
+`estimated=False` 证明流式响应真的从 mock-llm 拿到了 usage chunk（阶段三第 6 步要求"流式调用要拿到 usage"），不是退回字数估算。
+
+预算降级（把 t_b 的 `daily_token_budget` 设成 100，用 u_b_1001 聊两句）：
+```
+$ docker compose run --rm tools python -c "...update tenants set daily_token_budget=100 where id='t_b'..."
+$ docker compose run --rm tools python scripts/chat.py --tenant t_b --user u_b_1001 --conv budget_test1 "今天天气不错"
+[ack] status=accepted ...
+"budget_exceeded": true
+（t_b 今天之前的用量已经有 588，先于这次设置的 100 上限，所以第一句就直接超限——分类这一步
+自己调 LLM 也超预算了，降级成关键词规则，"今天天气不错"没命中任何关键词，落到 fallback 意图，
+回复的是"系统这会儿有点忙"那句通用固定话术，不是新加的 BUDGET_EXCEEDED_CHITCHAT_REPLY——
+这条新话术只有在"这句话本身被分类成 chitchat"时才会用到，见下面知识问答那组验证）
+$ docker compose run --rm tools python scripts/chat.py --tenant t_b --user u_b_1001 --conv budget_test_kb "寒假班请假会退课时费吗"
+"citations": [{"doc_title": "请假规则", "clause_no": "1.2", ...}]
+"budget_exceeded": true
+$ docker compose run --rm tools python scripts/sql.py "select content from messages where tenant_id='t_b' and role='assistant' order by created_at desc limit 1"
+依据《课程服务协议》第 4.2 条、《课程服务协议》第 4.1 条：寒假班请假需提前 48 小时……
+$ docker compose run --rm tools python scripts/sql.py "select count(*) from llm_usage where tenant_id='t_b' and created_at > now() - interval '2 minutes'"
+count: 0
+```
+"寒假班请假会退课时费吗"命中关键词规则里的问句特征词（"吗"），关键词兜底直接判成 `knowledge_qa`，
+走到 `knowledge()` 节点自己的预算检查，直接把命中条款第一条原文带出处发出去（`citations` 里能看到
+真实来源），跟 PHASE3.md 的设计一致；这期间没有新增任何 `llm_usage` 记录，确认真的没有调 LLM。
+```
+$ docker compose run --rm tools python -c "...update tenants set daily_token_budget=None where id='t_b'..."
+$ docker compose run --rm tools python scripts/chat.py --tenant t_b --user u_b_1001 --conv budget_restored "今天天气不错"
+"budget_exceeded": false
+```
+改回不限额后立刻恢复正常。
+
+Prometheus 指标（浏览器/`curl` 都能看，worker 这次分到的宿主机端口是 8015，端口范围内会变，以 `docker compose port worker 8001` 实际输出为准）：
+```
+$ curl -s http://localhost:8015/metrics | grep -E "^worker_(llm_requests_total|llm_tokens_total|tool_calls_total|circuit_breaker_state|message_retry_total|message_dead_letter_total|queue_backlog|reply_seconds_count)"
+worker_circuit_breaker_state{service="finance"} 0.0
+worker_circuit_breaker_state{service="llm"} 0.0
+worker_llm_requests_total{result="ok"} 69.0
+worker_llm_tokens_total{direction="completion",tenant_id="t_a"} 1561.0
+worker_llm_tokens_total{direction="prompt",tenant_id="t_a"} 35863.0
+worker_message_dead_letter_total 0.0
+worker_message_retry_total 0.0
+worker_queue_backlog{queue="inbound.dead"} 0.0
+worker_queue_backlog{queue="inbound.messages"} 0.0
+worker_reply_seconds_count 38.0
+worker_tool_calls_total{status="ok",tool="search_knowledge"} 2.0
+...（工具调用按 tool/status 各自累计，这里只截取几行）
+
+$ curl -s http://localhost:8000/metrics | grep gateway_inbound_messages_total
+gateway_inbound_messages_total{status="accepted",tenant_id="t_a"} 38.0
+gateway_inbound_messages_total{status="duplicate",tenant_id="t_a"} 1.0
+
+$ curl -s http://localhost:8002/metrics | grep scheduler_
+scheduler_reminder_push_total{result="ok"} 1.0
+scheduler_reminder_push_delay_seconds_sum 0.20804
+scheduler_reminder_push_delay_seconds_count 1.0
+```
+
+单元测试/回归：
+```
+$ docker compose run --rm tools alembic upgrade head
+...Running upgrade 202609250002 -> 202609251200...
+$ docker compose run --rm tools pytest -q tests/unit -rs
+177 passed, 1 skipped in 6.95s
+$ docker compose run --rm mock-llm pytest -q tests/unit/test_mock_llm_rules.py
+38 passed in 0.07s
+$ docker compose run --rm tools python scripts/phase2_smoke.py
+全部 9 个场景 PASS
+$ docker compose run --rm tools python scripts/phase3_smoke.py
+全部 2 个场景 PASS
+```
+
+**已知问题**（措辞已按 Jo 审查更正，见下面"步骤 6 审查修复"第 2 条）：
+- 预算检查和用量累加不是一个原子操作：超支上限是"同一时刻所有已经通过预算检查、但还没来得及把这次用量累加进 Redis 的 LLM 调用"，多个 worker 并发时可能是好几次调用一起超支，不是只多一次。Jo 已决定接受，理由：客服场景下少量超支没有实际危害，做成原子扣减需要预先估算每次调用的 token 用量才能"先扣后用"，改造成本明显高于收益。
+- token 用量记录（`llm_usage` 表）如果写库失败只打日志、不重试，极小概率会漏记一条用量（比如那几毫秒数据库恰好抖动），不影响回复本身，但会让当天 token 汇总比实际略低。
+
+**人工审查与修复点**：
+【人工审查发现】预算耗尽导致关键词规则也判断不出意图时，原来回复的是"系统这会儿有点忙"（暗示稍后重试就好），但预算要等到第二天才恢复，会让用户反复重试白等——已修复，见下面"步骤 6 审查修复"第 1 条。
+
+---
+
+## 步骤 6 审查修复
+
+**日期**：2026-09-25
+
+**触发**：Jo 审查第 6 步时提出三件事，见下面逐条记录（另有一件关于步骤 3 检查点 C 熔断计数的补充说明，记在上面"步骤 3 检查点 C 修复"一节，不重复记在这里）。
+
+### 1. 预算耗尽兜底话术不对（【人工审查发现】）
+
+**问题**：预算耗尽导致意图识别跳过 LLM、关键词规则又判断不出意图时，回复的是 `FALLBACK_LLM_UNAVAILABLE_REPLY`（"系统这会儿有点忙……你可以稍后再试"）。这句话暗示过一会儿再问就可能好，但 token 预算是按天算的，要等到第二天才恢复，"稍后再试"会让用户当天反复重试、每次都得到同样的拒绝。
+
+**修复**：
+- `app/worker/graph/style.py`：新增 `FALLBACK_BUDGET_EXCEEDED_REPLY` = "这个问题我这边暂时处理不了。你可以换个说法再问一次，或者回复"转人工"，我帮你转给人工客服。"
+- `app/worker/graph/classify.py`：`_classify_with_llm` 里预算超限那条分支，关键词兜底也判断不出意图（`intent == "fallback"`）时，把 `fallback_reason` 从默认的 `"llm_unavailable"` 改成 `"budget_exceeded"`；熔断打开那条分支（`except CircuitBreakerOpenError`）不改，继续用 `"llm_unavailable"`——熔断打开确实是"过一会儿再试可能就好"，跟预算耗尽是两回事。
+- `app/worker/graph/nodes.py`：`fallback()` 节点原来是 `if reason == "llm_unavailable" else FALLBACK_INVALID_OUTPUT_REPLY` 的二选一，改成一张 `_FALLBACK_REASON_TO_REPLY` 映射表（`llm_unavailable`→原话术，`budget_exceeded`→新话术，其余走 `FALLBACK_INVALID_OUTPUT_REPLY` 兜底），行为对原来两种情况不变，只是加了一个新分支。
+- `tests/unit/test_classify_fallback_reason.py`：新建 5 条——预算超限+关键词不命中时 `fallback_reason` 是 `budget_exceeded`（且没有 `circuit_breaker` 字段）；熔断打开+关键词不命中时仍是 `llm_unavailable`（且没有 `budget_exceeded` 字段）；`fallback()` 节点对三种 `fallback_reason`（`budget_exceeded`/`llm_unavailable`/`invalid_output`）各自选对话术。
+
+**验证（真实 docker，原样输出）**：
+```
+$ docker compose run --rm tools python scripts/sql.py "select tenant_id, sum(prompt_tokens+completion_tokens) from llm_usage where tenant_id='t_b' and created_at::date=current_date group by tenant_id"
+tenant_id  sum
+t_b        1176
+```
+t_b 当天用量已经是 1176（之前测试留下的），设 `daily_token_budget=100` 之后一开始就是超限状态：
+```
+$ docker compose run --rm tools python -c "...update tenants set daily_token_budget=100 where id='t_b'..."
+
+$ docker compose run --rm tools python scripts/chat.py --tenant t_b --user u_b_1001 --conv fix1_a "今天天气怎么样"
+我暂时没有查到明确依据，建议转人工确认。回复"转人工"我帮你转接。
+[meta] {
+  "intent": "knowledge_qa",
+  "route_source": "rule_fallback",
+  ...
+  "budget_exceeded": true
+}
+```
+"今天天气怎么样"这句话本身含"怎么"，命中关键词规则里的问句特征词，直接落到 `knowledge_qa`（走的是知识问答那条降级路径，不是这次修的 `fallback` 分支），不是 Jo 预想中的"关键词也判断不出意图"的场景——如实记录，另外补发一条真正不命中任何关键词的消息验证这次修复：
+```
+$ docker compose run --rm tools python scripts/chat.py --tenant t_b --user u_b_1001 --conv fix1_b "你好呀"
+[ack] status=accepted ...
+这个问题我这边暂时处理不了。你可以换个说法再问一次，或者回复"转人工"，我帮你转给人工客服。
+[meta] {
+  "intent": "fallback",
+  "route_source": "rule_fallback",
+  "tools": [],
+  ...
+  "budget_exceeded": true
+}
+```
+新话术生效，不再是"系统这会儿有点忙"。
+
+```
+$ docker compose run --rm tools python scripts/chat.py --tenant t_b --user u_b_1001 --conv fix1_a "转人工"
+已为你转接人工客服，前面还有 3 位，预计 5 分钟接入。刚才的情况我已经同步给客服，不用再重复描述。
+[meta] {
+  "intent": "handoff",
+  "route_source": "rule",
+  ...
+  "budget_exceeded": false
+}
+```
+"转人工"在 `classify()` 的第 2 步（转人工关键词）就直接命中，根本不会走到第 5 步的 LLM/预算检查，`budget_exceeded` 是 `false`（这一步压根没检查预算，不是"检查了但没超"），转人工本身不受预算影响，这是符合预期的。
+
+```
+$ docker compose run --rm tools python scripts/sql.py "select count(*) from llm_usage where tenant_id='t_b' and created_at > now() - interval '3 minutes'"
+count
+0
+```
+这期间（含上面三条消息）t_b 没有新增任何 `llm_usage` 记录，确认预算超限期间真的没有调 LLM。
+
+```
+$ docker compose run --rm tools python -c "...update tenants set daily_token_budget=None where id='t_b'..."
+$ docker compose run --rm tools python scripts/sql.py "select id, daily_token_budget from tenants where id='t_b'"
+id   daily_token_budget
+t_b  (空)
+```
+已改回 `NULL`（SQL 查询结果的 `daily_token_budget` 列是空的），恢复不限额。
+
+回归：
+```
+$ docker compose run --rm tools pytest -q tests/unit -rs
+182 passed, 1 skipped in 6.97s
+$ docker compose run --rm tools python scripts/phase2_smoke.py
+全部 9 个场景 PASS
+$ docker compose run --rm tools python scripts/phase3_smoke.py
+全部 2 个场景 PASS
+```
+
+### 2. 已知问题措辞更正
+
+原写法"预算检查和用量累加不是一个原子操作……两次调用之间有极短的竞态窗口，理论上单次可能略微超支"低估了影响范围。更正：超支上限是"同一时刻所有已经通过预算检查、但还没来得及把这次用量累加进 Redis 的 LLM 调用"——多个 worker 并发处理同一机构的多条消息时，可能是好几次调用一起通过检查、一起超支，不是只多一次调用。Jo 已决定接受为已知问题，理由：客服场景下少量超支没有实际危害；要做成原子扣减（先扣预算再调用，调用完再按实际用量修正）需要提前估算每次调用大概会用多少 token，改造成本明显高于收益。已按此改写 AGENT_LOG 步骤 6 节的"已知问题"一条。
+
+### 3. 第 6 步"计划外改动"逐文件重贴
+
+严格意义上的"计划外改动"（`docker-compose.yml`/`Makefile`/`Dockerfile`）确实是无。Jo 要求把改动文件按"改了什么、影响哪些服务"逐行重新列出，完整版如下（`app/common/*` 三个服务共用同一个镜像和代码，但下面按"functionally 谁的业务逻辑真的会执行到这段代码"标注影响范围，不是"这个文件在哪些镜像里存在"）：
+
+- `migrations/versions/202609251200_llm_usage_and_budget.py`（新建）：加 `tenants.daily_token_budget` 列和 `llm_usage` 表。只在跑 `alembic upgrade head` 时执行一次，不影响运行中的服务；三个服务（gateway/worker/scheduler）共用同一个数据库 schema，迁移完成后表结构对三者都可见。
+- `app/common/models.py`：加 `Tenant.daily_token_budget`、`LlmUsage` 模型。属于 `app/common`，随镜像一起进 gateway/worker/scheduler，但只有 worker 的代码会读写这两处新增内容，gateway/scheduler 功能上不受影响。
+- `app/common/config.py`、`.env.example`：加 `DEFAULT_DAILY_TOKEN_BUDGET`。同上，三个服务共用同一份 `Settings` 对象，只有 worker 会读这个值。
+- `app/common/llm_usage.py`（新建）：预算检查/累加、`llm_usage` 写入、`worker_llm_tokens_total` 计数。只被 worker 的代码（`classify.py`/`nodes.py`/`knowledge.py`/`context_summary.py`/`handoff.py`/`graph.py`）调用，gateway/scheduler 不引用这个模块。
+- `app/common/llm_client.py`：流式请求带 `stream_options`、`usage_holder` 原地写回用量、新增 `worker_llm_requests_total` 计数。只有 worker 会调 LLM，gateway 完全不碰这个模块（硬性规则：gateway 不调用 LLM），scheduler 也不用。
+- `app/common/circuit_breaker.py`：加 `worker_circuit_breaker_state` Gauge。只有 worker 的 `llm_client.py`/`finance_client.py` 用到熔断器实例。
+- `app/gateway/metrics.py`、`app/gateway/message_handler.py`：`inbound_messages_total` 加 `tenant_id` 标签，6 处打点都补上。直接影响 **gateway** 服务——这是 gateway 自己的入站消息统计，标签集变了，Prometheus 里这个指标的时间序列会从这次发布开始重新累计（旧标签组合的历史数据还在，但不会再增长）。
+- `app/scheduler/metrics.py`（新建）、`app/scheduler/loop.py`：提醒推送计数和延迟直方图。直接影响 **scheduler** 服务。
+- `app/worker/graph/classify.py`、`nodes.py`、`knowledge.py`、`context_summary.py`、`handoff.py`、`graph.py`、`state.py`、`style.py`，以及 `app/worker/handler.py`、`app/worker/metrics.py`、`app/worker/consumer.py`：预算检查/降级、用量记录、`budget_exceeded` meta 字段、工具调用/重试/死信/队列积压指标。全部只影响 **worker** 服务，这些模块只在 worker 进程的代码路径里被调用到。
+- `mocks/mock_llm/main.py`：流式响应补 usage chunk，加 `stream_options` 请求字段。只影响 **mock-llm** 这一个 mock 服务（独立镜像 `edu-cs-bot/mocks`），不影响 gateway/worker/scheduler 用的 `edu-cs-bot/app` 镜像。
+- `tests/unit/test_llm_usage.py`（新建）、`test_classify_fallback_reason.py`（新建）、`test_context_summary.py`/`test_handoff.py`/`test_classify_confirm_boundaries.py`（补 monkeypatch）：只在 `pytest` 运行时被 **tools** 服务用到，不影响任何生产服务的运行时行为。
+
+**人工审查与修复点**：
+本节本身就是人工审查驱动的修复记录，不再重复。
 
 ---

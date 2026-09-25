@@ -3,7 +3,11 @@
 
 跟 tests/unit/test_handoff.py 是同一套思路：能用纯函数/monkeypatch 覆盖的就不连真实数据库/
 LLM；真正连数据库、连 mock-llm 的完整链路（25 条消息触发摘要生成）走 phase3_smoke.py。
+
+阶段三第 6 步给 `_generate_summary_text` 加了 token 预算检查和用量记录，这两步都要连
+数据库/Redis，这里统一 monkeypatch 成"预算没超、记录是空操作"，不然这个文件就不再是纯单测。
 """
+import uuid
 from types import SimpleNamespace
 
 import httpx
@@ -21,6 +25,30 @@ from app.worker.graph.context_summary import (
 )
 
 settings = get_settings()
+
+_FAKE_CONVERSATION_ID = uuid.uuid4()
+
+
+@pytest.fixture(autouse=True)
+def _no_budget_limit(monkeypatch):
+    async def fake_get_daily_budget(session, tenant_id):
+        return None  # 不限额，budget 检查直接放行，不用连数据库
+
+    async def fake_add_tokens_used(*args, **kwargs):
+        return None
+
+    async def fake_record_llm_usage(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(context_summary_module, "get_daily_budget", fake_get_daily_budget)
+    monkeypatch.setattr(context_summary_module, "add_tokens_used", fake_add_tokens_used)
+    monkeypatch.setattr(context_summary_module, "record_llm_usage", fake_record_llm_usage)
+
+
+async def _call_generate_summary_text(old_summary, transcript_messages):
+    return await _generate_summary_text(
+        None, "t_a", "Asia/Shanghai", _FAKE_CONVERSATION_ID, old_summary, transcript_messages
+    )
 
 
 # ---------- 阈值判断 ----------
@@ -60,7 +88,19 @@ async def test_classify_puts_summary_in_user_message_not_system(monkeypatch):
         message = SimpleNamespace(tool_calls=[])
         return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
+    async def fake_get_daily_budget(session, tenant_id):
+        return None
+
+    async def fake_add_tokens_used(*args, **kwargs):
+        return None
+
+    async def fake_record_llm_usage(*args, **kwargs):
+        return None
+
     monkeypatch.setattr(classify_module, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(classify_module, "get_daily_budget", fake_get_daily_budget)
+    monkeypatch.setattr(classify_module, "add_tokens_used", fake_add_tokens_used)
+    monkeypatch.setattr(classify_module, "record_llm_usage", fake_record_llm_usage)
 
     state = {
         "tenant_id": "t_a",
@@ -71,7 +111,7 @@ async def test_classify_puts_summary_in_user_message_not_system(monkeypatch):
         "tenant_timezone": "Asia/Shanghai",
     }
 
-    await classify_module._classify_with_llm(state)
+    await classify_module._classify_with_llm(state, session=None)
 
     messages = captured["messages"]
     system_messages = [m["content"] for m in messages if m["role"] == "system"]
@@ -103,7 +143,7 @@ async def test_generated_summary_is_masked_before_returning(monkeypatch):
 
     monkeypatch.setattr(context_summary_module, "chat_completion", fake_chat_completion)
 
-    result = await _generate_summary_text(None, [{"role": "user", "content": "我的手机号是13812345678"}])
+    result = await _call_generate_summary_text(None, [{"role": "user", "content": "我的手机号是13812345678"}])
 
     assert "13812345678" not in result
     assert "138****5678" in result
@@ -116,7 +156,7 @@ async def test_generate_summary_returns_none_on_llm_failure(monkeypatch):
 
     monkeypatch.setattr(context_summary_module, "chat_completion", fake_chat_completion)
 
-    result = await _generate_summary_text("旧摘要", [{"role": "user", "content": "你好"}])
+    result = await _call_generate_summary_text("旧摘要", [{"role": "user", "content": "你好"}])
     assert result is None
 
 
@@ -128,5 +168,5 @@ async def test_generate_summary_returns_none_on_empty_llm_output(monkeypatch):
 
     monkeypatch.setattr(context_summary_module, "chat_completion", fake_chat_completion)
 
-    result = await _generate_summary_text(None, [{"role": "user", "content": "你好"}])
+    result = await _call_generate_summary_text(None, [{"role": "user", "content": "你好"}])
     assert result is None

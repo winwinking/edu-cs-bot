@@ -228,6 +228,7 @@ async def process_inbound_message(
 
         # 摘要在回复发完之后才生成，不拖慢首 token（PHASE3.md 第 3 步关键设计决定 7）；
         # 用同一个 session 接着跑，生成失败只记日志、不影响这条消息已经回复成功这件事
-        await maybe_update_summary(session, tenant_id, conversation_id)
+        tenant_timezone = final_state.get("tenant_timezone") or "Asia/Shanghai"
+        await maybe_update_summary(session, tenant_id, conversation_id, tenant_timezone)
 
     return _metric_result(meta.get("route_source")), meta.get("intent")
