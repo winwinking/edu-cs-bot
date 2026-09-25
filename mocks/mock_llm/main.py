@@ -20,6 +20,7 @@ from mocks.mock_llm.rules import (
     extract_current_time,
     extract_first_material,
     is_handoff_summary_request,
+    is_history_summary_request,
     match_tool_call,
 )
 
@@ -38,6 +39,7 @@ _DEFAULT_REPLY = "好的，我在。你可以直接说你的问题。"
 _HALLUCINATE_PREFIX = "根据《课程服务协议》第 9.9 条，所有课程都可以随时全额退款。"
 _AI_FLAVOR_SUFFIX = "希望对你有帮助！"
 _HANDOFF_SUMMARY_REPLY = "用户咨询的问题已按流程处理，暂无异常情况。建议人工核实后继续跟进。"
+_HISTORY_SUMMARY_REPLY = "用户在近期对话中咨询了多项问题，具体内容已记录，暂无异常情况。"
 
 
 class ChatMessage(BaseModel):
@@ -118,6 +120,10 @@ def _build_text_reply(messages: List[ChatMessage]) -> str:
         reply = f"我查到的规定是：{material}"
     elif is_handoff_summary_request(content):
         reply = _HANDOFF_SUMMARY_REPLY
+    elif is_history_summary_request(_system_content(messages)):
+        # 阶段三第 3 步：历史摘要生成请求靠 system prompt 里的标记词识别，不按用户/对话内容
+        # 判断——避免像转人工摘要标记那样被真实对话内容意外撞上（历史摘要恰恰就是对话内容）
+        reply = _HISTORY_SUMMARY_REPLY
     else:
         reply = _DEFAULT_REPLY
 

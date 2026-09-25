@@ -14,7 +14,7 @@ from sqlalchemy import func, select, update
 
 from app.common.auth import create_access_token
 from app.common.db import AsyncSessionLocal
-from app.common.models import Reminder, ReminderStatus, User
+from app.common.models import ConversationSummary, Reminder, ReminderStatus, User
 
 REPLY_TIMEOUT_SECONDS = 30
 PUSH_TIMEOUT_SECONDS = 10
@@ -156,8 +156,57 @@ async def scenario_5_reminder_push() -> tuple[str, bool]:
         return _check("场景5 创建提醒并按时收到推送", ok, detail)
 
 
+async def scenario_context_summary() -> tuple[str, bool]:
+    """第 3 步：同一会话连续发 25 条消息，超过阈值后应该生成历史摘要（conversation_summaries
+    有记录），最后一条回复的 meta 里 context.has_summary 为 true。"""
+    tenant, user, conv = "t_a", "u_a_1001", "s_context"
+    token = await _get_token(tenant, user)
+    conversation_id = _conversation_id(tenant, user, conv)
+
+    last_meta: dict = {}
+    async with websockets.connect(f"{GATEWAY_URL}?token={token}") as ws:
+        for i in range(25):
+            mid = str(uuid.uuid4())
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "message",
+                        "message_id": mid,
+                        "conversation_id": conversation_id,
+                        "content": f"你好，这是第 {i + 1} 条消息",
+                    }
+                )
+            )
+            ack = json.loads(await ws.recv())
+            if ack.get("status") != "accepted":
+                return _check("场景(上下文) 25 条消息后生成历史摘要", False, f"第 {i + 1} 条 ack={ack}")
+
+            try:
+                async with asyncio.timeout(REPLY_TIMEOUT_SECONDS):
+                    while True:
+                        msg = json.loads(await ws.recv())
+                        if msg["type"] == "reply_end":
+                            last_meta = msg.get("meta", {})
+                            break
+            except TimeoutError:
+                return _check("场景(上下文) 25 条消息后生成历史摘要", False, f"第 {i + 1} 条回复超时")
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(ConversationSummary).where(ConversationSummary.conversation_id == uuid.UUID(conversation_id))
+        )
+        row = result.scalar_one_or_none()
+
+    db_ok = row is not None and len(row.summary) > 0
+    meta_ok = last_meta.get("context", {}).get("has_summary") is True
+    ok = db_ok and meta_ok
+    detail = f"db_ok={db_ok} meta={last_meta.get('context')}"
+    return _check("场景(上下文) 25 条消息后生成历史摘要", ok, detail)
+
+
 SCENARIOS = [
     scenario_5_reminder_push,
+    scenario_context_summary,
 ]
 
 

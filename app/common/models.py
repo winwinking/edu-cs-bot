@@ -267,6 +267,22 @@ class FollowupTask(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class ConversationSummary(Base):
+    __tablename__ = "conversation_summaries"
+
+    # 一个会话只有一条持续更新的摘要，不是按时间滚动追加的历史记录，conversation_id 直接当主键
+    conversation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("conversations.id"), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    # 存库前已经过 mask_text() 脱敏（硬性规则：日志/长期存储不留敏感信息原文）
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    # 摘要覆盖到了哪条消息（存该消息的 created_at）：判断"最近 10 条之前、还没被摘要覆盖"的
+    # 消息够不够阈值时，只需要比较时间戳，不用另外记消息 id
+    covered_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
 class ReminderRepeat(str, enum.Enum):
     none = "none"
     daily = "daily"

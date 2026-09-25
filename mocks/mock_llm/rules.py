@@ -61,7 +61,7 @@ def match_tool_call(content: str, *, now_local: Optional[datetime] = None) -> Op
     保证测试结果固定，不依赖 mock-llm 进程自己的系统时钟。传 None 时退回真实系统时钟
     （理论上不会发生，因为调用方一直会传，这里只是防御性兜底）。
     """
-    user_text = _strip_reminder_list_block(content)
+    user_text = _strip_meta_blocks(content)
     finance = _match_finance(user_text)
     if finance is not None:
         return finance
@@ -81,9 +81,12 @@ def match_tool_call(content: str, *, now_local: Optional[datetime] = None) -> Op
     return _match_knowledge(user_text)
 
 
-# ---------- 日程提醒（创建/修改/取消/查看，阶段三第 2 步新增）----------
+# ---------- 元信息块：<提醒列表>/<历史摘要> 都是 worker 拼进 user 消息给 LLM 看的上下文，
+# 不是用户真正说的话，在做"是不是在说 XX"这类判断之前必须先去掉，不然块里的字眼
+# （"提醒列表""生效中的提醒"，或者摘要文本里恰好提到的历史话题）会让 R1-R4 对任何消息
+# 都可能误判。真正要用块内容的地方（比如从 <提醒列表> 里挑 id）用没去块的 full_content。----------
 
-_REMINDER_LIST_BLOCK_RE = re.compile(r"<提醒列表>.*?</提醒列表>", re.S)
+_META_BLOCK_RE = re.compile(r"<(?:提醒列表|历史摘要)>.*?</(?:提醒列表|历史摘要)>", re.S)
 _REMINDER_LIST_ID_RE = re.compile(r"id: ([0-9a-fA-F-]{36})")
 _EXPLICIT_UUID_RE = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
 
@@ -100,11 +103,8 @@ _REMINDER_TITLE_AFTER_RE = re.compile(r"提醒我([^，。！？,、]+)")
 _REMINDER_TITLE_BEFORE_RE = re.compile(r"的([^，。！？\s]{1,20}?)提醒")
 
 
-def _strip_reminder_list_block(content: str) -> str:
-    """<提醒列表> 是 worker 拼进 user 消息给 LLM 挑 id 用的元信息（PHASE3.md 第 2 步），
-    不是用户真正说的话；这里在做"是不是在说提醒/财务/平台指令"这类判断之前先把它去掉，
-    不然块里的"提醒列表""生效中的提醒"这些字眼会让 R1 对任何消息都误判成在创建提醒。"""
-    return _REMINDER_LIST_BLOCK_RE.sub("", content).strip()
+def _strip_meta_blocks(content: str) -> str:
+    return _META_BLOCK_RE.sub("", content).strip()
 
 
 def _extract_reminder_id(user_text: str, full_content: str) -> Optional[str]:
@@ -115,6 +115,21 @@ def _extract_reminder_id(user_text: str, full_content: str) -> Optional[str]:
         return explicit.group()
     ids = _REMINDER_LIST_ID_RE.findall(full_content)
     return ids[0] if len(ids) == 1 else None
+
+
+_REMINDER_LIST_ENTRY_DATE_RE = re.compile(
+    r"id: ([0-9a-fA-F-]{36}) \| 标题：.*? \| 时间：(\d{4}-\d{2}-\d{2}) \d{2}:\d{2}"
+)
+
+
+def _reminder_original_date(reminder_id: Optional[str], full_content: str) -> Optional[str]:
+    """从 <提醒列表> 块里查这个 id 原来的日期（YYYY-MM-DD）。修改提醒时，如果用户只说了
+    时间没说日期，应该保留原提醒的日期，不能默认成"今天"——这是人审时发现的真实 bug：
+    "明天 09:00 打扫房间"改成"晚上 8 点"，被错误地算成了"今天 20:00"，正确应为"明天 20:00"。
+    """
+    if reminder_id is None:
+        return None
+    return dict(_REMINDER_LIST_ENTRY_DATE_RE.findall(full_content)).get(reminder_id)
 
 
 def _extract_reminder_date_offset(text: str) -> Optional[int]:
@@ -135,20 +150,29 @@ def _extract_reminder_time_of_day(text: str) -> Optional[tuple[int, int]]:
     return hour, minute
 
 
-def _compute_reminder_event_time(text: str, now_local: datetime) -> Optional[str]:
+def _compute_reminder_event_time(
+    text: str, now_local: datetime, *, default_date: Optional[str] = None
+) -> Optional[str]:
+    """default_date 只在"修改"场景传：用户只给了时间、没提哪天时，应该保留目标提醒原来的
+    日期，不能像创建场景那样默认成"今天"（创建没有"原来的日期"这个概念，默认今天/自动挪到
+    明天是唯一合理的行为，所以 create 分支调用这个函数时不传 default_date）。
+    """
     time_of_day = _extract_reminder_time_of_day(text)
     if time_of_day is None:
         return None
     hour, minute = time_of_day
     offset = _extract_reminder_date_offset(text)
-    if offset is None:
-        # 没显式说哪天：默认今天；这个点已经过了就自动挪到明天（"每天 9 点"这类重复提醒不用
-        # 每次都精确报日期）
+    if offset is not None:
+        candidate = (now_local + timedelta(days=offset)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+    elif default_date is not None:
+        base_date = datetime.strptime(default_date, "%Y-%m-%d")
+        candidate = base_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    else:
+        # 没显式说哪天，也没有"原来的日期"可以沿用（创建场景）：默认今天；这个点已经过了就
+        # 自动挪到明天（"每天 9 点"这类重复提醒不用每次都精确报日期）
         candidate = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if candidate <= now_local:
             candidate += timedelta(days=1)
-    else:
-        candidate = (now_local + timedelta(days=offset)).replace(hour=hour, minute=minute, second=0, microsecond=0)
     return candidate.strftime("%Y-%m-%d %H:%M")
 
 
@@ -195,7 +219,8 @@ def _match_reminder(user_text: str, full_content: str, now_local: datetime) -> O
         reminder_id = _extract_reminder_id(user_text, full_content)
         if reminder_id:
             args["reminder_id"] = reminder_id
-        event_time = _compute_reminder_event_time(user_text, now_local)
+        default_date = _reminder_original_date(reminder_id, full_content)
+        event_time = _compute_reminder_event_time(user_text, now_local, default_date=default_date)
         if event_time:
             args["event_time"] = event_time
         repeat = _extract_reminder_repeat(user_text)
@@ -302,6 +327,19 @@ def extract_first_material(content: str) -> Optional[str]:
 def is_handoff_summary_request(content: str) -> bool:
     """请求不带 tools 时用：识别是不是转人工摘要请求（2.11 会在 prompt 里带上这个标记词）"""
     return _HANDOFF_SUMMARY_MARKER in content
+
+
+_HISTORY_SUMMARY_MARKER = "历史摘要生成"
+
+
+def is_history_summary_request(system_content: str) -> bool:
+    """请求不带 tools 时用：识别是不是"生成历史摘要"请求（阶段三第 3 步）。
+
+    跟转人工摘要不同，这个标记词要求出现在 system 消息里，不是用户/对话内容——历史摘要
+    生成请求本身就是把一堆对话原文塞进 user 消息，如果按 user 内容判断标记词，用户聊天里
+    只要恰好提到类似的字眼就会被误判，所以调用方传的是 system 消息内容，不是最后一条用户消息。
+    """
+    return _HISTORY_SUMMARY_MARKER in system_content
 
 
 _CURRENT_TIME_RE = re.compile(r"当前时间：(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})")

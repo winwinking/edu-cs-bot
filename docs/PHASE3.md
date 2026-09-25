@@ -219,17 +219,15 @@
   - gateway：消息计数（按 tenant 和结果：accepted / duplicate / rate_limited / error）、ACK 耗时直方图、当前连接数。
   - worker：处理计数（按意图和结果）、首 token 耗时直方图、完整回复耗时直方图、LLM 请求计数（按结果）、LLM token 计数（按 tenant，分输入和输出）、工具调用计数（按工具和结果）、熔断状态、重试计数、死信计数、队列积压（每 5 秒查一次 inbound 和 inbound.dead 的消息数）。
   - scheduler：提醒推送计数、推送延迟直方图（实际推送时间 − next_trigger_at）。
-  - 各服务在健康检查端口上暴露 `/metrics`（gateway 8000、worker 8001、scheduler 8002）。
-- **Prometheus 服务**：docker-compose 加 prometheus，端口 9090，抓取上面三个服务。worker 要支持 `--scale` 之后多个实例都能抓到（用 Docker 内部 DNS 按服务名发现）。不做 Grafana。
+  - 各服务在健康检查端口上暴露 `/metrics`（宿主机端口：gateway 8000、worker 默认 8011（可扩到 8011-8019）、scheduler 默认 8002（可扩到 8002-8009）；容器内部固定是 8000/8001/8002，不随宿主机端口变化）。
 
-**为什么**：对应负面清单"不记录 token 成本"、NFR-4 Prometheus 指标、NFR-5 按租户统计 token 和模型降级、加分项"成本控制与 token 预算"。Prometheus 服务是阶段四压测报告要用的（队列积压随时间的变化）。
+**为什么**：对应负面清单"不记录 token 成本"、NFR-4 Prometheus 指标、NFR-5 按租户统计 token 和模型降级、加分项"成本控制与 token 预算"。
 
 **验证**
 
 - 聊几句之后，用 `scripts/sql.py` 按机构汇总今天的 token，t_a 和 t_b 分开。
 - 预算：把 t_b 的 daily_token_budget 设成 100 → 用 u_b_1001 聊两句 → 第二句起 meta 显示 budget_exceeded，回复是模板或条款原文，不报错 → 改回来。
-- 浏览器打开 http://localhost:8001/metrics ，能找到 token 计数、工具调用计数、队列积压。
-- 浏览器打开 http://localhost:9090 ，查询 `rate()` 能看到 gateway 的消息速率；`docker compose up -d --scale worker=3` 后，Targets 页面能看到 3 个 worker。验证完恢复成 1 个。
+- 浏览器打开 http://localhost:8011/metrics ，能找到 token 计数、工具调用计数、队列积压。
 
 ---
 
@@ -245,7 +243,7 @@
   - meta 里不能有未脱敏的敏感信息。
 - **收尾**：
   - `phase3_smoke.py` 补齐场景：提醒修改和取消、限流、熔断降级、预算降级。每个场景结束后把 mock 和配置恢复原样。
-  - README 更新端口（scheduler 8002、prometheus 9090）和新命令。
+  - README 更新端口（worker 8011-8019、scheduler 8002-8009）和新命令。
   - `.env.example` 检查所有新配置都在。
   - AGENT_LOG 写完本阶段。
 

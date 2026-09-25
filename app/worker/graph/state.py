@@ -24,6 +24,9 @@ class GraphState(TypedDict, total=False):
     # 随时能看到最新的提醒状态，不用另外判断"这条消息像不像在说提醒"才决定要不要查
     tenant_timezone: Optional[str]
     reminder_list_block: Optional[str]
+    # load_context 查一次放进来（阶段三第 3 步）：更早的对话压成的摘要，已脱敏；
+    # classify/chitchat/knowledge 组装 user 消息时统一用 append_summary_block() 拼进去
+    history_summary: Optional[str]
 
     content: str  # 当前这条用户消息
     history: List[dict]  # 历史消息（不含当前这条），[{"role": ..., "content": ...}]

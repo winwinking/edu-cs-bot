@@ -69,8 +69,11 @@ services:
       - .env
     volumes:
       - ./data/knowledge:/app/data/knowledge:ro
+    # 端口写成一个范围（不是单个固定端口），跟 scheduler 是同一个理由：`docker compose up -d
+    # --scale worker=N` 要求每个副本都能拿到一个不冲突的宿主机端口，固定映射会让第二个副本
+    # 起不来。单实例时依然稳定拿到 WORKER_HEALTH_HOST_PORT（默认 8011）
     ports:
-      - "${WORKER_HEALTH_HOST_PORT}:8001"
+      - "${WORKER_HEALTH_HOST_PORT}-8019:8001"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=3)"]
       interval: 5s

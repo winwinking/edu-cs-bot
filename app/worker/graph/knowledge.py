@@ -10,6 +10,7 @@ import httpx
 from app.common.logging import get_logger
 from app.common.prompt_guard import build_reference_block
 from app.common.retrieval import SearchResult, get_retriever
+from app.worker.graph.context_summary import append_summary_block
 from app.worker.graph.state import GraphState
 from app.worker.graph.style import KNOWLEDGE_NO_HIT_REPLY, KNOWLEDGE_SYSTEM_ADDENDUM, STYLE_SYSTEM_PROMPT
 
@@ -78,10 +79,11 @@ async def knowledge(state: GraphState, runtime) -> dict:
     snippets = [f"《{c.doc_title}》第 {c.clause_no} 条\n{c.content}" for c in qualifying]
     reference_block = build_reference_block(snippets)
 
+    user_content = append_summary_block(state["content"], state.get("history_summary"))
     messages = (
         [{"role": "system", "content": f"{STYLE_SYSTEM_PROMPT}\n\n{KNOWLEDGE_SYSTEM_ADDENDUM}"}]
         + list(state.get("history", []))
-        + [{"role": "user", "content": f"{reference_block}\n\n{state['content']}"}]
+        + [{"role": "user", "content": f"{reference_block}\n\n{user_content}"}]
     )
 
     return {

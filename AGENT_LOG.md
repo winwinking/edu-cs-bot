@@ -1694,7 +1694,7 @@ $ docker compose run --rm tools pytest -q tests/unit -rs
 ```
 
 **人工审查与修复点**：
-（等 Jo 验证后再补充）
+无（检查点 A 审查提出的问题都在步骤 3.2 的范围里，见步骤 3.2 补充）。
 
 ---
 
@@ -1824,4 +1824,157 @@ $ docker compose down
 【agent 自查修复】mock-llm 的"日程提醒"规则最初检查顺序在最前面（跟旧的占位版本一样），导致 PHASE2 已有的"修改课程提醒"平台指令被新规则误吞（两者字面上都含"提醒"）。写单测时发现，调整成"财务→平台指令→日程提醒→问候→知识问答"的顺序修复，未额外请示（判断为纯粹的规则冲突，逻辑必然性强）。
 【agent 自查修复】`docker compose up -d --scale scheduler=2` 因为端口固定映射直接启动失败，验证时立刻复现。改成端口范围 `8002-8009:8002` 修复，只改了 scheduler 自己的端口声明。
 【agent 自查修复】mock-llm 提取时间时正则 `(\d{1,2})[:：点](\d{0,2})` 没算上数字和"点"之间可能有空格（"9 点"），单测跑起来直接暴露，改成 `\s*` 允许空格后修复。
-【待你决定】worker 服务的端口声明和 scheduler 修复前一样，也没法 `--scale worker=3`（已实测复现，见上面"计划外改动"），这次没有动 worker 的配置，留给你决定要不要现在一并改，还是留到 PHASE3.md 第 6 步用到的时候再改。
+【agent 自查修复】worker 服务的端口声明和 scheduler 修复前一样，也没法 `--scale worker=3`，是阶段一起就有的老配置，在验证 scheduler 多实例时顺带发现。Jo 审查后要求现在就改，处理过程见"步骤 3 检查点 A 修复"。
+
+---
+
+## 步骤 3 检查点 A 修复
+
+**日期**：2026-09-25
+
+**触发**：Jo 审查检查点 A（步骤 1、2）时提出三件事，加一条已知问题确认，见下面逐条记录。
+
+### 1. worker 端口固定导致无法水平扩展
+
+**改动**：
+- `docker-compose.yml`：`worker` 服务端口从 `${WORKER_HEALTH_HOST_PORT}:8001` 改成 `${WORKER_HEALTH_HOST_PORT}-8019:8001`（跟 scheduler 上次的修法一样，写成范围而不是单个端口）
+- `app/common/config.py`/`.env.example`/`.env`：`worker_health_host_port`/`WORKER_HEALTH_HOST_PORT` 默认值从 `8001` 改成 `8011`（新的范围起点，跟 scheduler 的 8002-8009 错开，不占用 mock 服务的 8100+ 段）
+- `README.md`：端口表 worker 那一行改成"8011（可扩到 8011-8019）"，并补了一行 scheduler 的端口（之前一直没写进 README，顺手补上）
+- `docs/PHASE3.md` 第 6 步：`/metrics` 那条改成写清楚"宿主机端口 vs 容器内部端口"；`浏览器打开 http://localhost:8001/metrics` 改成 `8011`
+
+`app/worker/main.py` 里 uvicorn 监听的容器内部端口（`8001`）没有改，也不需要改——固定的是宿主机映射端口，容器内部端口不管怎么扩容都还是同一个。
+
+**验证**：
+```
+$ docker compose up -d --build
+...gateway/worker/scheduler/5 mock/3 基础设施全部 healthy
+
+$ docker compose up -d --scale worker=3
+...
+Container edu-cs-bot-worker-2  Started
+Container edu-cs-bot-worker-3  Started
+
+$ docker compose ps
+NAME                          IMAGE                      COMMAND                   SERVICE          CREATED          STATUS                    PORTS
+edu-cs-bot-gateway-1          edu-cs-bot/app:latest      "python -m app.gatew…"   gateway          25 seconds ago   Up 22 seconds (healthy)   0.0.0.0:8000->8000/tcp
+edu-cs-bot-mock-finance-1     edu-cs-bot/mocks:latest    "python -m mocks.moc…"   mock-finance     26 seconds ago   Up 23 seconds (healthy)   0.0.0.0:8103->8000/tcp
+edu-cs-bot-mock-im-1          edu-cs-bot/mocks:latest    "python -m mocks.moc…"   mock-im          26 seconds ago   Up 23 seconds (healthy)   0.0.0.0:8080->8000/tcp
+edu-cs-bot-mock-knowledge-1   edu-cs-bot/mocks:latest    "python -m mocks.moc…"   mock-knowledge   26 seconds ago   Up 23 seconds (healthy)   0.0.0.0:8101->8000/tcp
+edu-cs-bot-mock-llm-1         edu-cs-bot/mocks:latest    "python -m mocks.moc…"   mock-llm         26 seconds ago   Up 23 seconds (healthy)   0.0.0.0:8100->8000/tcp
+edu-cs-bot-mock-platform-1    edu-cs-bot/mocks:latest    "python -m mocks.moc…"   mock-platform    26 seconds ago   Up 23 seconds (healthy)   0.0.0.0:8102->8000/tcp
+edu-cs-bot-postgres-1         pgvector/pgvector:pg15     "docker-entrypoint.s…"   postgres         9 minutes ago    Up 9 minutes (healthy)    0.0.0.0:5432->5432/tcp
+edu-cs-bot-rabbitmq-1         rabbitmq:3.13-management   "docker-entrypoint.s…"   rabbitmq         9 minutes ago    Up 9 minutes (healthy)    0.0.0.0:5672->5672/tcp, 0.0.0.0:15672->15672/tcp
+edu-cs-bot-redis-1            redis:7-alpine             "docker-entrypoint.s…"   redis            9 minutes ago    Up 9 minutes (healthy)    0.0.0.0:6380->6379/tcp
+edu-cs-bot-scheduler-1        edu-cs-bot/app:latest      "python -m app.sched…"   scheduler        25 seconds ago   Up 22 seconds (healthy)   0.0.0.0:8005->8002/tcp
+edu-cs-bot-worker-1           edu-cs-bot/app:latest      "python -m app.worke…"   worker           25 seconds ago   Up 17 seconds (healthy)   0.0.0.0:8011->8001/tcp
+edu-cs-bot-worker-2           edu-cs-bot/app:latest      "python -m app.worke…"   worker           7 seconds ago    Up 5 seconds (healthy)    0.0.0.0:8012->8001/tcp
+edu-cs-bot-worker-3           edu-cs-bot/app:latest      "python -m app.worke…"   worker           7 seconds ago    Up 5 seconds (healthy)    0.0.0.0:8013->8001/tcp
+
+$ docker compose up -d --scale worker=1   # 验证完恢复
+```
+3 个 worker 全部 `healthy`，端口按范围自动分配（8011/8012/8013）；scheduler 这次自动分到的是 8005（还在 8002-8009 范围内，是 Docker 端口分配的正常行为，不是 bug）。
+
+### 2. 修改提醒时"只给时间没给日期"被错误地当成"今天"
+
+**排查**：问题出在 mock-llm 的解析（`mocks/mock_llm/rules.py` 的 `_compute_reminder_event_time`），不是 worker 的逻辑。原实现里"没显式说哪天"统一默认成"今天"（这是给**创建**场景设计的默认值——创建没有"原来的日期"可言，默认今天/自动挪到明天是唯一合理的行为），但**修改**场景直接复用了同一个函数、同一套默认值，没有考虑到修改场景其实是有"原来的日期"这个信息来源的（`<提醒列表>` 块里就带着），错误地把创建场景的默认值搬到了修改场景。
+
+**改动**：
+- `mocks/mock_llm/rules.py`：`_compute_reminder_event_time` 加 `default_date` 关键字参数（只有"修改"场景会传，"创建"场景不传，保持原来的默认今天/自动挪明天行为不变）；新增 `_reminder_original_date()`，从 `<提醒列表>` 块里按 id 查这条提醒原来的日期；修改分支（`_match_reminder` 的 update 分支）解出 `reminder_id` 之后，把对应的原日期传给 `_compute_reminder_event_time` 当 `default_date`
+- `tests/unit/test_mock_llm_rules.py`：新增 3 条——只给时间保留原日期、显式给新日期时不受"保留原日期"影响、拿不到原日期时退回创建场景的默认值
+
+**验证**：
+```
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv bugfix_test "明天早上 9 点提醒我拖地"
+已设置提醒：明天 09:00 拖地，提前 30 分钟在 IM 通知你。
+
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv bugfix_test "把拖地那个提醒改到晚上 8 点"
+已把"拖地"的提醒改到 09 月 26 日 20:00，提前 30 分钟通知你。
+[meta] {"intent": "reminder", "tools": [{"name": "manage_reminder", "status": "ok"}], ...}
+
+$ docker compose run --rm tools python scripts/sql.py "select id, title, event_at, next_trigger_at from reminders where user_id='u_a_1001' and title='拖地' order by created_at desc limit 1"
+id                                    title  event_at                   next_trigger_at
+3e30f540-e649-403b-bfb7-e51ab4a0f8c5  拖地   2026-09-26 12:00:00+00:00  2026-09-26 11:30:00+00:00
+```
+`event_at` 是 2026-09-26 12:00 UTC，换算成上海时间是 9 月 26 日（明天）20:00，跟原提醒的日期一致，不再是"今天"。
+
+```
+$ docker compose run --rm mock-llm pytest -q tests/unit/test_mock_llm_rules.py
+38 passed in 0.06s
+$ docker compose run --rm tools pytest -q tests/unit -rs
+135 passed, 1 skipped in 6.74s
+$ docker compose run --rm tools python scripts/phase2_smoke.py && docker compose run --rm tools python scripts/phase3_smoke.py
+全部 9 个场景 PASS / 全部 1 个场景 PASS
+```
+
+### 3. docs/PHASE3.md 第 6 步：不加 Prometheus 服务容器
+
+Jo 因时间原因决定不加 Prometheus 服务容器，题目要求的指标通过各服务自己的 `/metrics` 暴露就够。删掉了第 6 步"做什么"里的"Prometheus 服务"整段、"为什么"里提 Prometheus 服务的那句、验证里 `http://localhost:9090` 那条，以及第 7 步"收尾"里"更新端口"提到的 `prometheus 9090`。
+
+### 4. 记录两条已知问题（Jo 同意，写进 AGENT_LOG）
+
+- mock-llm 的日程提醒规则只支持有限的说法（关键词+正则拼出来的，不认识"周三""下周一"这类具体星期几的说法，也不支持更复杂的口语描述），跟之前几步 mock-llm 规则的固有局限是同一类问题，接真实 LLM 后自然消失。
+- "取消课程提醒"这种不带"帮我/给我"触发词、又没说清楚是想操作平台指令还是日程提醒功能的边界句子，目前会被当成日程提醒的取消处理，是两个功能字面上共享"提醒"这个词导致的固有歧义，没有专门处理，优先级不高。
+
+**验证记录**：见上面第 1、2 点各自的验证；第 3、4 点是文档改动，跟着 `docs/PHASE3.md`/本文件的 diff 看即可。
+
+**人工审查与修复点**：
+（本节本身就是人工审查驱动的修复记录，不再重复）
+
+---
+
+## 步骤 3.3：上下文（历史摘要）
+
+**日期**：2026-09-25
+
+**改动/新建模块**：
+- `app/common/models.py`：新增 `ConversationSummary` 模型——`conversation_id` 直接当主键（一个会话只有一条持续更新的摘要，不是按时间滚动追加的记录）、`tenant_id`、`summary`（脱敏后）、`covered_until`（摘要覆盖到哪条消息，存该消息的 `created_at`）、`updated_at`
+- `migrations/versions/202609250002_conversation_summaries.py`：新建，对应建表
+- `app/worker/graph/context_summary.py`：新建——`should_regenerate_summary()`（阈值判断，复用 `CONVERSATION_HISTORY_LIMIT`）、`build_summary_messages()`（摘要生成请求本身的消息列表，标记词放 system、旧摘要+新增对话放 user）、`_generate_summary_text()`（调 LLM，失败/空结果返回 None，成功则 `mask_text()` 脱敏后返回）、`load_history_summary()`、`append_summary_block()`（给 classify/chitchat/knowledge 统一拼 `<历史摘要>` 块用）、`maybe_update_summary()`（回复发完之后调用的主流程：找出"最近 10 条之前、还没被摘要覆盖"的消息，够阈值就重新生成并 upsert）
+- `app/worker/graph/nodes.py`：`load_context` 顺带查这个会话现有的摘要，存进 `state["history_summary"]`；`chitchat()` 组装 user 消息时调 `append_summary_block()`
+- `app/worker/graph/classify.py`、`knowledge.py`：组装 user 消息时同样调 `append_summary_block()`，跟 `<提醒列表>`/`<资料>` 块并列，不进 system prompt
+- `app/worker/graph/state.py`：`GraphState` 加 `history_summary`
+- `app/worker/graph/graph.py`：`_build_meta` 加 `context: {history_messages, has_summary}`
+- `app/worker/handler.py`：`process_inbound_message` 在插入 assistant 消息、标记 replied 之后，用同一个 session 调 `maybe_update_summary()`——回复已经发完，这一步慢一点不影响用户体验
+- `mocks/mock_llm/rules.py`：`_strip_reminder_list_block` 改名并扩展成 `_strip_meta_blocks`，正则从只匹配 `<提醒列表>` 扩展到同时匹配 `<历史摘要>`（原因见下面"过程中发现的问题"）；新增 `is_history_summary_request()`（按 system prompt 里的标记词识别摘要生成请求，不按用户内容判断）
+- `mocks/mock_llm/main.py`：`_build_text_reply` 接入 `is_history_summary_request`，命中时返回固定的 `_HISTORY_SUMMARY_REPLY`
+- `scripts/phase3_smoke.py`：新增场景——同一会话连续发 25 条消息，确认 `conversation_summaries` 有记录、最后一条回复 meta 里 `context.has_summary=true`
+- `tests/unit/test_context_summary.py`：新建，覆盖 PHASE3.md 要求的四类场景（低于阈值不生成、超过阈值生成、摘要只能放 user 不能放 system、摘要存库前已脱敏）
+
+**过程中发现的问题（自查发现并已修复，不是 Jo 提出的）**：
+写单测/联调时发现：`<历史摘要>` 块跟阶段三第 2 步的 `<提醒列表>` 块是同一类问题——两者都是拼进 classify 阶段 user 消息的"元信息"，不是用户真正说的话。摘要文本可能恰好提到用户之前聊过的话题（比如"用户之前问过提前提醒"），如果不在做 R1-R4 路由判断之前把这个块去掉，会跟 `<提醒列表>` 当初的问题一样，让 mock-llm 对当前这句完全无关的话产生误判。已把原来只处理 `<提醒列表>` 的 `_strip_reminder_list_block()` 改成同时处理两种块的 `_strip_meta_blocks()`，判断为跟 2.7/2.8/2.9 那几次 mock-llm 关键词碰撞同一类问题，逻辑必然性强，未额外请示。
+
+**验证记录**：
+```
+$ docker compose run --rm tools pytest -q tests/unit -rs
+144 passed, 1 skipped in 6.68s   （新增 9 条，全部在 test_context_summary.py）
+
+$ docker compose run --rm mock-llm pytest -q tests/unit/test_mock_llm_rules.py
+38 passed in 0.06s
+
+$ docker compose up -d --build
+...gateway/worker/scheduler/5 mock/3 基础设施全部 healthy
+
+$ docker compose run --rm tools sh -c "alembic upgrade head && python scripts/seed.py && python scripts/reindex.py"
+...Running upgrade 202609250001 -> 202609250002, conversation_summaries...
+
+$ docker compose run --rm tools sh -c "alembic revision --autogenerate -m consistency_check2 && cat migrations/versions/*consistency_check2.py"
+upgrade()/downgrade() 都是 pass，models.py 和迁移完全对得上（临时文件未落盘到仓库）
+
+$ docker compose run --rm tools python scripts/phase2_smoke.py
+全部 9 个场景 PASS   # 确认摘要接入没有影响阶段二的对话流程
+
+$ docker compose run --rm tools python scripts/phase3_smoke.py
+[PASS] 场景5 创建提醒并按时收到推送：push_ok=True 延迟=0.954146
+[PASS] 场景(上下文) 25 条消息后生成历史摘要：db_ok=True meta={'history_messages': 10, 'has_summary': True}
+全部 2 个场景 PASS
+
+$ docker compose run --rm tools python scripts/sql.py "select conversation_id, tenant_id, summary, covered_until, updated_at from conversation_summaries limit 3"
+（3 行，summary 是 mock-llm 固定返回的摘要文案，covered_until 是本轮摘要覆盖到的消息时间）
+
+$ docker exec edu-cs-bot-rabbitmq-1 rabbitmqctl list_queues
+inbound.dead 0  inbound.messages 0
+$ docker compose down
+```
+
+**人工审查与修复点**：
+（等 Jo 验证后再补充）

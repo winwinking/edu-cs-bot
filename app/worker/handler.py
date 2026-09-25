@@ -11,6 +11,7 @@ from app.common.db import AsyncSessionLocal
 from app.common.logging import get_logger
 from app.common.models import Conversation, Message, MessageRole, MessageStatus
 
+from app.worker.graph.context_summary import maybe_update_summary
 from app.worker.graph.graph import COMPILED_GRAPH, respond
 from app.worker.graph.state import GraphContext, GraphState
 from app.worker.pubsub import publish_error
@@ -224,5 +225,9 @@ async def process_inbound_message(
         # respond() 跑完就代表已经给用户答复过了（不管走的是哪条分支），标记 replied
         await _mark_user_message_replied(session, tenant_id, client_message_id)
         await session.commit()
+
+        # 摘要在回复发完之后才生成，不拖慢首 token（PHASE3.md 第 3 步关键设计决定 7）；
+        # 用同一个 session 接着跑，生成失败只记日志、不影响这条消息已经回复成功这件事
+        await maybe_update_summary(session, tenant_id, conversation_id)
 
     return _metric_result(meta.get("route_source")), meta.get("intent")

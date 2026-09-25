@@ -209,6 +209,50 @@ def test_create_reminder_with_repeat_and_advance_minutes():
     assert args["advance_minutes"] == 10
 
 
+def test_update_reminder_time_only_keeps_original_date_from_list_block():
+    # 人审发现的真实 bug：原提醒是"明天 09:00 打扫房间"，用户说"改到晚上 8 点"（没提日期），
+    # 应该保留原提醒的日期（明天），不能默认成"今天"
+    content = (
+        "把打扫房间那个提醒改到晚上 8 点\n\n"
+        "<提醒列表>\n"
+        "id: 11111111-1111-1111-1111-111111111111 | 标题：打扫房间 | 时间：2026-09-26 09:00 | 重复：none\n"
+        "</提醒列表>"
+    )
+    result = match_tool_call(content, now_local=_NOW)
+    assert result == (
+        "manage_reminder",
+        {
+            "action": "update",
+            "reminder_id": "11111111-1111-1111-1111-111111111111",
+            "event_time": "2026-09-26 20:00",
+        },
+    )
+
+
+def test_update_reminder_with_explicit_date_overrides_original_date():
+    # 用户这次明确说了新日期（后天），不应该被"保留原日期"的逻辑覆盖
+    content = (
+        "把打扫房间那个提醒改到后天晚上 8 点\n\n"
+        "<提醒列表>\n"
+        "id: 11111111-1111-1111-1111-111111111111 | 标题：打扫房间 | 时间：2026-09-26 09:00 | 重复：none\n"
+        "</提醒列表>"
+    )
+    result = match_tool_call(content, now_local=_NOW)
+    assert result is not None
+    _, args = result
+    assert args["event_time"] == "2026-09-27 20:00"
+
+
+def test_update_reminder_without_resolvable_id_falls_back_to_today_default():
+    # 没有可用的 <提醒列表> 信息（比如列表是空的），拿不到"原来的日期"，退回创建场景那套默认值，
+    # 不会因为拿不到 default_date 就报错
+    morning = datetime(2026, 9, 25, 10, 0)  # 当天上午 10 点，晚上 8 点还没过
+    result = match_tool_call("帮我修改一下提醒，改到晚上 8 点", now_local=morning)
+    assert result is not None
+    _, args = result
+    assert args["event_time"] == "2026-09-25 20:00"
+
+
 def test_course_reminder_platform_command_not_hijacked_by_reminder_rule():
     # "课程提醒"是 PHASE2 已有的平台指令动作（update_course_reminder），字面上也含"提醒"两个字，
     # 不能被新的日程提醒规则抢走

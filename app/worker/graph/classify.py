@@ -23,6 +23,7 @@ from app.common.logging import get_logger
 from app.common.models import Conversation, PendingAction, PendingActionStatus
 from app.common.prompt_guard import detect_prompt_injection
 from app.common.tools import ParsedToolCall, ToolCallError, parse_tool_call, to_openai_tools
+from app.worker.graph.context_summary import append_summary_block
 from app.worker.graph.state import GraphState
 from app.worker.graph.style import STYLE_SYSTEM_PROMPT, build_current_time_note
 
@@ -163,8 +164,10 @@ async def _classify_with_llm(state: GraphState) -> dict:
     # state 的，这里不用再连数据库
     tenant_timezone = state.get("tenant_timezone") or "Asia/Shanghai"
     system_content = f"{STYLE_SYSTEM_PROMPT}\n{build_current_time_note(tenant_timezone)}"
+    user_content = append_summary_block(state["content"], state.get("history_summary"))
     reminder_block = state.get("reminder_list_block") or ""
-    user_content = f"{state['content']}\n\n{reminder_block}" if reminder_block else state["content"]
+    if reminder_block:
+        user_content = f"{user_content}\n\n{reminder_block}"
     messages = (
         [{"role": "system", "content": system_content}]
         + list(state.get("history", []))

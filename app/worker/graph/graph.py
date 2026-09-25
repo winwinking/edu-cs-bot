@@ -116,6 +116,11 @@ def _build_meta(state: GraphState, guard: OutputGuard) -> dict[str, Any]:
             "banned_phrases_removed": guard.banned_phrases_removed,
         },
         "risk_flags": state.get("risk_flags", []),
+        # 本轮 LLM 请求带了几条原文历史、有没有带历史摘要（阶段三第 3 步）
+        "context": {
+            "history_messages": len(state.get("history", [])),
+            "has_summary": bool(state.get("history_summary")),
+        },
     }
 
 

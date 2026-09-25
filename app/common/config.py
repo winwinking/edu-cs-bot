@@ -101,7 +101,7 @@ class Settings(BaseSettings):
 
     # ---------- 服务端口 ----------
     gateway_host_port: int = 8000
-    worker_health_host_port: int = 8001
+    worker_health_host_port: int = 8011
     scheduler_health_host_port: int = 8002
     mock_im_host_port: int = 8080
     mock_llm_host_port: int = 8100
