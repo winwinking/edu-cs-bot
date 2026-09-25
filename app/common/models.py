@@ -51,6 +51,9 @@ class Tenant(Base):
     # 转人工"坐席不在线"话术里展示的服务时间（阶段二 2.11），只是展示文案，不参与
     # 在线/不在线的判断——那个判断完全来自 mock-platform 的 /agents/status
     service_hours: Mapped[str] = mapped_column(String(32), nullable=False)
+    # 提醒计算"明天 9 点""每天"这类相对时间要用的时区（阶段三 1）；数据库里事件时间存 UTC，
+    # 这一列决定了 UTC 换算成用户能看懂的本地时间/日期时该用哪个时区
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False, server_default="Asia/Shanghai")
 
 
 class User(Base):
@@ -262,3 +265,48 @@ class FollowupTask(Base):
         Enum(FollowupStatus, name="followup_task_status", native_enum=True), nullable=False
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ReminderRepeat(str, enum.Enum):
+    none = "none"
+    daily = "daily"
+    weekly = "weekly"
+    workdays = "workdays"
+
+
+class ReminderStatus(str, enum.Enum):
+    active = "active"
+    cancelled = "cancelled"
+    done = "done"
+
+
+class Reminder(Base):
+    __tablename__ = "reminders"
+    __table_args__ = (
+        Index("ix_reminders_tenant_user", "tenant_id", "user_id"),
+        # scheduler 每秒的查询是 WHERE status='active' AND next_trigger_at<=now()，这个复合索引
+        # 直接对应那条查询，比单独给 next_trigger_at 建索引更贴合真实访问模式
+        Index("ix_reminders_status_next_trigger", "status", "next_trigger_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("conversations.id"), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    # 事件时间：数据库存 UTC（硬性规则：时间统一存 UTC），timezone 这一列记住换算用哪个时区
+    event_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    repeat: Mapped[ReminderRepeat] = mapped_column(
+        Enum(ReminderRepeat, name="reminder_repeat", native_enum=True), nullable=False
+    )
+    advance_minutes: Mapped[int] = mapped_column(Integer, nullable=False, server_default="30")
+    # 单独存"下一次触发时间"：scheduler 只查这一列，不用每秒把 event_at/repeat 重新算一遍
+    next_trigger_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[ReminderStatus] = mapped_column(
+        Enum(ReminderStatus, name="reminder_status", native_enum=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )

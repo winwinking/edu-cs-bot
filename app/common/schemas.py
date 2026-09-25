@@ -59,3 +59,15 @@ class ErrorMessage(BaseModel):
     message_id: Optional[str] = None
     code: str
     detail: str
+
+
+class ReminderPushMessage(BaseModel):
+    """scheduler -> 客户端：提醒到点推送。跟对话回复（reply_chunk/reply_end）走同一个 Redis
+    频道、同一条 gateway 转发链路，但 type 不同——客户端（阶段三第 7 步的演示控制台）靠这个
+    字段区分"这是一条提醒"还是"这是一条对话回复"，用不同样式展示。
+    """
+
+    type: Literal["reminder"] = "reminder"
+    reminder_id: str
+    title: str
+    text: str

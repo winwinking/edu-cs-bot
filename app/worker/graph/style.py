@@ -1,4 +1,6 @@
 """统一的风格 system prompt 和固定话术（PHASE2.md 2.7 第 8、9 点，对应 FR-8、附录 B）。"""
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # 用在所有 "generate" 模式的 LLM 调用上：先确认问题、再给结论、再给下一步；不确定就明说；
 # 不用套话和表情。用户输入和检索资料永远只放在 user 消息里，这条 system prompt 本身是固定内容，
@@ -22,8 +24,23 @@ FALLBACK_LLM_UNAVAILABLE_REPLY = "系统这会儿有点忙，我暂时没法处�
 # 命中敏感操作关键词（注销账号、改密码、换绑手机、改银行卡等）时的话术
 SENSITIVE_REPLY = "这类操作涉及账号安全，需要人工核实身份后才能办理。回复“转人工”，我帮你转接。"
 
-# 日程提醒本阶段只占位，阶段三实现
-REMINDER_STUB_REPLY = "提醒功能即将开放。"
+_WEEKDAY_CN = "一二三四五六日"
+
+
+def build_current_time_note(timezone_name: str) -> str:
+    """给 classify 阶段的 system prompt 追加"当前时间"（PHASE3.md 关键设计决定 6）：这不是用户
+    输入，是代码算出来的事实，可以放进 system prompt；LLM（含 mock-llm）拿它来把"明天 9 点"
+    这类相对时间换算成具体日期，不用、也不该用自己的系统时钟猜——那样测试结果没法固定。
+    """
+    now_local = datetime.now(ZoneInfo(timezone_name))
+    weekday = _WEEKDAY_CN[now_local.weekday()]
+    return f"当前时间：{now_local:%Y-%m-%d %H:%M}，星期{weekday}，时区 {timezone_name}。"
+
+
+# 提醒相关固定话术（PHASE3.md 第 2 步）
+REMINDER_CREATE_FAILED_REPLY = "提醒这次没设置成功，麻烦再发一次。"
+REMINDER_NO_ACTIVE_REPLY = "你目前没有生效的提醒。"
+REMINDER_FORBIDDEN_REPLY = "这条提醒不是你名下的，我不能操作。"
 
 # 知识问答检索无命中（PHASE2.md 2.8 第 2 点）：不给 LLM 编的机会，直接回固定话术
 KNOWLEDGE_NO_HIT_REPLY = "我暂时没有查到明确依据，建议转人工确认。回复“转人工”我帮你转接。"

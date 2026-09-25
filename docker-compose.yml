@@ -86,6 +86,30 @@ services:
       mock-llm:
         condition: service_healthy
 
+  scheduler:
+    <<: *app-build
+    command: ["python", "-m", "app.scheduler.main"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    # 端口写成一个范围（不是单个固定端口）：PHASE3.md 要求验证"多个 scheduler 不重复处理同一条
+    # 提醒"，需要 `docker compose up -d --scale scheduler=2` 真的能起第二个实例——固定端口映射
+    # 会导致第二个副本抢占同一个宿主机端口而启动失败。单实例时依然稳定拿到
+    # SCHEDULER_HEALTH_HOST_PORT 这个端口（compose 按顺序从范围里分配），只有扩容时才会用到
+    # 范围里更靠后的端口
+    ports:
+      - "${SCHEDULER_HEALTH_HOST_PORT}-8009:8002"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   postgres:
     image: pgvector/pgvector:pg15
     restart: unless-stopped

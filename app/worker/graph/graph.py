@@ -18,7 +18,8 @@ from app.worker.graph.finance import finance
 from app.worker.graph.guard import OutputGuard
 from app.worker.graph.handoff import dissatisfied_first, handoff
 from app.worker.graph.knowledge import knowledge
-from app.worker.graph.nodes import chitchat, fallback, load_context, reminder_stub, sensitive
+from app.worker.graph.nodes import chitchat, fallback, load_context, sensitive
+from app.worker.graph.reminder import reminder
 from app.worker.graph.state import GraphContext, GraphState
 from app.worker.graph.style import FALLBACK_LLM_UNAVAILABLE_REPLY
 from app.worker.metrics import first_token_seconds
@@ -28,12 +29,12 @@ logger = get_logger(__name__)
 
 # 意图 -> 节点名。knowledge 已在 2.8、finance 已在 2.9、command/request_confirmation/
 # confirm_action/cancel_action/confirm_ambiguous 已在 2.10、handoff/dissatisfied_first
-# 已在 2.11 接入真正的实现，所有业务节点到本步全部落地
+# 已在 2.11、reminder 已在阶段三第 2 步接入真正的实现，所有业务节点全部落地
 _INTENT_TO_NODE = {
     "knowledge_qa": "knowledge",
     "finance_query": "finance",
     "platform_command": "command",
-    "reminder": "reminder_stub",
+    "reminder": "reminder",
     "chitchat": "chitchat",
     "handoff": "handoff",
     "dissatisfied_first": "dissatisfied_first",
@@ -51,7 +52,7 @@ _BUSINESS_NODES = (
     "confirm_action",
     "cancel_action",
     "confirm_ambiguous",
-    "reminder_stub",
+    "reminder",
     "handoff",
     "dissatisfied_first",
     "chitchat",
@@ -83,7 +84,7 @@ def _build_graph():
     graph.add_node("confirm_action", confirm_action)
     graph.add_node("cancel_action", cancel_action)
     graph.add_node("confirm_ambiguous", confirm_ambiguous)
-    graph.add_node("reminder_stub", reminder_stub)
+    graph.add_node("reminder", reminder)
     graph.add_node("handoff", handoff)
     graph.add_node("dissatisfied_first", dissatisfied_first)
     graph.add_node("chitchat", chitchat)

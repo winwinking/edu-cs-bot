@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import date as date_type
 from typing import Any, Callable, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 # ---------- 各工具的参数模型 ----------
 
@@ -101,15 +101,58 @@ class ManageReminderAction(str, enum.Enum):
     create = "create"
     update = "update"
     cancel = "cancel"
+    view = "view"
 
 
 class ManageReminderArgs(BaseModel):
-    """日程提醒（阶段二只占位路由，阶段三细化 raw_text 的解析）"""
+    """日程提醒：创建、修改、取消、查看四个动作共用一个工具，字段是否必填按 action 校验——
+    跟 PlatformCommandArgs 三个高风险动作共用一个模型是同一个思路，对外始终只有一个
+    manage_reminder 工具，不用为四个动作各注册一个函数。
+
+    时间由 LLM 理解、代码检查（PHASE3.md 关键设计决定 6）：event_time 是 LLM 把"明天 9 点"
+    这类说法转换成的本地时间字符串，这里只做结构性校验（格式对不对）；是不是真的在将来、
+    时区合不合法、提前量范围对不对，交给 app.common.reminder_rules（那边要连时区库，
+    不是纯粹的 JSON Schema 校验，放在这一层不合适）。
+
+    reminder_id 不强制要求 update/cancel 必填：LLM 应该从 <提醒列表> 块里选一个 id 填进来，
+    但选不出来（用户没说清楚，或者压根没有生效中的提醒）也是一种合法结果，交给
+    app/worker/graph/reminder.py 按"0 条/1 条/多条"分别处理，不在这一层就直接拒绝。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     action: ManageReminderAction
-    raw_text: str = Field(description="用户描述提醒需求的原话，阶段三再解析成具体时间和重复规则")
+    title: Optional[str] = Field(default=None, max_length=100, description="提醒标题，如“交作业”“家长会”")
+    # 形如 "2026-09-26 09:00"，是不是在将来、时区合不合法由 reminder_rules 校验，这里只挡格式
+    event_time: Optional[str] = Field(
+        default=None, description="LLM 理解后的本地时间，格式 YYYY-MM-DD HH:MM"
+    )
+    repeat: Optional[Literal["none", "daily", "weekly", "workdays"]] = Field(
+        default=None, description="重复规则，不传视为 none（只提醒一次）"
+    )
+    advance_minutes: Optional[int] = Field(default=None, ge=0, le=1440, description="提前多少分钟提醒")
+    # 修改/取消时从 <提醒列表> 块里选一个 id；代码会再查一遍这个 id 是不是真的属于当前
+    # tenant/user，不属于就按越权处理，不能信任 LLM 输出的 id 一定合法
+    reminder_id: Optional[str] = Field(default=None, description="要修改/取消的提醒 id")
+
+    @field_validator("event_time")
+    @classmethod
+    def _check_event_time_format(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        import re
+
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}", v.strip()):
+            raise ValueError("event_time 格式必须是 YYYY-MM-DD HH:MM")
+        return v
+
+    @model_validator(mode="after")
+    def _check_required_by_action(self) -> "ManageReminderArgs":
+        # 只在这里挡"创建提醒但连标题/时间都没有"这种明显残缺的输出；update/cancel/view
+        # 需不需要 reminder_id、有没有传其它字段，是业务节点自己按实际查到的数据判断的事
+        if self.action == ManageReminderAction.create and (not self.title or not self.event_time):
+            raise ValueError("创建提醒必须提供 title 和 event_time")
+        return self
 
 
 class TransferToHumanArgs(BaseModel):

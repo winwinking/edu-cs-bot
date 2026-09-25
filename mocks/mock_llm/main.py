@@ -16,7 +16,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from mocks.mock_llm.rules import extract_first_material, is_handoff_summary_request, match_tool_call
+from mocks.mock_llm.rules import (
+    extract_current_time,
+    extract_first_material,
+    is_handoff_summary_request,
+    match_tool_call,
+)
 
 app = FastAPI(title="mock-llm")
 
@@ -95,6 +100,13 @@ def _last_user_content(messages: List[ChatMessage]) -> str:
         if msg.role == "user":
             return msg.content
     return messages[-1].content if messages else ""
+
+
+def _system_content(messages: List[ChatMessage]) -> str:
+    for msg in messages:
+        if msg.role == "system":
+            return msg.content
+    return ""
 
 
 def _build_text_reply(messages: List[ChatMessage]) -> str:
@@ -208,7 +220,10 @@ async def chat_completions(req: ChatCompletionRequest):
     tool_call: Optional[tuple[str, dict]] = None
     if req.tools:
         content = _last_user_content(req.messages)
-        tool_call = match_tool_call(content)
+        # 相对时间（"明天 9 点"这类）按 system prompt 里写的"当前时间"算，不用 mock-llm 进程
+        # 自己的系统时钟——这样测试结果是固定的，不会因为跑测试的那一刻几点几分而变化
+        now_local = extract_current_time(_system_content(req.messages))
+        tool_call = match_tool_call(content, now_local=now_local)
 
     if tool_call is not None:
         name, args = tool_call

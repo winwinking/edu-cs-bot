@@ -1645,3 +1645,183 @@ $ phase2_smoke.py   # 第二次
 
 **人工审查与修复点**：
 （等 Jo 验证后再补充）
+
+---
+
+## 步骤 3.1：提醒的数据部分
+
+**日期**：2026-09-25
+
+**改动/新建模块**：
+- `app/common/models.py`：`Tenant` 新增 `timezone`（默认 `Asia/Shanghai`）；新增 `ReminderRepeat`/`ReminderStatus` 枚举和 `Reminder` 模型（`(tenant_id, user_id)` 和 `(status, next_trigger_at)` 两个索引）
+- `migrations/versions/202609250001_reminders.py`：新建，加 `tenants.timezone` 列、建 `reminders` 表和两个数据库枚举
+- `app/common/reminder_rules.py`：新建，纯函数——`resolve_timezone`/`validate_advance_minutes`/`parse_local_datetime`/`compute_creation_trigger`/`compute_next_occurrence`/`advance_after_trigger`
+- `app/common/tools.py`：`ManageReminderArgs` 从"占位 raw_text"改成真正的四动作参数模型（`action`/`title`/`event_time`/`repeat`/`advance_minutes`/`reminder_id`），只在 Pydantic 层校验创建时必须有 `title`+`event_time`，`reminder_id` 是否必填交给业务节点判断
+- `scripts/seed.py`：`TENANTS` 种子数据加 `timezone: "Asia/Shanghai"`
+- `tests/unit/test_reminder_rules.py`、`tests/unit/test_reminder_tool_args.py`：新建
+
+**关键决策**：
+- 时间计算全程用 UTC 的 aware datetime，只有算"下一次是哪一天"时才转到用户时区、算完立刻转回 UTC——不能直接在 UTC 上加整数天，有夏令时的时区会因为本地一天不是精确 24 小时而漂移（Asia/Shanghai 没有夏令时看不出这条逻辑的价值，单测专门用 `America/New_York` 覆盖了一次夏令时切换）。
+- 创建时的两种"拒绝"/"立刻提醒"规则严格按 PHASE3.md 原文：事件本身已过直接拒绝；"事件时间-提前量"已过但事件没过，`next_trigger_at` 设为现在。
+- `ManageReminderArgs` 沿用 `PlatformCommandArgs` 的模式：一个 `action` 字段驱动的单一模型，不是四个独立工具——对外始终只有一个 `manage_reminder` 工具。`reminder_id` 不强制 update/cancel 必填，因为"选不出来"本身是合法结果（0 条/1 条/多条），交给阶段三第 2 步的业务节点处理，不在参数校验这一层就拒绝。
+
+**验证记录**：
+```
+$ docker compose run --rm tools pytest -q tests/unit/test_reminder_rules.py tests/unit/test_reminder_tool_args.py
+25 passed in 0.08s
+
+$ docker compose run --rm tools alembic upgrade head
+...Running upgrade 202609241200 -> 202609250001...
+
+$ docker compose run --rm tools sh -c "alembic revision --autogenerate -m consistency_check && cat migrations/versions/*consistency_check.py"
+...upgrade()/downgrade() 都是 pass，models.py 和迁移完全对得上（临时文件未落盘到仓库）
+
+$ docker compose run --rm tools python scripts/sql.py "select column_name,data_type,is_nullable,column_default from information_schema.columns where table_name='reminders' order by ordinal_position"
+（13 行，字段/类型/默认值都符合设计：advance_minutes 默认 30，created_at/updated_at 默认 now()）
+
+$ docker compose run --rm tools python scripts/sql.py "select column_name,data_type,column_default from information_schema.columns where table_name='tenants' and column_name='timezone'"
+timezone  character varying  'Asia/Shanghai'::character varying
+
+$ docker compose run --rm tools python scripts/seed.py
+种子数据完成：2 个租户，7 个用户，2 条家长-学员关联
+
+$ docker compose run --rm tools python scripts/sql.py "select id,name,timezone,service_hours from tenants order by id"
+t_a  星辰教育  Asia/Shanghai  9:00 至 21:00
+t_b  启明学堂  Asia/Shanghai  8:30 至 20:30
+
+$ docker compose run --rm tools pytest -q tests/unit -rs
+135 passed, 1 skipped in 6.96s
+```
+
+**人工审查与修复点**：
+（等 Jo 验证后再补充）
+
+---
+
+## 步骤 3.2：提醒的推送和对话部分
+
+**日期**：2026-09-25
+
+**改动/新建模块**：
+- `app/scheduler/`（新服务，和 gateway/worker 共用同一个镜像）：`main.py`（健康检查端口 8002）、`loop.py`（每秒一次，`FOR UPDATE SKIP LOCKED` 取最多 100 条到期提醒，逐条推 Redis、写会话消息，整批处理完最后一次性提交）、`pubsub.py`（往 `im:out:{tenant_id}:{user_id}` 发 `type=reminder` 的消息）
+- `app/common/schemas.py`：新增 `ReminderPushMessage`
+- `app/worker/graph/reminder.py`：新建，`manage_reminder` 四个动作的业务节点——`load_active_reminders`/`format_reminder_list_block`（给 classify 用）、创建（时间/时区/提前量校验）、查看、修改/取消（先按 LLM 给的 id 核实归属，核实不通过按越权处理；id 缺失或选不出来按 0/1/多条分别处理）
+- `app/worker/graph/nodes.py`：`load_context` 顺带查出 `tenant_timezone` 和当前生效中的提醒列表，存进 state；删掉不再用的 `reminder_stub`
+- `app/worker/graph/classify.py`：给 LLM 分类请求的 system prompt 加"当前时间"（`build_current_time_note`），user 消息拼 `<提醒列表>` 块
+- `app/worker/graph/state.py`：`GraphState` 加 `tenant_timezone`/`reminder_list_block`
+- `app/worker/graph/style.py`：`build_current_time_note`、`REMINDER_CREATE_FAILED_REPLY`/`REMINDER_NO_ACTIVE_REPLY`/`REMINDER_FORBIDDEN_REPLY`；删掉不再用的 `REMINDER_STUB_REPLY`
+- `app/worker/graph/graph.py`：`reminder` 从占位换成真正实现
+- `mocks/mock_llm/rules.py`：新增日程提醒规则（创建/修改/取消/查看的字段提取、`<提醒列表>` 块解析、"当前时间"解析）；调整规则检查顺序为 财务→平台指令→日程提醒→问候→知识问答，避免"课程提醒"（平台指令）被"提醒"这个更宽泛的新规则抢走
+- `mocks/mock_llm/main.py`：解析 system prompt 里的当前时间传给 `match_tool_call`
+- `app/common/config.py`/`.env.example`/`.env`：新增 `SCHEDULER_INTERVAL_SECONDS`/`SCHEDULER_BATCH_SIZE`/`SCHEDULER_HEALTH_HOST_PORT`
+- `docker-compose.yml`：新增 `scheduler` 服务（依赖 postgres/redis healthy；端口用范围 `8002-8009:8002` 而不是单个固定端口，见下面"计划外改动"）
+- `scripts/reminder_ff.py`：新建，把指定用户最新一条生效提醒快进到 3 秒后触发，`APP_ENV=production` 时拒绝执行
+- `scripts/phase3_smoke.py`：新建，场景 5（创建提醒 → 快进 → WebSocket 收到推送 → 打印延迟）
+- `tests/unit/test_mock_llm_rules.py`：新增日程提醒规则的单测
+
+**计划外改动**：
+- `docker-compose.yml` 里 `scheduler` 服务的端口从单个固定端口改成了范围 `${SCHEDULER_HEALTH_HOST_PORT}-8009:8002`。原因：PHASE3.md 本步要求验证"`docker compose up -d --scale scheduler=2` 时两个实例不会重复处理同一条提醒"，但固定端口映射会导致第二个副本抢占同一个宿主机端口直接启动失败（实测复现，见下面验证记录）。改成端口范围后单实例仍然稳定拿到 `SCHEDULER_HEALTH_HOST_PORT`（8002），扩容时才会用到范围里更靠后的端口。这个改动只影响 `scheduler` 服务本身，不影响 gateway/worker。
+- 顺带发现 `worker` 服务的端口声明是同样的写法（单个固定端口），实测 `docker compose up -d --scale worker=3` 会有一样的启动失败（见验证记录）。这是阶段一就有的老配置，不在这一步的范围内，**没有动 worker 的配置**，只在下面"建议记为已知问题"里报告给你，PHASE3.md 第 6 步要用到 `--scale worker=3` 时需要一并解决。
+
+**关键决策**：
+- scheduler 一批（最多 100 条）到期提醒放在同一个事务里处理，所有 Redis 推送都发生在最后一次 `commit()` 之前——这是 PHASE3.md 原文"先推送再提交"的字面实现，代价是如果处理到第 50 条时进程崩溃，前 49 条的 Redis 推送已经发生但数据库更新会随事务一起回滚，重启后这 49 条会被重新判定为"还没处理"再推一次。这个代价比"先提交再推送、推送失败提醒永久丢了"小得多，接受，记已知问题。
+- 单条提醒推送失败（Redis 报错）时，不对这一条做任何 ORM 属性修改，让它在这次事务里保持"什么都没发生"的状态——批次里其他成功的提醒正常提交，这一条留在原地，下一秒被同一个查询重新选中再试。
+- `<提醒列表>` 块由 `load_context` 节点统一查一次放进 state，`classify.py` 直接读 state 里现成的字段，不在 `_classify_with_llm` 内部另开一次数据库查询——这样 `tests/unit/test_classify_confirm_boundaries.py` 那批用最小假 session 的单测不用跟着改（那批测试直接调 `_classify_core`，不经过 `load_context`，state 里没有这两个字段时用默认值兜底）。
+- mock-llm 的规则检查顺序把"日程提醒"排在"平台指令"之后：PHASE2 已有的 `update_course_reminder`（"修改课程提醒"）和阶段三新的 `manage_reminder` 字面上都含"提醒"两个字，"课程提醒"这个具体短语必须留给平台指令先接住。
+- `<提醒列表>` 块本身的文字（"提醒列表""生效中的提醒"）会让 mock-llm 新规则的"含'提醒'就当日程提醒"判断对任何消息都命中，所以 `match_tool_call` 在做 R1-R4 这类"是不是在说 XX"的判断之前，先把 `<提醒列表>` 块整个去掉，只用去块之后的用户原话判断意图；解析提醒 id 时才用回带块的完整内容。
+- 修改/取消提醒不算高风险，`ToolSpec` 沿用默认的 `is_high_risk=lambda: False`，不用像 `platform_command` 那样按参数判断。
+
+**验证记录**：
+```
+$ docker compose run --rm mock-llm pytest -q tests/unit/test_mock_llm_rules.py
+35 passed in 0.06s
+$ docker compose run --rm tools pytest -q tests/unit -rs
+135 passed, 1 skipped in 6.96s
+
+$ docker compose up -d --build   # 含新的 scheduler 服务，全部 healthy（gateway/worker/scheduler/5 mock/3 基础设施）
+
+$ docker compose run --rm tools sh -c "alembic upgrade head && python scripts/seed.py && python scripts/reindex.py"
+...已在 head，seed/reindex 幂等跳过
+
+$ docker compose run --rm tools python scripts/phase2_smoke.py
+全部 9 个场景 PASS   # 确认阶段二功能不受影响
+
+$ docker compose run --rm tools python scripts/phase3_smoke.py
+[PASS] 场景5 创建提醒并按时收到推送：push_ok=True 延迟=0.995589
+全部 1 个场景 PASS
+
+--- 服务重启不丢提醒 ---
+$ chat.py --tenant t_a --user u_a_1001 --conv restart_test "明天早上 9 点提醒我交作业"
+已设置提醒：明天 09:00 交作业，提前 30 分钟在 IM 通知你。
+$ sql.py "select next_trigger_at from reminders where ..."   # 2026-09-26 00:30:00+00:00（08:30 上海时间）
+$ docker compose stop scheduler
+$ reminder_ff.py --tenant t_a --user u_a_1001
+已快进：... next_trigger_at -> 2026-09-25T02:21:25...
+$ sleep 10 && sql.py "select status,next_trigger_at from reminders where id=..."
+active  2026-09-25 02:21:25...   # 10 秒内没有被处理，因为 scheduler 停着
+$ docker compose start scheduler && sleep 3
+$ sql.py "select status,next_trigger_at from reminders where id=..."
+done  2026-09-25 02:21:25...
+$ sql.py "select content,intent from messages where meta->>'reminder_id'='...'"
+提醒：明天 09:00 交作业，还有 30 分钟开始。  reminder_push   # 启动后几秒内补推
+
+--- 多个 scheduler 不重复 ---
+$ docker compose up -d --scale scheduler=2
+scheduler-1: 0.0.0.0:8002->8002  scheduler-2: 0.0.0.0:8003->8002   # 两个都 healthy
+$ chat.py ... "明天早上 9 点提醒我复习英语" && reminder_ff.py --tenant t_a --user u_a_1001
+$ sleep 5 && sql.py "select content from messages where meta->>'reminder_id'='...'"
+（只有 1 行）   # 两个 scheduler 都在跑，SKIP LOCKED 保证只被处理一次
+$ docker compose up -d --scale scheduler=1   # 验证完恢复
+
+--- 修改、取消 ---
+$ chat.py ... "明天早上 9 点提醒我打扫房间"
+$ chat.py ... "把打扫房间那个提醒改到晚上 8 点"
+$ sql.py "select event_at,next_trigger_at,status from reminders where title='打扫房间'"
+2026-09-25 12:00:00+00:00（20:00 上海）  2026-09-25 11:30:00+00:00  active
+$ chat.py ... "查看我的提醒"
+你目前生效中的提醒：09 月 25 日 20:00 打扫房间。
+$ chat.py ... "取消打扫房间的提醒"
+$ sql.py "select status from reminders where title='打扫房间'"
+cancelled
+$ (直接改库把这条 cancelled 记录的 next_trigger_at 拨到 5 秒前，模拟"早就该触发")
+$ sleep 4 && sql.py "select status from reminders where id=..." / "select content from messages where meta->>'reminder_id'=..."
+cancelled；messages 里 0 行   # 已取消的提醒不会被 scheduler 捡起来推送
+
+--- 越权 ---
+$ chat.py --tenant t_b --user u_b_1001 ... "明天早上 9 点提醒我背单词"   # 造一条别人的提醒
+$ sql.py "select id from reminders where user_id='u_b_1001' and title='背单词'"   # 拿到 id
+$ chat.py --tenant t_a --user u_a_1001 ... "帮我取消提醒 <上面那个 id>"
+这条提醒不是你名下的，我不能操作。   [meta] tools=[{"status":"forbidden"}]
+$ sql.py "select status from reminders where id=<上面那个 id>"
+active   # 越权尝试没有影响到这条提醒
+
+--- 0 条 / 多条歧义 ---
+$ chat.py --tenant t_a --user u_a_1004 ... "取消提醒"   # 这个用户没有任何提醒
+你目前没有生效的提醒。
+$ chat.py --tenant t_a --user u_a_1004 ... "明天早上 9 点提醒我交作业" 、"明天晚上 7 点提醒我打篮球"
+$ chat.py --tenant t_a --user u_a_1004 ... "帮我修改一下提醒"
+你有几条生效中的提醒：09 月 26 日 09:00 交作业；09 月 26 日 19:00 打篮球。要操作哪一条，麻烦说一下时间或名称。
+
+--- LLM 调用失败时不猜时间 ---
+$ mockctl.py llm mode=error500
+$ chat.py ... "明天早上 9 点提醒我开会"
+提醒这次没设置成功，麻烦再发一次。
+$ mockctl.py all reset
+
+--- 收尾 ---
+$ docker exec edu-cs-bot-rabbitmq-1 rabbitmqctl list_queues
+inbound.dead 0  inbound.messages 0
+$ docker compose logs worker --tail 500 | grep -i "error|exception" | grep -v "APIConnectionError|模拟的上游错误|error500"
+（无相关异常，只有历史启动时的 RabbitMQ 重连日志）
+$ docker compose run --rm tools pytest -q tests/unit -rs && docker compose run --rm mock-llm pytest -q tests/unit/test_mock_llm_rules.py
+135 passed, 1 skipped / 35 passed
+$ docker compose run --rm tools python scripts/phase2_smoke.py && docker compose run --rm tools python scripts/phase3_smoke.py
+全部 9 个场景 PASS / 全部 1 个场景 PASS
+$ docker compose down
+```
+
+**人工审查与修复点**：
+【agent 自查修复】mock-llm 的"日程提醒"规则最初检查顺序在最前面（跟旧的占位版本一样），导致 PHASE2 已有的"修改课程提醒"平台指令被新规则误吞（两者字面上都含"提醒"）。写单测时发现，调整成"财务→平台指令→日程提醒→问候→知识问答"的顺序修复，未额外请示（判断为纯粹的规则冲突，逻辑必然性强）。
+【agent 自查修复】`docker compose up -d --scale scheduler=2` 因为端口固定映射直接启动失败，验证时立刻复现。改成端口范围 `8002-8009:8002` 修复，只改了 scheduler 自己的端口声明。
+【agent 自查修复】mock-llm 提取时间时正则 `(\d{1,2})[:：点](\d{0,2})` 没算上数字和"点"之间可能有空格（"9 点"），单测跑起来直接暴露，改成 `\s*` 允许空格后修复。
+【待你决定】worker 服务的端口声明和 scheduler 修复前一样，也没法 `--scale worker=3`（已实测复现，见上面"计划外改动"），这次没有动 worker 的配置，留给你决定要不要现在一并改，还是留到 PHASE3.md 第 6 步用到的时候再改。

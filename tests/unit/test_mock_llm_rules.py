@@ -5,11 +5,17 @@ mocks/ 目录只打进 mocks 镜像，不在 tools/app 镜像里（两边刻意�
 tests/unit 目录在 tools 镜像里跑不起来。真正执行要用 mocks 镜像：
     docker compose run --rm mock-llm pytest -q tests/unit/test_mock_llm_rules.py
 """
+from datetime import datetime
+
 import pytest
 
 pytest.importorskip("mocks.mock_llm.rules")
 
-from mocks.mock_llm.rules import extract_first_material, match_tool_call  # noqa: E402
+from mocks.mock_llm.rules import (  # noqa: E402
+    extract_current_time,
+    extract_first_material,
+    match_tool_call,
+)
 
 
 def test_greeting_with_question_char_is_not_treated_as_knowledge_qa():
@@ -164,3 +170,104 @@ def test_knowledge_question_about_leave_policy_not_misrouted_to_platform_command
     result = match_tool_call("寒假班请假会退课时费吗")
     assert result is not None
     assert result[0] == "search_knowledge"
+
+
+# ---------- 日程提醒（PHASE3.md 第 2 步新增）----------
+
+_NOW = datetime(2026, 9, 25, 20, 0)  # 周五晚上 8 点
+
+
+def test_extract_current_time_from_system_prompt():
+    note = "当前时间：2026-09-25 20:00，星期五，时区 Asia/Shanghai。"
+    assert extract_current_time(note) == datetime(2026, 9, 25, 20, 0)
+
+
+def test_extract_current_time_returns_none_without_marker():
+    assert extract_current_time("你是一个客服机器人") is None
+
+
+def test_create_reminder_tomorrow_morning():
+    result = match_tool_call("明天早上 9 点提醒我交作业", now_local=_NOW)
+    assert result == ("manage_reminder", {"action": "create", "title": "交作业", "event_time": "2026-09-26 09:00"})
+
+
+def test_create_reminder_before_course_name_pattern():
+    result = match_tool_call("帮我把明天 19:00 的家长会提醒打开", now_local=_NOW)
+    assert result is not None
+    name, args = result
+    assert name == "manage_reminder"
+    assert args["action"] == "create"
+    assert args["title"] == "家长会"
+    assert args["event_time"] == "2026-09-26 19:00"
+
+
+def test_create_reminder_with_repeat_and_advance_minutes():
+    result = match_tool_call("每天早上 8 点提醒我喝水，提前 10 分钟", now_local=_NOW)
+    assert result is not None
+    _, args = result
+    assert args["repeat"] == "daily"
+    assert args["advance_minutes"] == 10
+
+
+def test_course_reminder_platform_command_not_hijacked_by_reminder_rule():
+    # "课程提醒"是 PHASE2 已有的平台指令动作（update_course_reminder），字面上也含"提醒"两个字，
+    # 不能被新的日程提醒规则抢走
+    result = match_tool_call("帮我修改课程提醒", now_local=_NOW)
+    assert result == ("platform_command", {"action": "update_course_reminder"})
+
+
+def test_cancel_reminder_without_explicit_id_lets_worker_resolve():
+    result = match_tool_call("帮我取消提醒", now_local=_NOW)
+    assert result == ("manage_reminder", {"action": "cancel"})
+
+
+def test_cancel_reminder_picks_unique_id_from_reminder_list_block():
+    content = (
+        "把交作业那个提醒取消掉\n\n"
+        "<提醒列表>\n"
+        "id: 11111111-1111-1111-1111-111111111111 | 标题：交作业 | 时间：2026-09-26 09:00 | 重复：none\n"
+        "</提醒列表>"
+    )
+    result = match_tool_call(content, now_local=_NOW)
+    assert result == (
+        "manage_reminder",
+        {"action": "cancel", "reminder_id": "11111111-1111-1111-1111-111111111111"},
+    )
+
+
+def test_reminder_list_block_with_multiple_entries_does_not_guess_id():
+    content = (
+        "帮我修改一下提醒\n\n"
+        "<提醒列表>\n"
+        "id: 11111111-1111-1111-1111-111111111111 | 标题：交作业 | 时间：2026-09-26 09:00 | 重复：none\n"
+        "id: 22222222-2222-2222-2222-222222222222 | 标题：家长会 | 时间：2026-09-26 19:00 | 重复：none\n"
+        "</提醒列表>"
+    )
+    result = match_tool_call(content, now_local=_NOW)
+    assert result is not None
+    _, args = result
+    assert "reminder_id" not in args
+
+
+def test_explicit_reminder_id_in_message_overrides_ambiguous_list():
+    # 模拟越权测试：用户消息里直接写了一个 id（不管是不是自己的），应该原样透传给校验层，
+    # 由业务节点核实这个 id 是不是真的属于当前用户
+    content = "帮我取消提醒 99999999-9999-9999-9999-999999999999"
+    result = match_tool_call(content, now_local=_NOW)
+    assert result == (
+        "manage_reminder",
+        {"action": "cancel", "reminder_id": "99999999-9999-9999-9999-999999999999"},
+    )
+
+
+def test_view_reminders():
+    result = match_tool_call("我的提醒都有哪些", now_local=_NOW)
+    assert result == ("manage_reminder", {"action": "view"})
+
+
+def test_reminder_list_block_alone_does_not_trigger_reminder_rule():
+    # <提醒列表> 块本身含"提醒""生效中"这类字眼，去掉之后剩下的用户原话跟提醒无关，
+    # 不能被这个块本身的文字误判成在创建提醒
+    content = "寒假班请假会退课时费吗？\n\n<提醒列表>\n（当前没有生效中的提醒）\n</提醒列表>"
+    result = match_tool_call(content, now_local=_NOW)
+    assert result == ("search_knowledge", {"query": "寒假班请假会退课时费吗？"})

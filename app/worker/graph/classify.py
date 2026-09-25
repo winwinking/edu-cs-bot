@@ -24,7 +24,7 @@ from app.common.models import Conversation, PendingAction, PendingActionStatus
 from app.common.prompt_guard import detect_prompt_injection
 from app.common.tools import ParsedToolCall, ToolCallError, parse_tool_call, to_openai_tools
 from app.worker.graph.state import GraphState
-from app.worker.graph.style import STYLE_SYSTEM_PROMPT
+from app.worker.graph.style import STYLE_SYSTEM_PROMPT, build_current_time_note
 
 logger = get_logger(__name__)
 
@@ -157,10 +157,18 @@ def _tool_meta_entry(name: str, parsed: "ParsedToolCall | ToolCallError") -> dic
 
 
 async def _classify_with_llm(state: GraphState) -> dict:
+    # 当前时间是代码算出来的事实，不是用户输入，放进 system prompt 没问题（关键设计决定 6）；
+    # <提醒列表> 块拼进 user 消息（不是 system），跟 <资料>/<历史摘要> 这类"资料性"内容一个
+    # 位置——修改/取消提醒时 LLM 要从这里挑 id。两者都是 load_context 这一步统一查好放进
+    # state 的，这里不用再连数据库
+    tenant_timezone = state.get("tenant_timezone") or "Asia/Shanghai"
+    system_content = f"{STYLE_SYSTEM_PROMPT}\n{build_current_time_note(tenant_timezone)}"
+    reminder_block = state.get("reminder_list_block") or ""
+    user_content = f"{state['content']}\n\n{reminder_block}" if reminder_block else state["content"]
     messages = (
-        [{"role": "system", "content": STYLE_SYSTEM_PROMPT}]
+        [{"role": "system", "content": system_content}]
         + list(state.get("history", []))
-        + [{"role": "user", "content": state["content"]}]
+        + [{"role": "user", "content": user_content}]
     )
     try:
         response = await chat_completion(messages=messages, tools=to_openai_tools(), tool_choice="auto")

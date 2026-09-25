@@ -95,9 +95,14 @@ class Settings(BaseSettings):
     # 待确认操作的有效期：超过这个时间用户还没回复"确认……"，就按超时处理，不再执行
     pending_action_ttl_seconds: int = 300
 
+    # ---------- 提醒调度（阶段三 2） ----------
+    scheduler_interval_seconds: float = 1
+    scheduler_batch_size: int = 100
+
     # ---------- 服务端口 ----------
     gateway_host_port: int = 8000
     worker_health_host_port: int = 8001
+    scheduler_health_host_port: int = 8002
     mock_im_host_port: int = 8080
     mock_llm_host_port: int = 8100
     mock_knowledge_host_port: int = 8101

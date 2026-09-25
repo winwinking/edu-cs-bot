@@ -18,6 +18,13 @@ class GraphState(TypedDict, total=False):
     message_id: str
     trace_id: Optional[str]
 
+    # load_context 一并查出来，给 classify 组装 LLM 请求用（PHASE3.md 第 2 步）：tenant_timezone
+    # 是"明天 9 点"这类相对时间换算的依据；reminder_list_block 是给 LLM 挑 id 用的 <提醒列表>
+    # 文本，每条消息都会查一次（不管这条消息是不是在说提醒），换一次小查询换来的是分类阶段
+    # 随时能看到最新的提醒状态，不用另外判断"这条消息像不像在说提醒"才决定要不要查
+    tenant_timezone: Optional[str]
+    reminder_list_block: Optional[str]
+
     content: str  # 当前这条用户消息
     history: List[dict]  # 历史消息（不含当前这条），[{"role": ..., "content": ...}]
 
