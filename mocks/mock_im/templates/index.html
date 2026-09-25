@@ -83,6 +83,11 @@
   #flow-dot { fill: var(--primary-dark); opacity: 0; }
   #flow-caption { font-size: 11px; color: var(--muted); margin: 2px 0 8px; }
 
+  /* 异常横条（阶段三 3.8 补充）：只在这条回复真的命中异常判定时出现，没有异常就完全不占地方，
+     不显示"无异常" */
+  #flow-anomaly-banner { display: none; background: var(--warn-bg); border: 1px solid var(--danger); color: var(--danger); font-size: 12px; padding: 6px 10px; border-radius: 4px; margin-bottom: 8px; }
+  .panel-val.anomaly { color: var(--danger); }
+
   .panel-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px dashed var(--border); font-size: 12px; }
   .panel-row:last-child { border-bottom: none; }
   .panel-key { color: var(--muted); }
@@ -148,6 +153,7 @@
 
     <div id="right">
       <div class="card">
+        <div id="flow-anomaly-banner"></div>
         <h3>处理流程回放（点击左侧任意一条机器人回复重新播放；这是"回放"，不是实时画面）</h3>
         <div id="flow-caption">图里的节点/连线跟 app/worker/graph/graph.py 的 StateGraph 一一对应；respond() 是虚线框——它不是图里的节点，是图跑完之后才执行的普通函数。</div>
         <div id="flow-diagram-wrap"></div>
@@ -230,6 +236,7 @@
     const scenarioCardEl = $("scenario-card");
     const workbenchCardEl = $("workbench-card");
     const rightPanelEl = document.getElementById("right");
+    const flowAnomalyBannerEl = $("flow-anomaly-banner");
     const flowDiagramWrapEl = $("flow-diagram-wrap");
     const flowDetailsEl = $("flow-details");
     const flowTraceEl = $("flow-trace");
@@ -310,9 +317,9 @@
       return bubble;
     }
 
-    function panelRow(key, val) {
+    function panelRow(key, val, isAnomaly) {
       return `<div class="panel-row"><span class="panel-key">${key}</span>` +
-        `<span class="panel-val">${val}</span></div>`;
+        `<span class="panel-val${isAnomaly ? " anomaly" : ""}">${val}</span></div>`;
     }
 
     function escapeHtml(s) {
@@ -424,6 +431,17 @@
 
     // 熔断/预算/限流/注入嫌疑标在具体是哪个节点做的那个判断上，不是随便挑一个显眼的位置放——
     // 这几处判断分别在哪个函数里，是读代码确认过的，不是猜的（AGENT_LOG 3.8 一节有逐条说明）
+    // 工具名 -> 图节点名：给"工具结果异常"标节点用，跟 app/worker/graph/*.py 里各节点
+    // tools_meta.name 的取值一一对应（query_finance/finance.py、platform_command/command.py、
+    // search_knowledge/knowledge.py、manage_reminder/reminder.py、transfer_to_human/handoff.py）
+    const TOOL_NAME_TO_NODE = {
+      query_finance: "finance",
+      platform_command: "command",
+      search_knowledge: "knowledge",
+      manage_reminder: "reminder",
+      transfer_to_human: "handoff",
+    };
+
     function applyFlagHighlights(meta, animPath) {
       const risk = meta.risk_flags || [];
       const cb = meta.circuit_breaker || [];
@@ -443,6 +461,49 @@
       if (cb.includes("finance") && animPath.includes("finance")) {
         markNodeClass("finance", "warn");
       }
+      // 阶段三 3.8 补充：工具结果异常/兜底回复/知识库无命中，也标在对应节点上，颜色沿用
+      // 已有的 .warn 样式，不是新画法
+      (meta.tools || []).forEach((t) => {
+        if (t.status === "ok") return;
+        const node = TOOL_NAME_TO_NODE[t.name];
+        if (node && animPath.includes(node)) markNodeClass(node, "warn");
+      });
+      if (meta.intent === "fallback" && animPath.includes("fallback")) {
+        markNodeClass("fallback", "warn");
+      }
+      if (meta.intent === "knowledge_qa" && (meta.citations || []).length === 0 && animPath.includes("knowledge")) {
+        markNodeClass("knowledge", "warn");
+      }
+    }
+
+    // ---------- 异常判定（阶段三 3.8 补充：右侧面板顶部的异常横条）----------
+    // 全部从 reply_end.meta 读，不新增字段；字段名跟 app/worker/graph/graph.py 的
+    // _build_meta() 实际输出一一对应：circuit_breaker、budget_exceeded、risk_flags、
+    // tools（不是 tools_meta——那是 GraphState 内部的键名，meta 里叫 tools）、intent、citations。
+    const TOOL_STATUS_LABEL = { forbidden: "工具被拒绝", timeout: "工具超时", upstream_error: "工具出错" };
+
+    function computeAnomalies(meta) {
+      const anomalies = [];
+      (meta.circuit_breaker || []).forEach((svc) => anomalies.push(`熔断降级（${svc}）`));
+      if (meta.budget_exceeded) anomalies.push("预算降级");
+      (meta.risk_flags || []).forEach((flag) => anomalies.push(`风险：${flag}`));
+      (meta.tools || []).forEach((t) => {
+        if (t.status !== "ok") anomalies.push(TOOL_STATUS_LABEL[t.status] || `工具${t.status}`);
+      });
+      if (meta.intent === "fallback") anomalies.push("兜底回复");
+      if (meta.intent === "knowledge_qa" && (meta.citations || []).length === 0) anomalies.push("知识库无命中");
+      return anomalies;
+    }
+
+    function renderAnomalyBanner(meta) {
+      const anomalies = computeAnomalies(meta);
+      if (!anomalies.length) {
+        flowAnomalyBannerEl.style.display = "none";
+        flowAnomalyBannerEl.textContent = "";
+        return;
+      }
+      flowAnomalyBannerEl.style.display = "";
+      flowAnomalyBannerEl.textContent = "本条异常：" + anomalies.join(" · ");
     }
 
     let flowAnimToken = 0; // 每次重新播放就作废上一次还没播完的动画，避免两次点击的动画交叉
@@ -481,6 +542,7 @@
     function renderFlowForNonReply(kind, traceId) {
       flowAnimToken++; // 作废任何正在播的动画
       resetFlowStyles();
+      renderAnomalyBanner({}); // 没有 meta，不显示异常横条
       flowDetailsEl.innerHTML = `<div class="detail-sub">${escapeHtml(kind)}</div>`;
       flowTraceEl.innerHTML = traceId
         ? `<div class="trace-row"><span class="panel-key">trace_id</span><code>${escapeHtml(traceId)}</code></div>`
@@ -498,28 +560,52 @@
       const timings = meta.timings || {};
       const path = meta.path || [];
 
+      // 阶段三 3.8 补充：这几行对应异常横条的六类判定，命中了就把值标红，不新增字段，
+      // 判定条件跟 computeAnomalies() 用的是同一份
+      const cbHit = (meta.circuit_breaker || []).length > 0;
+      const budgetHit = !!meta.budget_exceeded;
+      const riskHit = (meta.risk_flags || []).length > 0;
+      const toolsHit = tools.some((t) => t.status !== "ok");
+      const fallbackHit = meta.intent === "fallback";
+      const noHitHit = meta.intent === "knowledge_qa" && citations.length === 0;
+
       let html = "";
       const timingLines = path
         .map((n) => `${escapeHtml(n)}：${timings[n] != null ? timings[n] + " ms" : "-"}`)
         .join("　·　");
       html += panelRow("各节点耗时", timingLines || "-");
       html += panelRow("LLM 网络调用耗时", `${meta.llm_ms ?? 0} ms`);
-      html += panelRow("意图 / 判定来源", `${escapeHtml(meta.intent || "-")} / ${escapeHtml(meta.route_source || "-")}`);
+      html += panelRow(
+        "意图 / 判定来源",
+        `${escapeHtml(meta.intent || "-")} / ${escapeHtml(meta.route_source || "-")}`,
+        fallbackHit
+      );
       html += panelRow(
         "工具名和结果",
-        tools.length ? tools.map((t) => `${escapeHtml(t.name)}:${escapeHtml(t.status)}`).join("、") : "无"
+        tools.length ? tools.map((t) => `${escapeHtml(t.name)}:${escapeHtml(t.status)}`).join("、") : "无",
+        toolsHit
       );
       html += panelRow(
         "知识来源和分数",
         citations.length
           ? citations.map((c) => `《${escapeHtml(c.doc_title)}》第${escapeHtml(c.clause_no)}条(${c.score})`).join("；")
-          : "无"
+          : "无",
+        noHitHit
       );
       html += panelRow("worker_id", escapeHtml(meta.worker_id || "-"));
-      html += panelRow("熔断降级", meta.circuit_breaker && meta.circuit_breaker.length ? escapeHtml(meta.circuit_breaker.join("、")) : "无");
-      html += panelRow("预算降级", meta.budget_exceeded ? "是" : "否");
-      html += panelRow("风险标记", meta.risk_flags && meta.risk_flags.length ? escapeHtml(meta.risk_flags.join("、")) : "无");
+      html += panelRow(
+        "熔断降级",
+        cbHit ? escapeHtml(meta.circuit_breaker.join("、")) : "无",
+        cbHit
+      );
+      html += panelRow("预算降级", budgetHit ? "是" : "否", budgetHit);
+      html += panelRow(
+        "风险标记",
+        riskHit ? escapeHtml(meta.risk_flags.join("、")) : "无",
+        riskHit
+      );
       flowDetailsEl.innerHTML = html;
+      renderAnomalyBanner(meta);
 
       const traceId = entry.traceId || "-";
       flowTraceEl.innerHTML =
@@ -591,6 +677,7 @@
       logEl.innerHTML = "";
       flowAnimToken++;
       resetFlowStyles();
+      renderAnomalyBanner({});
       flowDetailsEl.innerHTML = '<div id="panel-empty">还没有回复</div>';
       flowTraceEl.innerHTML = "";
       flowRawMetaEl.textContent = "（还没有回复）";

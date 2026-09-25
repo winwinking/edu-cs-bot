@@ -21,7 +21,7 @@ from sqlalchemy import func, select
 
 from app.common.config import get_settings
 from app.common.db import AsyncSessionLocal
-from app.common.logging import get_logger
+from app.common.logging import bind_trace_context, clear_trace_context, get_logger
 from app.common.models import Message, MessageRole, Reminder, ReminderStatus
 from app.common.reminder_rules import advance_after_trigger, resolve_timezone
 from app.scheduler.metrics import reminder_push_delay_seconds, reminder_push_total
@@ -67,44 +67,56 @@ async def _process_due_reminders() -> int:
 
         processed = 0
         for item in due:
-            text = build_push_text(item, now)
+            # 人审发现（排查摘要日志时顺带发现，见 AGENT_LOG）：scheduler 之前从没调用过
+            # bind_trace_context，所有日志都没有 tenant_id/trace_id，不满足 NFR-4、也没法按
+            # 提醒/机构追踪。每条到期提醒现生成一个 trace_id，处理完立刻清空，不串到下一条——
+            # 一条提醒的处理是这个循环里最小的、有意义的追踪单元，不用整批共用一个 trace_id
+            # （那样多条提醒的日志会分不清是哪一条）。
+            trace_id = uuid.uuid4().hex
+            bind_trace_context(trace_id=trace_id, tenant_id=item.tenant_id)
             try:
-                await publish_reminder_push(item.tenant_id, item.user_id, str(item.id), item.title, text)
-            except RedisError as exc:
-                logger.warning(
-                    "提醒推送失败，这一条这次不更新触发时间，下一秒再试",
-                    reminder_id=str(item.id),
-                    error=str(exc),
+                text = build_push_text(item, now)
+                try:
+                    await publish_reminder_push(item.tenant_id, item.user_id, str(item.id), item.title, text)
+                except RedisError as exc:
+                    logger.warning(
+                        "提醒推送失败，这一条这次不更新触发时间，下一秒再试",
+                        user_id=item.user_id,
+                        reminder_id=str(item.id),
+                        error=str(exc),
+                    )
+                    reminder_push_total.labels(result="error").inc()
+                    continue
+
+                logger.info("提醒已推送", user_id=item.user_id, reminder_id=str(item.id))
+                reminder_push_total.labels(result="ok").inc()
+                # 这里读 next_trigger_at 还是这一条本来到期的时间——下面 advance_after_trigger()
+                # 才会把它改成下一次触发时间，晚一步读就量不出真实的推送延迟了
+                reminder_push_delay_seconds.observe((now - item.next_trigger_at).total_seconds())
+
+                session.add(
+                    Message(
+                        id=uuid.uuid4(),
+                        tenant_id=item.tenant_id,
+                        conversation_id=item.conversation_id,
+                        message_id=f"reminder-{uuid.uuid4()}",
+                        role=MessageRole.assistant,
+                        content=text,
+                        intent="reminder_push",
+                        meta={"reminder_id": str(item.id)},
+                    )
                 )
-                reminder_push_total.labels(result="error").inc()
-                continue
 
-            reminder_push_total.labels(result="ok").inc()
-            # 这里读 next_trigger_at 还是这一条本来到期的时间——下面 advance_after_trigger()
-            # 才会把它改成下一次触发时间，晚一步读就量不出真实的推送延迟了
-            reminder_push_delay_seconds.observe((now - item.next_trigger_at).total_seconds())
-
-            session.add(
-                Message(
-                    id=uuid.uuid4(),
-                    tenant_id=item.tenant_id,
-                    conversation_id=item.conversation_id,
-                    message_id=f"reminder-{uuid.uuid4()}",
-                    role=MessageRole.assistant,
-                    content=text,
-                    intent="reminder_push",
-                    meta={"reminder_id": str(item.id)},
+                advance = advance_after_trigger(
+                    item.event_at, item.timezone, item.repeat.value, item.advance_minutes, now
                 )
-            )
-
-            advance = advance_after_trigger(
-                item.event_at, item.timezone, item.repeat.value, item.advance_minutes, now
-            )
-            if advance is None:
-                item.status = ReminderStatus.done
-            else:
-                item.event_at, item.next_trigger_at = advance
-            processed += 1
+                if advance is None:
+                    item.status = ReminderStatus.done
+                else:
+                    item.event_at, item.next_trigger_at = advance
+                processed += 1
+            finally:
+                clear_trace_context()
 
         await session.commit()
         return processed
