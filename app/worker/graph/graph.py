@@ -4,8 +4,9 @@ respond() 是图外面的统一出口：图只负责决策，产出 reply_plan�
 跑完图的最终 state，负责把 reply_plan 转成真正的 reply_chunk/reply_end 发给客户端，template 按句
 切分，generate 流式调 LLM 并经过 OutputGuard，最后统一发 reply_end（带 meta）。
 """
+import socket
 import time
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from langgraph.graph import END, StateGraph
 from openai import APIConnectionError, APIError, APITimeoutError
@@ -29,6 +30,10 @@ from app.worker.metrics import first_token_seconds, reply_seconds, tool_calls_to
 from app.worker.pubsub import publish_reply_chunk, publish_reply_end
 
 logger = get_logger(__name__)
+
+# 容器主机名当 worker 实例的标识（阶段三 3.8 第 9 点，演示控制台流程视图要显示"这条回复是哪个
+# worker 处理的"）：多个 worker 副本各自的容器 hostname 天然不同，不用额外生成/维护一个实例 id
+_WORKER_ID = socket.gethostname()
 
 # 意图 -> 节点名。knowledge 已在 2.8、finance 已在 2.9、command/request_confirmation/
 # confirm_action/cancel_action/confirm_ambiguous 已在 2.10、handoff/dissatisfied_first
@@ -64,6 +69,30 @@ _BUSINESS_NODES = (
 )
 
 
+_NodeFn = Callable[[GraphState, Any], Awaitable[dict]]
+
+
+def _timed(name: str, fn: _NodeFn) -> _NodeFn:
+    """给节点打点用（阶段三 3.8 第二轮，Jo 批准的第二处后端改动）：只包一层计时，不碰节点自己
+    的业务逻辑和返回值内容，把"这条消息实际经过了哪些节点、每个节点花了多久"如实记下来，供
+    演示控制台的流程图回放用，也是阶段四拆分"系统耗时/mock 耗时"的数据来源之一（respond() 里
+    LLM 调用的耗时单独记在 llm_ms，不在这里）。path/timings 用"读旧值、拼新值"的写法而不是
+    直接改 state，是因为 LangGraph 只认节点返回值里的字段来更新 state，节点入参这个 state
+    对象本身的原地修改不保证会被采纳（respond() 是图跑完之后才执行的普通函数，不受这条限制，
+    所以那边可以直接对 state 赋值）。
+    """
+
+    async def wrapper(state: GraphState, runtime: Any) -> dict:
+        start = time.monotonic()
+        result = await fn(state, runtime)
+        elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+        path = list(state.get("path", [])) + [name]
+        timings = {**state.get("timings", {}), name: elapsed_ms}
+        return {**result, "path": path, "timings": timings}
+
+    return wrapper
+
+
 def _route(state: GraphState) -> str:
     intent = state.get("intent")
     if intent == "high_risk":
@@ -78,21 +107,21 @@ def _route(state: GraphState) -> str:
 def _build_graph():
     graph = StateGraph(state_schema=GraphState, context_schema=GraphContext)
 
-    graph.add_node("load_context", load_context)
-    graph.add_node("classify", classify)
-    graph.add_node("knowledge", knowledge)
-    graph.add_node("finance", finance)
-    graph.add_node("command", command)
-    graph.add_node("request_confirmation", request_confirmation)
-    graph.add_node("confirm_action", confirm_action)
-    graph.add_node("cancel_action", cancel_action)
-    graph.add_node("confirm_ambiguous", confirm_ambiguous)
-    graph.add_node("reminder", reminder)
-    graph.add_node("handoff", handoff)
-    graph.add_node("dissatisfied_first", dissatisfied_first)
-    graph.add_node("chitchat", chitchat)
-    graph.add_node("sensitive", sensitive)
-    graph.add_node("fallback", fallback)
+    graph.add_node("load_context", _timed("load_context", load_context))
+    graph.add_node("classify", _timed("classify", classify))
+    graph.add_node("knowledge", _timed("knowledge", knowledge))
+    graph.add_node("finance", _timed("finance", finance))
+    graph.add_node("command", _timed("command", command))
+    graph.add_node("request_confirmation", _timed("request_confirmation", request_confirmation))
+    graph.add_node("confirm_action", _timed("confirm_action", confirm_action))
+    graph.add_node("cancel_action", _timed("cancel_action", cancel_action))
+    graph.add_node("confirm_ambiguous", _timed("confirm_ambiguous", confirm_ambiguous))
+    graph.add_node("reminder", _timed("reminder", reminder))
+    graph.add_node("handoff", _timed("handoff", handoff))
+    graph.add_node("dissatisfied_first", _timed("dissatisfied_first", dissatisfied_first))
+    graph.add_node("chitchat", _timed("chitchat", chitchat))
+    graph.add_node("sensitive", _timed("sensitive", sensitive))
+    graph.add_node("fallback", _timed("fallback", fallback))
 
     graph.set_entry_point("load_context")
     graph.add_edge("load_context", "classify")
@@ -133,6 +162,17 @@ def _build_meta(state: GraphState, guard: OutputGuard) -> dict[str, Any]:
         "circuit_breaker": state.get("circuit_breaker", []),
         # 本轮因为机构今日 token 预算用完而跳过 LLM 调用（阶段三第 6 步，设计决定 13）
         "budget_exceeded": state.get("budget_exceeded", False),
+        # 这条回复是哪个 worker 副本处理的（阶段三 3.8 第 9 点）
+        "worker_id": _WORKER_ID,
+        # 这条消息实际经过的图节点名，按执行顺序（阶段三 3.8 第二轮，演示控制台流程图回放用）；
+        # respond() 不是 StateGraph 的节点，是图跑完之后才调用的普通函数，在 respond() 末尾
+        # 手工追加，不是 _timed() 打的点
+        "path": state.get("path", []),
+        # 每个节点自己的耗时（毫秒），键是节点名，取值来自 path 同一份打点
+        "timings": state.get("timings", {}),
+        # 这条消息里真正花在等 LLM 网络调用上的时间（毫秒），累加自 classify/handoff/respond
+        # 三处可能调 LLM 的地方，没调用 LLM 的请求这里是 0，不是 None——方便前端直接做除法/占比
+        "llm_ms": round(state.get("llm_ms", 0), 1),
     }
 
 
@@ -223,6 +263,11 @@ async def respond(tenant_id: str, user_id: str, reply_to: str, state: GraphState
                 await emit(fallback_guard.feed(FALLBACK_LLM_UNAVAILABLE_REPLY))
                 await emit(fallback_guard.flush())
                 guard = fallback_guard
+        finally:
+            # 熔断打开时这段耗时接近 0（熔断在真正发请求前就拦下了），不是"等 LLM"的时间，
+            # 但为了不用再判断一次分支，还是按实际经过的时间记——影响小到可以忽略，不值得
+            # 为了这点精度多写一层判断
+            state["llm_ms"] = state.get("llm_ms", 0) + (time.monotonic() - start) * 1000
 
         # 知识问答专用兜底（2.8 第 5 点）：LLM 生成的句子全被出处检查拦下了（或者干脆没生成出
         # 任何有效内容），guard 手上一句都没成功发出去——用排名第一的检索结果原文垫底，
@@ -235,6 +280,12 @@ async def respond(tenant_id: str, user_id: str, reply_to: str, state: GraphState
         # 这次请求，mock-llm/真实 LLM 根本没收到或者没处理完，没有真实成本可记
         if stream_ok:
             await _record_generate_usage(state, plan, chunks, usage_holder)
+
+    # respond() 不是 StateGraph 节点，_timed() 包不到它，这里手工补最后一段到 path/timings——
+    # 图里最后一个业务节点只是"决定回复内容"，真正的生成/发送（含流式调 LLM、OutputGuard、
+    # 发 reply_chunk）是这个函数做的，流程图回放要能看到这一步，不能漏掉
+    state["path"] = list(state.get("path", [])) + ["respond"]
+    state["timings"] = {**state.get("timings", {}), "respond": round((time.monotonic() - reply_start) * 1000, 1)}
 
     meta = _build_meta(state, guard)
     await publish_reply_end(tenant_id, user_id, reply_to, meta)

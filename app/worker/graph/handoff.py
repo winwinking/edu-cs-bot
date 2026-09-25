@@ -4,6 +4,7 @@
 这里只管把转接记录建好、判断坐席在不在线。转接记录要给人工客服看，所以 summary 必须先过
 mask_text() 脱敏（硬性规则：日志/审计不留敏感信息原文，转接记录本质上也是一种审计留痕）。
 """
+import time
 import uuid
 from typing import Any, Optional
 
@@ -43,7 +44,10 @@ def _fallback_summary(messages: list[dict]) -> str:
     return "；".join(text[:50] for text in user_texts[-3:])
 
 
-async def _generate_summary(state: GraphState, session) -> str:
+async def _generate_summary(state: GraphState, session, timing_holder: Optional[dict] = None) -> str:
+    """timing_holder：跟 respond() 的 usage_holder 一个用法（阶段三 3.8 第二轮）——这个函数不是
+    图节点，调用方 handoff() 才是，函数自己没法把耗时写进节点返回值，只能通过调用方传进来的
+    可变字典带出去。"""
     history = list(state.get("history", []))
     transcript_messages = history + [{"role": "user", "content": state["content"]}]
     transcript = "\n".join(
@@ -60,11 +64,15 @@ async def _generate_summary(state: GraphState, session) -> str:
         logger.info("机构今日 token 预算已用完，转人工摘要改用模板拼接", tenant_id=tenant_id)
     else:
         messages = [{"role": "user", "content": _HANDOFF_SUMMARY_PROMPT_PREFIX + transcript}]
+        llm_start = time.monotonic()
         try:
             response = await chat_completion(messages=messages)
             summary = (response.choices[0].message.content or "").strip()
         except (APIError, APITimeoutError, APIConnectionError) as exc:
             logger.warning("生成转人工摘要失败，改用模板拼接", error=str(exc))
+        finally:
+            if timing_holder is not None:
+                timing_holder["llm_ms"] = timing_holder.get("llm_ms", 0) + (time.monotonic() - llm_start) * 1000
 
         if summary:
             usage = extract_usage_from_response(response)
@@ -218,7 +226,8 @@ async def handoff(state: GraphState, runtime) -> dict[str, Any]:
     # 不让转接这件事本身因为一个次要字段没设就失败
     trigger_value = state.get("handoff_trigger") or "keyword"
 
-    summary = await _generate_summary(state, session)
+    llm_timing: dict = {}
+    summary = await _generate_summary(state, session, llm_timing)
     intent = await _last_business_intent(session, tenant_id, conversation_id)
     attempted_actions = await _collect_attempted_actions(session, tenant_id, conversation_id)
     risk_flags = await _collect_risk_flags(session, tenant_id, conversation_id, state)
@@ -261,6 +270,7 @@ async def handoff(state: GraphState, runtime) -> dict[str, Any]:
         "reply_plan": {"mode": "template", "text": reply},
         "handoff_ticket_id": str(ticket_id),
         "tools_meta": [{"name": "transfer_to_human", "status": "ok"}],
+        "llm_ms": state.get("llm_ms", 0) + llm_timing.get("llm_ms", 0),
     }
 
 

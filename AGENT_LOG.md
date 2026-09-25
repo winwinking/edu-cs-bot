@@ -2598,7 +2598,7 @@ $ docker compose run --rm tools python scripts/phase3_smoke.py
 mock-im 后端（真实 docker）：
 ```
 $ curl -s "http://localhost:8080/api/token?tenant_id=t_a&user_id=u_a_1001"
-{"token":"eyJhbGciOiJIUzI1NiIs...","name":"张小明","role":"student"}
+{"token":"<u_a_1001的token>","name":"张小明","role":"student"}
 $ curl -s "http://localhost:8080/api/token?tenant_id=t_a&user_id=nope"
 {"detail":"用户不存在：tenant=t_a user=nope，先跑 make seed"}
 $ curl -s -w "\nHTTP_STATUS:%{http_code}\n" "http://localhost:8080/api/token?tenant_id=t_a&user_id=u_b_1001"
@@ -2685,5 +2685,504 @@ $ git status --short | grep -i "\.env$"
 
 **人工审查与修复点**：
 无（本步骤是按 PHASE3.md 第 7 步开发，不是审查驱动的修复）。
+
+## 步骤 3.8：演示控制台增强（Jo 审查检查点 D 后提出的追加需求，不在 PHASE3.md 原文里）
+
+这一步是 Jo 在检查点 D 审查通过之后，另外提出的两条追加指令合并来的：第一条要求把透视面板改成
+处理流程视图、支持点历史回复、记忆区块、按身份记会话、按身份分组场景按钮（含若干新场景）、坐席
+工作台、顶部状态条、整体改视觉风格；第二条追加了 worker_id 打点和坐席工作台的审计日志栏。指令
+明确限定"只改 mocks/mock_im/ 下的文件，不改 app/、gateway、worker、scheduler，如果发现必须改
+它们，先停下说明原因和影响，等 Jo 确认"，第 9 点又单独批准了一处例外（worker_id）。
+
+**改动/新建模块**：
+- `mocks/mock_im/main.py`：新增 `/api/status`（顶部状态条：gateway 健康状态 + 机构今日 token
+  用量/预算）、`/api/conversation/context`（记忆区块：会话历史摘要内容+覆盖到哪）、
+  `/api/handoff_tickets`（坐席工作台：本机构转接工单列表）、`/api/audit_logs`（坐席工作台：
+  本机构审计日志），后两个接口用 `_require_agent()` 校验 token 角色必须是 agent 且 tenant_id
+  必须匹配，不匹配一律 403。
+- `mocks/mock_im/templates/index.html`：整页重写——处理流程视图（7 个节点：入站/意图识别/
+  安全校验/工具调用/知识检索/输出检查/回复）、点击历史回复切换面板、记忆区块、按身份分组的
+  快捷场景按钮（原有 10+1 个场景保留在 u_a_1001 组不变，另加 6 类新场景分到对应身份组）、
+  坐席工作台（工单表格+审计日志表格）、顶部状态条（5 秒轮询 `/api/status`）、整体改成白底+
+  单一主色+1px 细线分隔的视觉风格，聊天区不再直接显示 ack/reply_end 原始文字，改成气泡下面
+  一行小字（"已送达 · 86 ms"这种）。
+- `app/worker/graph/graph.py`：`_build_meta()` 加一行 `"worker_id": socket.gethostname()`
+  ——这是本步骤**唯一允许的后端改动**（Jo 追加指令第 9 点明确批准），只改这一行、只改
+  worker 生成 meta 的这段代码，没有动其它任何业务逻辑。
+- `.env.example`：加一条 `GATEWAY_INTERNAL_URL`（mock-im 后端查 gateway `/health` 用的容器
+  内部地址，跟浏览器用的 `GATEWAY_HOST_PORT` 是两回事），有代码默认值，不设也能跑。
+
+**为什么/怎么实现的关键设计点**：
+1. **顶部状态条为什么由 mock-im 后端查，不是浏览器直接查**：指令原文写明"由 mock-im 后端
+   查询"——一是浏览器直接查 Redis 预算键做不到（Redis 没对外暴露 HTTP），二是跟 `/api/token`
+   一样的角色分工："mock-im 在演示里临时扮演一个有后端查询能力的角色"，不代表真实平台会这样
+   接入 gateway。gateway 健康检查走 `GATEWAY_INTERNAL_URL`（默认
+   `http://gateway:8000`，docker 网络内部地址），跟浏览器连 WebSocket 用的
+   `GATEWAY_HOST_PORT`（宿主机映射端口）是两个完全不同的地址，不能混用。
+2. **记忆区块里的摘要内容/覆盖到哪，是现查数据库，不是从 reply_end.meta 里读的**：meta 里
+   只有 `context.history_messages`/`context.has_summary` 这两个布尔/数字字段，没有摘要正文
+   和 `covered_until`——这两个字段目前系统里根本不存在于 meta，加进去是一次新的 app/worker
+   改动（超出本步骤"只改 mocks/mock_im"的范围）。退一步的做法：mock-im 本来就已经因为
+   `/api/token` 连了数据库，这里再查一次只读的 `conversation_summaries` 表，不新增任何
+   app/worker 改动。副作用是这查到的是"当前最新摘要状态"，不是"点开的这条历史回复发生那一刻
+   的快照"——页面上用一句话明确写出来了这个限制，不假装能做到历史快照。
+3. **处理流程视图里，7 个节点不是每个都有"耗时"**：只有"入站"（ACK 耗时）和"回复"（首句/
+   完整耗时）能从浏览器计时（`performance.now()`，发送到收到 ack/首个分片/reply_end 的时间
+   差）拿到；中间 5 个节点（意图识别/安全校验/工具调用/知识检索/输出检查）系统目前没有任何
+   分段打点，`reply_end.meta` 里也没有对应的时间戳字段——按 Jo 的要求"缺字段先问，不许编造"，
+   这几个节点的"耗时"栏如实显示"—"，底部横向耗时条也只画了三段（入站/后端处理到首句/流式
+   生成），不是七段。**这是需要 Jo 决定要不要做的缺口**：如果要更细的分段耗时，需要在
+   app/worker 里给每个节点各自记一个时间戳写进 meta，这是一处 app/worker 改动，按指令要求
+   停下来问，不在本步骤自行加。
+4. **场景按钮为什么这样分组，原有 10 个场景为什么原封不动留在 u_a_1001 组**：
+   `scripts/phase2_smoke.py` 的 10 个 E2E 场景全部是用 `t_a/u_a_1001` 发的（读代码确认过，
+   不是猜的），挪到别的身份下会跟冒烟脚本的叙事对不上，所以保留在原身份组，只是加了个分组
+   外壳，文案和目标身份都没变。新增场景按最贴合叙事的身份分组：家长查财务的两个新场景放
+   `u_a_1002`；反向越权查询放 `u_a_1004`（跟张小明互不关联的学生）；跨机构政策对比在
+   `u_a_1001`/`u_b_1001` 两边各放一个，需要手动切身份对比，不是自动化的。
+5. **"连续两次不满意转人工"为什么做成一个按钮发两条消息，不是两个按钮**：不满意计数是
+   服务端按消息到达顺序累加的（`_bump_dissatisfied_count`），两条消息之间不能同时发、也不能
+   乱序，做成一个按钮内部顺序发送（等第一条的 `reply_end` 回来再发第二条），比让人手动点两次
+   更不容易因为点太快导致顺序乱掉。
+6. **坐席工作台的权限校验为什么放在 mock-im，不是让前端自己判断该不该显示**：`role` 只能来自
+   数据库/JWT，不能让浏览器自己决定"我是不是坐席"——`_require_agent()` 解 token 拿到的
+   `role`/`tenant_id` 做校验，跟 gateway 鉴权的思路一致（角色永远从服务端可信来源判断，不
+   信前端传的任何东西），前端只是根据 `/api/token` 返回的角色做界面切换，不是权限判断本身。
+7. **审计日志接口为什么统一过一遍 `mask_text()`**：`AuditLog.detail` 目前存的字段（kind/
+   period/target_user_id/action）本来就不含姓名、卡号这类原文，但"显示内容必须脱敏"是指令
+   里的硬性要求，不能假设"这张表现在存的内容就一定不敏感"，统一脱敏兜底，以后往 detail 里
+   加字段时也不用担心漏脱敏。
+
+**计划外改动**：
+1. 本步骤唯一涉及 app/ 的改动（`app/worker/graph/graph.py` 加 `worker_id`）是 Jo 追加指令
+   第 9 点明确批准的，不算"计划外"；影响范围只是 `_build_meta()` 返回的字典多一个只读字段，
+   不改变任何路由/业务判断逻辑，`tests/unit`、`phase2_smoke.py`、`phase3_smoke.py` 全部重新
+   跑过，行为没有变化（结果见下面"验证"）。
+2. **`mocks/mock_im/main.py` 新增的 `/api/handoff_tickets`、`/api/audit_logs`、
+   `/api/status`、`/api/conversation/context` 这 4 个接口，PHASE3.md 原文里没有，是计划外
+   新增的**：本步骤（3.8）整体就是 Jo 审查检查点 D 之后另外提出的追加需求，不在 PHASE3.md
+   任务列表里，这 4 个接口具体是为了实现追加指令第 6/7/10 点（坐席工作台要看转接单和审计
+   日志、顶部状态条要查 gateway 健康和预算、记忆区块要查会话摘要）才加的，没有更早的计划
+   依据。影响范围：
+   - 全部是 `GET`，只读查询，不写数据库、不改任何表的数据、不改变
+     `handoff_tickets`/`audit_logs` 这两张表的任何一行（`/api/handoff_tickets` 只是
+     `SELECT ... FROM handoff_tickets WHERE tenant_id=...`，不会创建新的转接单、不会把
+     `queued` 改成别的状态——建转接单和判断在不在线是 `app/worker/graph/handoff.py` 的
+     `handoff()` 节点做的事，这个接口跟那条业务链路完全没有交叉）；
+   - `/api/handoff_tickets`/`/api/audit_logs` 需要 token，而且必须是坐席角色 + token 所属
+     机构等于请求的机构（`_require_agent()`），学生 token 调用会被拒绝，返回
+     `{"detail":"仅坐席可访问，且只能查看本机构数据"}`，状态码 403（不带 token 是
+     `{"detail":"缺少 token，仅坐席可访问"}`，同样 403）——原样输出见下面"验证"；
+   - 只改 `mocks/mock_im/`，不涉及 gateway/worker/scheduler 的任何代码或数据库写路径，
+     跟 gateway/worker 的运行时行为完全无关。
+
+**验证**：
+
+1）单元测试 + 两个冒烟脚本（`worker_id` 改动之后重新跑，确认没有破坏任何既有行为）：
+```
+$ docker compose run --rm tools pytest tests/unit -q
+182 passed, 1 skipped in 7.04s
+$ docker compose run --rm tools python scripts/phase2_smoke.py
+全部 9 个场景 PASS
+$ docker compose run --rm tools python scripts/phase3_smoke.py
+全部 6 个场景 PASS
+```
+
+2）坐席接口权限校验——学生 token / 不带 token 调 `/api/handoff_tickets`，完整命令和完整返回：
+```
+$ curl -s -w "\nHTTP_STATUS:%{http_code}\n" "http://localhost:8080/api/handoff_tickets?tenant_id=t_a&token=<u_a_1001的token>"
+{"detail":"仅坐席可访问，且只能查看本机构数据"}
+HTTP_STATUS:403
+
+$ curl -s -w "\nHTTP_STATUS:%{http_code}\n" "http://localhost:8080/api/handoff_tickets?tenant_id=t_a"
+{"detail":"缺少 token，仅坐席可访问"}
+HTTP_STATUS:403
+```
+（token 是现发的 u_a_1001 学生身份的真实 JWT，这里用占位符代替，不贴真实值；这个接口只做
+`SELECT`，两次调用都在校验阶段就被 `_require_agent()` 拦下，没有查过数据库，更不会有任何
+写操作）
+
+3）坐席接口跨机构隔离——t_a 坐席只看到 t_a 的审计记录，t_b 坐席用自己的 token 查 t_a 会被拒：
+```
+$ curl -s "http://localhost:8080/api/audit_logs?tenant_id=t_a&token=<u_a_1003的token>"
+（12 条记录，actor_user_id 全部是 u_a_* ，其中一条是 u_a_1001 查 u_a_1004 被拒的记录：
+ {"actor_user_id":"u_a_1001","action":"query_finance","target_user_id":"u_a_1004","result":"forbidden","result_label":"拒绝", ...}）
+$ curl -s "http://localhost:8080/api/audit_logs?tenant_id=t_b&token=<u_b_1003的token>"
+（返回的记录 actor_user_id 全部是 u_b_* ，没有 t_a 的数据）
+$ curl -s -w "\nHTTP_STATUS:%{http_code}\n" "http://localhost:8080/api/audit_logs?tenant_id=t_a&token=<u_b_1003的token>"
+{"detail":"仅坐席可访问，且只能查看本机构数据"}
+HTTP_STATUS:403
+```
+（这条记录就是 u_a_1001 查 u_a_1004 财务被拒——PHASE2 场景 3——的审计留痕，坐席工作台能查到
+说明 `_write_audit_log` 和这个新接口是接得上的，不是巧合造出来的假数据）
+
+4）`worker_id` 分布到不同 worker 副本（验证完已经缩回单实例）：
+```
+$ docker compose build tools worker && docker compose up -d --scale worker=3
+$ docker compose run --rm tools python scripts/_verify_worker_id.py   # 临时脚本，验证完已删除
+消息1 worker_id=e8fd81f93e3a
+消息2 worker_id=f2acd2335010
+消息3 worker_id=79322a5f1ffc
+消息4 worker_id=e8fd81f93e3a
+消息5 worker_id=f2acd2335010
+消息6 worker_id=79322a5f1ffc
+去重后的 worker_id 集合： ['79322a5f1ffc', 'e8fd81f93e3a', 'f2acd2335010']
+$ docker compose up -d --scale worker=1   # 验证完恢复单实例
+```
+6 条消息分布在 3 个不同的 worker 容器上，符合预期。
+
+5）新增/分组后的场景按钮原句真实发一遍，确认命中预期意图（临时脚本，写法照抄
+`scripts/phase2_smoke.py` 的 `send()`，验证完已删除）：
+```
+[PASS] 家长查孩子发票：intent=finance_query tool_status=ok reply='我查到 2026-08 有一笔订单 #EDU-20260812-8831，金额 '
+[PASS] 家长查非关联学生：tool_status=forbidden reply='这个账号的财务信息不属于你，我这边不能查询。如果需要，请本人登录后再问我。'
+[PASS] 反向越权查询：tool_status=forbidden reply='这个账号的财务信息不属于你，我这边不能查询。如果需要，请本人登录后再问我。'
+[PASS] 连续两次不满意转人工：intent1=dissatisfied_first handoff_ticket_id2=72852587-0c55-4187-a414-ae1efb9698e9
+[PASS] 敏感操作注销账号：risk_flags=['sensitive_request'] reply='这类操作涉及账号安全，需要人工核实身份后才能办理。回复"转人工"，我帮你转接。'
+[PASS] 注入尝试：intent=knowledge_qa risk_flags=['prompt_injection_suspected'] tool_status=None
+[PASS] 工作日重复提醒：tool_status=ok reply='已设置提醒：明天 08:00 打卡，工作日，提前 30 分钟在 IM 通知你。'
+[PASS] 跨机构政策对比：t_a citations=[{'doc_title': '退费政策', 'clause_no': '2.1', ...}] | t_b citations=[{'doc_title': '退费政策', 'clause_no': '2.2', ...}]
+```
+唯一一处跟我实现前的推断不一样的地方：'注入尝试'那句话里带"规则"两个字，命中了 mock-llm
+`_match_knowledge` 的问句特征词表（`_QUESTION_FEATURE_ANY` 里有"规则"），所以最终 intent
+是 `knowledge_qa`，不是我一开始以为的 `chitchat`——但要验证的安全属性没变：`query_finance`
+没有被调用（`tool_status=None`），`risk_flags` 正确打上了 `prompt_injection_suspected`，
+没有因为这句话里提到"订单"就真的把订单信息倒出去。**这条按钮没有为了凑效果去改
+mock-llm**，实际命中的意图如实记在这里。8 个新场景全部实测通过，没有"触发不了、需要列出来"
+的情况。
+
+6）前端 JS 语法检查 + HTML 标签配对检查（重写后的整页）：
+```
+$ node --check <extracted from <script> block>
+JS_SYNTAX_OK
+$ python -c "...统计标签开闭是否配平..."
+leftover stack: []
+errors: []
+$ python -m py_compile mocks/mock_im/main.py
+PY_COMPILE_OK
+```
+
+**缺字段清单（问 Jo）**（第一轮遗留，第二轮已收口）：
+- 处理流程视图里"意图识别/安全校验/工具调用/知识检索/输出检查"这 5 个节点的单独耗时——
+  **已由第二轮 `meta.timings` 解决**：Jo 批准了第二处后端改动，worker 直接给每个图节点打点，
+  `reply_end.meta` 现在带 `path`/`timings`/`llm_ms`，流程图上的每个节点都能显示真实耗时，
+  不用再靠客户端计时凑或者留空，详见"步骤 3.8 第二轮"一节。
+- 切回原身份时不重新显示之前的聊天气泡——**Jo 决定不做，记为设计说明，不是待办**：
+  conversation_id 复用之后，服务端上下文（历史消息、历史摘要、不满意计数）都能正常接上，
+  只是页面本身不会把这个会话更早的聊天气泡重新画出来，不影响任何演示效果，也不影响后端
+  行为，所以不用为了这个再加一个"按会话拉历史消息"的接口。
+
+**浏览器验证**：本次改动同样没有浏览器自动化工具可用，验证方式跟步骤 7 一致（后端接口直接
+调用、真实 WebSocket 脚本模拟协议交互、JS/HTML 静态检查），页面在浏览器里实际长什么样、
+处理流程视图/坐席工作台的交互是否顺手，由 Jo 亲手打开页面确认，结果待 Jo 反馈后补记。
+
+**已知问题/设计说明**：无新增（"重复发送上一条"的设计说明已经记在上面步骤 7 那一节，本步骤
+没有改动那部分的行为）。
+
+**人工审查与修复点**：
+无（本步骤是 Jo 主动提出的追加需求，按需求直接实现，不是审查已完成代码后的修复）。
+
+---
+
+## 步骤 3.8 第二轮：处理流程回放改成真实 SVG + worker 打点 path/timings/llm_ms
+
+**(a) 为什么有第二轮**：第一轮的需求描述没有写明要"按真实处理路径播放的动画流程图"，agent
+按字面把"处理流程视图"实现成了 7 张按顺序排列的静态卡片（入站/意图识别/安全校验/工具调用/
+知识检索/输出检查/回复），跟 Jo 期望的样子不符——Jo 真正要的是一张按 `app/worker/graph/graph.py`
+真实节点画出来、带分支、收到 `reply_end` 后能按这条消息实际走过的路径播放动画的流程图，静态
+卡片列表不满足这个预期，因此返工。第二轮指令要求：流程图节点/连线照抄 `graph.py` 的真实图
+结构、收到 `reply_end` 后放一段"小圆点沿实际路径走"的回放动画、点历史消息能重播、图下面依次
+留耗时/trace_id/记忆区块/原始 meta。第二轮指令第 3 点原本要求"路径不够用就先问 Jo，不许猜"，
+Jo 看完这一版之后直接给了补充决定：批准第二处后端改动，第二轮第 3 点因此作废（详见下面 (b)）。
+
+**教训**：给 coding agent 描述界面类需求时，要写清楚三件事——是动态（会动、会播放）还是静态
+（一次性渲染完就不变）、具体长什么样（有哪些视觉元素、交互方式）、数据从哪来（是已有字段还是
+需要新增）。这次第一轮的指令里"处理流程视图"这几个字本身没有指明是不是动画，agent 按最直接
+的字面理解做成了静态卡片，不是揣摩错了 Jo 的意图，是指令本身留了歧义空间。
+
+**改动/新建模块**：
+- `app/worker/graph/state.py`：`GraphState` 新增 `path`/`timings`/`llm_ms` 三个字段。
+- `app/worker/graph/graph.py`：新增 `_timed()` 包装器，`_build_graph()` 里给 15 个节点
+  （`load_context`/`classify`/13 个业务节点）注册时全部套一层，自动打点每个节点的执行顺序和
+  耗时；`respond()`（不是 StateGraph 节点）末尾手工把自己这一段追加进 `path`/`timings`，并且
+  给流式生成那段加了 `llm_ms` 计时；`_build_meta()` 把这三个字段放进 `reply_end.meta`。
+- `app/worker/graph/classify.py`：`_classify_with_llm()` 给真正发起的 `chat_completion` 调用
+  加计时，累计进返回字典的 `llm_ms`（熔断打开时没有真实网络调用，不计入；API 报错是真的发了
+  请求才失败的，计入）。
+- `app/worker/graph/handoff.py`：`_generate_summary()` 加 `timing_holder` 参数（跟 `respond()`
+  的 `usage_holder`一个用法），把生成转人工摘要那次 `chat_completion` 的耗时带出去；`handoff()`
+  节点把这段耗时累加进自己返回的 `llm_ms`。
+- `mocks/mock_im/main.py`：
+  - 新增 `_require_same_tenant()`：只校验 token 有效 + 机构匹配，不限角色，给 `/api/status`、
+    `/api/conversation/context` 用。
+  - `/api/status` 补上 token 校验（阶段三 3.8 补充决定 C）。
+  - `/api/conversation/context` 补上 token 校验 + 会话归属校验（必须是 token 本人在本机构的
+    会话），并且把非法 `conversation_id`（不是合法 UUID）从"直接 500"改成"400 + 明确提示"。
+- `mocks/mock_im/templates/index.html`：右侧"处理流程视图"整段换成 SVG 流程图 + 回放动画 +
+  下方详细数据/trace_id 复制按钮/记忆区块/折叠原始 meta；`/api/status`、
+  `/api/conversation/context` 的调用补上 `token` 参数。
+
+**(b) 第二处后端改动**（Jo 补充决定 A 批准）：**只改 `app/worker/`，不改 gateway/scheduler**。
+在 `reply_end.meta` 里增加三个字段——`path`（这条消息实际经过的图节点名，按执行顺序）、
+`timings`（每个节点自己的耗时，毫秒）、`llm_ms`（这条消息里真正花在等 LLM 网络调用上的
+时间）。全部是**只加计时和记录**：新增的代码只负责"测时间、把结果塞进返回字典里多出来的
+键"，没有改动任何 `if`/`except` 判断条件、没有改任何节点的执行顺序、没有改任何节点原有的
+返回值内容（第 3 点有完整 `git diff` 佐证，逐行看得出来加的都是新键，没有动旧键）。这份数据
+除了这次给演示控制台的流程图回放用，Jo 明确说了阶段四还要用来拆分"mock 耗时"和"系统自己的
+耗时"——`llm_ms` 单独摘出来，就是为了以后能算"一次请求里，等 LLM/mock-llm 的时间占比多少、
+系统自己（DB 查询、Guard 处理、路由判断）的开销占比多少"，不是这一步用完就扔的一次性数据。
+
+**为什么/怎么实现的关键设计点**：
+1. **为什么要新加一处后端改动，不能只在前端里"猜"路径**：第一轮做完之后发现 `reply_end.meta`
+   压根没有任何"这条消息经过了哪些节点、每个节点花了多久"的数据——第二轮指令第 3 点原本是
+   "用 intent 和标记推断路径，推断规则要在汇报里逐条列出"，但推断出来的路径终究是"猜的"，
+   不是真的跑过的记录，而且"每段耗时"完全没法推断（没有任何计时数据）。这正是 Jo 看完第一轮
+   汇报之后决定"直接批准一处真实打点"的原因——上面 (b) 引号内那句就是 Jo 原话的转述："第一轮
+   发现 meta 无分段耗时和路径，回放无法基于真实数据；分段耗时同时用于阶段四拆分 mock 耗时
+   与系统耗时"。第 9 点（worker_id）已经开了一次"只加打点、不改逻辑"的先例，这次是同一个
+   性质的第二处。
+2. **`_timed()` 包装器为什么包在 `_build_graph()` 里，不是改每个节点函数**：15 个节点每个
+   都自己加计时代码，等于要动 `nodes.py`/`knowledge.py`/`finance.py`/`command.py`/
+   `reminder.py`/`handoff.py` 六个文件、十几处地方，出错概率和评审工作量都远大于集中包一层；
+   `_timed()` 本身不读不改传进去的 `state`、不影响节点的业务返回值，只是在外面套一层计时，
+   跟节点本身要不要改代码是两件事，符合"只加计时和记录，不改任何业务逻辑和节点顺序"的要求。
+3. **为什么用"读旧值、拼新值"更新 `path`/`timings`，不直接改 `state`**：LangGraph 的节点只认
+   返回值来更新整体 state，对传进来的 `state` 参数做原地修改不保证会被采纳（这是 LangGraph
+   的既有约束，不是我们代码的选择）；`respond()` 是图跑完之后才执行的普通函数，不再受这条
+   约束，所以那边保留了原有的直接赋值写法（`state["path"] = ...`），两处写法不一样是因为
+   两处所处的执行阶段不一样，不是疏漏。
+4. **`llm_ms` 为什么要分开在 3 个文件里各自打点，不是在一个地方统一记**：一次请求里真正调用
+   LLM 的地方最多可能有两处（`classify` 的意图识别调用 + `handoff`/`respond` 的生成调用），
+   而且不是固定组合——比如"转人工"这个场景，`classify` 命中关键词规则根本没调 LLM
+   （`llm_ms` 贡献是 0），耗时全部来自 `handoff` 生成转接摘要那次调用；反过来"确认执行"场景
+   两处都没调 LLM（`llm_ms=0`）。这三处都用"读 `state.get("llm_ms", 0)` 再加上这次的耗时"
+   的累加写法，不管这次请求实际调用了 0 次、1 次还是 2 次 LLM，最终 `llm_ms` 都是真实总和，
+   不用在一个中心位置去猜"这次请求到底会不会调用 LLM"。
+5. **SVG 流程图节点/边是怎么来的，不是凭印象画的**：直接对着 `app/worker/graph/graph.py` 的
+   `_build_graph()`/`_BUSINESS_NODES`/`_route()` 把 15 个 StateGraph 节点和它们的边抄进前端
+   的 `GRAPH_NODES`/`GRAPH_EDGES` 常量——`load_context -> classify`，`classify` 条件路由到
+   13 个业务节点（`_route()` 对 `high_risk` 意图的两条分支——`sensitive_request` 走
+   `sensitive`、其余走 `request_confirmation`——也照实体现在边里，不是简化成一条），13 个
+   业务节点各自连到 `END`。`respond()` 不在 `_build_graph()` 里、是图跑完之后另外调用的普通
+   函数，所以画成虚线框，用一条虚线边接在 `END` 后面，跟真正的图节点/边用视觉上明显区分开，
+   避免被误当成 StateGraph 的一部分。
+6. **回放动画的"每段移动时间"是怎么从 `timings` 换算出来的，为什么正好卡在 3 秒**：
+   `path` 最后一项固定是 `respond`（`graph.py` 里手工追加的），业务节点是倒数第二项；`END`
+   不是打点节点，没有真实耗时，给它一段固定的 120ms 过渡（这是整个动画里唯一一段不是从真实
+   数据算出来的时长，前端注释和这里都写清楚了）。缩放系数 `scale = (3000 - 120) / 这条消息
+   除 END 外所有节点耗时之和`，每个真实节点的动画时长 = 它自己的真实耗时（毫秒）× scale，
+   数学上保证真实节点时长之和 + 120ms 固定过渡正好等于 3000ms（写了一个 Node 脚本拿 5 类真实
+   消息的 path/timings 验证过，见下面"验证"，总和都精确落在 3000ms，不是大概齐）。缩放只影响
+   动画播放速度，下方"详细数据"面板里显示的耗时数字是 `meta.timings`/`meta.llm_ms` 的原始值，
+   没有被缩放污染。
+7. **降级/熔断/预算/注入嫌疑标在哪个节点上，是读代码确定的，不是随便挑一个显眼的位置**：
+   `prompt_injection_suspected`/`sensitive_request` 这两个风险标记都是 `classify()` 打上去的
+   （`app/worker/graph/classify.py`），所以标在 `classify` 节点；预算超限的检查分散在
+   `classify`/`chitchat`/`knowledge`/`handoff` 四个地方（各自节点内部调
+   `is_budget_exceeded()`），`meta.budget_exceeded=True` 时把这条消息路径里实际出现的那几个
+   节点都标出来，不是固定标一个；熔断标记里 `"llm"` 可能来自 `classify` 的意图识别调用，也
+   可能来自 `respond()` 的生成调用（两处都可能触发熔断，`meta.circuit_breaker` 这个字段本身
+   不区分是哪一处），所以路径里如果两个节点都在就都标；`"finance"` 熔断只可能来自 `finance`
+   节点，只标那一个。
+8. **`/api/status`/`/api/conversation/context` 为什么原来没做 token 校验，这次为什么补上**：
+   第一轮漏了 token 校验和会话归属校验，属于越权（任何人传对 `tenant_id` 就能查到该机构
+   token 用量，传对 `conversation_id` 就能读到别人会话的历史摘要），审查时发现，第二轮补上
+   `_require_same_tenant()`（机构级数据）和"查会话归属"（用户级数据）两层校验，详见下面
+   "人工审查与修复点"第 1 条。
+
+**计划外改动**：`/api/conversation/context` 顺带把"`conversation_id` 不是合法 UUID 时直接
+500"改成了"400 + 明确提示"——这是验证补充决定 C 时自己发现的（用一个空字符串当
+`conversation_id` 测试触发了 500），不是 Jo 要求的，但既然顺手发现了就一起改了，属于同一个
+函数内的健壮性修正，不影响任何业务逻辑，只影响"传错参数时返回什么状态码"。
+
+**验证**：
+
+1）单元测试 + 两个冒烟脚本（worker 加了 `path`/`timings`/`llm_ms` 打点之后重新跑）：
+```
+$ docker compose run --rm tools pytest tests/unit -q
+182 passed, 1 skipped in 6.98s
+$ docker compose run --rm tools python scripts/phase2_smoke.py
+全部 9 个场景 PASS
+$ docker compose run --rm tools python scripts/phase3_smoke.py
+全部 6 个场景 PASS
+```
+
+2）5 类消息的 `path`/`timings`/`llm_ms` 原文（临时脚本，验证完已删除）：
+```
+== 知识问答命中 ==
+path = ['load_context', 'classify', 'knowledge', 'respond']
+timings = {'load_context': 3.7, 'classify': 321.7, 'knowledge': 24.9, 'respond': 4133.2}
+llm_ms = 4423.8   # classify 的意图识别调用 + respond 的流式生成调用，两处都调了 LLM
+
+== 财务查询 ==
+path = ['load_context', 'classify', 'finance', 'respond']
+timings = {'load_context': 3.9, 'classify': 322.7, 'finance': 74.6, 'respond': 1.1}
+llm_ms = 307.4   # 只有 classify 调了 LLM，finance/respond 都是模板回复，没有再调
+
+== 高风险指令-发起（request_confirmation）==
+path = ['load_context', 'classify', 'request_confirmation', 'respond']
+timings = {'load_context': 5.0, 'classify': 324.1, 'request_confirmation': 36.0, 'respond': 1.6}
+llm_ms = 311.2
+
+== 高风险指令-确认（confirm_action）==
+path = ['load_context', 'classify', 'confirm_action', 'respond']
+timings = {'load_context': 2.9, 'classify': 1.6, 'confirm_action': 90.7, 'respond': 1.7}
+llm_ms = 0   # 确认/取消走的是规则短路（_classify_core 第 1 步），根本没调 LLM
+
+== 转人工 ==
+path = ['load_context', 'classify', 'handoff', 'respond']
+timings = {'load_context': 3.1, 'classify': 0.0, 'handoff': 368.9, 'respond': 1.5}
+llm_ms = 305.0   # classify 命中"转人工"关键词规则，没调 LLM（timings.classify≈0）；
+                 # llm_ms 全部来自 handoff 生成转接摘要那次调用——证明累加逻辑真的按"实际
+                 # 调用发生在哪个节点"来记账，不是笼统地都算在 classify 头上
+
+== 预算降级 ==
+path = ['load_context', 'classify', 'fallback', 'respond']
+timings = {'load_context': 4.6, 'classify': 4.0, 'fallback': 0.0, 'respond': 0.5}
+llm_ms = 0   # 预算耗尽，classify 直接降级成关键词规则，没有真的调 LLM
+```
+
+3）动画时长换算数学验证（Node 脚本，用上面 5 条真实 timings 跑一遍 `durationFor()`/`scale`
+同款算法，验证完已删除）：
+```
+知识问答命中：total=3000.0000000000005
+财务查询：total=3000.0000000000005
+高风险确认：total=3000
+转人工：total=2999.9999999999995
+预算降级：total=3000
+```
+5 条真实数据算出来的总时长都精确落在 3000ms（浮点误差在 1e-12 量级），没有用人为下限
+（`Math.max(x, 40)`）去凑——最开始试过加一个 40ms 的最小可见时长，会导致总时长超过 3 秒的
+硬上限（最坏情况到 3084ms），后来去掉了，改成"耗时本来是 0 就播 0ms（瞬间跳过去）"，这样才能
+保证总时长不超过 Jo 定的 3 秒上限。
+
+4）补充决定 C：4 个新接口的鉴权方式说明和实测。
+
+- **`/api/conversation/context`**：校验 token 有效 + `token.tenant_id == 请求的 tenant_id`
+  + 用 `conversation_id` 查 `conversations` 表、要求 `tenant_id`/`user_id` 都跟 token 对得上，
+  三条有一条不满足就 403；不满足"合法 UUID"格式返回 400（计划外顺手修的健壮性问题，见上）。
+  实测：先用 `u_a_1004` 的身份真发一条消息，制造一个只属于 `u_a_1004` 的真实会话（conversation_id
+  `0319635f-1239-4894-bde7-335bfed6f57a`），再用 `u_a_1001` 的真实 token 去读，完整命令和完整
+  返回（含状态码）：
+  ```
+  $ curl -s -w "\nHTTP_STATUS:%{http_code}\n" "http://localhost:8080/api/conversation/context?tenant_id=t_a&conversation_id=0319635f-1239-4894-bde7-335bfed6f57a&token=<u_a_1001的token>"
+  {"detail":"只能查看自己的会话"}
+  HTTP_STATUS:403
+  ```
+  换成 `u_a_1004` 自己的 token 读自己的会话，正常返回：
+  ```
+  $ curl -s -w "\nHTTP_STATUS:%{http_code}\n" "http://localhost:8080/api/conversation/context?tenant_id=t_a&conversation_id=0319635f-1239-4894-bde7-335bfed6f57a&token=<u_a_1004自己的token>"
+  {"summary":null,"covered_until":null}
+  HTTP_STATUS:200
+  ```
+  （`summary` 是 null 因为这个会话只发了 1 条消息，还没到生成摘要的阈值，不是权限问题）
+
+- **`/api/status`**：校验 token 有效 + `token.tenant_id == 请求的 tenant_id`，不分角色（学生
+  也能查自己机构的用量）。实测：
+  ```
+  $ curl -s -w "\nHTTP_STATUS:%{http_code}\n" ".../api/status?tenant_id=t_a"
+  {"detail":"缺少 token"}
+  HTTP_STATUS:403
+  $ curl -s -w "\nHTTP_STATUS:%{http_code}\n" ".../api/status?tenant_id=t_a&token=<t_b坐席的token>"
+  {"detail":"token 所属机构和请求的机构不一致"}
+  HTTP_STATUS:403
+  $ curl -s -w "\nHTTP_STATUS:%{http_code}\n" ".../api/status?tenant_id=t_a&token=<u_a_1001的token>"
+  {"gateway":"ok","budget":{"used":516818,"limit":null}}
+  HTTP_STATUS:200
+  ```
+  `limit:null` 是"t_a 没配置每日预算上限"，不是查询出错：预算上限的取值顺序是先看
+  `tenants.daily_token_budget` 这一列，这个机构没单独设置（是 `NULL`）就落回
+  `DEFAULT_DAILY_TOKEN_BUDGET` 这个环境变量，当前 `.env` 里这一项也是空——查了一下现在跑着的
+  容器，`t_a`/`t_b` 两个机构的 `daily_token_budget` 都是 `NULL`，`DEFAULT_DAILY_TOKEN_BUDGET`
+  也是 `None`，所以两个机构现在都是"不限额"，`used` 只是累计用量，不代表快超限了。每个机构的
+  预算配置在 `tenants` 表的 `daily_token_budget` 列（按机构单独设置，留空就用
+  `.env` 里的 `DEFAULT_DAILY_TOKEN_BUDGET` 兜底），不是通过接口改的。上面"验证"第 1 条里
+  "预算降级"那条场景用的是 `t_b`（`scripts/phase3_smoke.py` 的 `scenario_budget_degrade`），
+  不是 `t_a`：脚本直接对数据库执行
+  `UPDATE tenants SET daily_token_budget=0 WHERE id='t_b'`，把 `t_b` 临时改成"预算=0"（必定
+  超限，不用管当天实际用了多少），发一条消息验证确实降级、拿到"预算耗尽"专用话术，验证完立刻
+  把这一列改回 `NULL`，再发一条消息确认已经恢复——不是通过任何 HTTP 接口触发的，是脚本直接
+  改数据库这一列，跟"演示控制台顶部状态条查询"是两回事。
+
+- **`/api/handoff_tickets`**（沿用第一轮的 `_require_agent()`，本轮未改）：
+  ```
+  $ curl -s ".../api/handoff_tickets?tenant_id=t_a&token=<u_a_1003坐席的token>"
+  {"tickets":[{"id":"c789f72f-...","user_id":"u_a_1001","trigger":"keyword","intent":"finance_query", ...,"status":"queued","created_at":"2026-09-25T12:31:29.747954+00:00"}, ...]}
+  ```
+
+- **`/api/audit_logs`**（同样沿用 `_require_agent()`）：
+  ```
+  $ curl -s ".../api/audit_logs?tenant_id=t_a&token=<u_a_1003坐席的token>"
+  {"logs":[{"id":"76aadb8d-...","actor_user_id":"u_a_1001","actor_role":"student","action":"query_finance","target_user_id":"u_a_1001","resource":"finance:invoices","result":"upstream_error","result_label":"失败","detail":"{'kind': 'invoices', 'period': 'last_month', 'target_user_id': 'u_a_1001'}"}, ...]}
+  ```
+
+5）`.env.example` 本次新增的配置项，原样贴出（确认不含真实密钥）：
+```diff
++# mock-im 后端查 gateway /health 用（阶段三 3.8 第 7 点顶部状态条），走 docker 网络内部地址，
++# 跟上面浏览器用的 GATEWAY_HOST_PORT 是两回事；不设也有默认值，跟 mocks/mock_im/main.py 里
++# 其它内部服务地址一样，这个变量只有 mock-im 自己用，没有放进 app/common/config.py 的 Settings
++GATEWAY_INTERNAL_URL=http://gateway:8000
+```
+只有一项，是容器内部服务发现用的主机名+端口（`http://gateway:8000`，docker compose 网络里
+`gateway` 这个 service name 自动可解析），不是密钥。
+
+6）前端 JS 语法检查 + HTML/SVG 标签配对检查：
+```
+$ node --check <extracted from <script> block>
+JS_SYNTAX_OK
+$ python -c "...统计标签开闭是否配平（含 svg/g/rect/circle/line/text）..."
+leftover stack: []
+errors: []
+```
+
+**浏览器验证**：本次同样没有浏览器自动化工具，验证方式跟前面几轮一致（真实 WebSocket 脚本
++ 直接调接口 + JS/HTML 静态检查 + 纯计算逻辑的 Node 脚本复算），这部分只能确认"数据和协议是
+对的"，SVG 图在浏览器里画出来是否清楚、圆点动画播放起来顺不顺滑，需要 Jo 亲手打开页面确认。
+这部分由 Jo 亲手在浏览器里逐项确认，结果如下：
+1. 发送知识问答，SVG 流程图播放回放动画，小圆点沿实际路径进入 `knowledge` 分支，未经过的
+   分支保持灰色，标题显示"回放"，均正常。
+2. 点击历史回复可以重新播放，正常。
+3. trace_id 复制功能正常，粘贴内容完整。
+4. 越权查询被拒绝后，切换到坐席 `u_a_1003`，审计日志中出现对应的拒绝记录，正常。
+5. 顶部状态条显示 `gateway: ok` 和本机构 token 用量；`t_a`、`t_b` 当前未配置预算，上限为空，
+   符合预期（跟上面"验证"第 4 条查到的 `daily_token_budget` 都是 `NULL` 一致）。
+6. 原有功能正常：10 个 E2E 场景按钮、重发显示 `duplicate`、按句流式回复、提醒推送。
+
+**已知问题/设计说明**：
+- 动画路径里插进 `END` 这一步用的是固定 120ms 过渡，不是真实打点——`END` 本来就不是一个
+  会执行代码的节点，没有耗时这个概念，写死一个小过渡是为了动画视觉上有个"经过"的停顿，不是
+  编造业务数据；已经在代码注释和上面"关键设计点"第 6 条里写清楚了。
+- 熔断标记标在"哪个节点"上时，`llm` 熔断如果 `classify`/`respond` 都在路径里会两个都标——
+  `meta.circuit_breaker` 这个字段本身只记了"llm 熔断过"，不记具体是哪次调用触发的，这是现有
+  字段的精度上限，不是这次引入的新问题。
+
+**人工审查与修复点**：
+
+1. 【人工审查发现】第一轮新增的 `/api/status`、`/api/conversation/context` 这两个接口没有
+   校验 token：任何人只要传对 `tenant_id` 就能查到该机构今日的 token 用量，传对
+   `conversation_id` 就能读到别人会话的历史摘要，属于越权——摘要内容虽然入库前已经
+   `mask_text()` 脱敏，但仍然是别人的对话内容，不该谁都能读。审查时发现，本轮（第二轮）
+   已经补上：`/api/status` 用新加的 `_require_same_tenant()` 校验 token 有效 +
+   `token.tenant_id == 请求的 tenant_id`；`/api/conversation/context` 除了同一条机构校验，
+   还另外校验会话归属——查 `conversations` 表确认 `tenant_id`/`user_id` 都跟 token 对得上，
+   不满足任何一条都是 403。验证输出（token 用占位符）：
+   ```
+   $ curl -s -w "\nHTTP_STATUS:%{http_code}\n" "http://localhost:8080/api/status?tenant_id=t_a"
+   {"detail":"缺少 token"}
+   HTTP_STATUS:403
+   $ curl -s -w "\nHTTP_STATUS:%{http_code}\n" "http://localhost:8080/api/status?tenant_id=t_a&token=<t_b坐席的token>"
+   {"detail":"token 所属机构和请求的机构不一致"}
+   HTTP_STATUS:403
+   $ curl -s -w "\nHTTP_STATUS:%{http_code}\n" "http://localhost:8080/api/conversation/context?tenant_id=t_a&conversation_id=0319635f-1239-4894-bde7-335bfed6f57a&token=<u_a_1001的token>"
+   {"detail":"只能查看自己的会话"}
+   HTTP_STATUS:403
+   ```
+2. 【人工审查发现】上一轮汇报贴的验证记录里，`/api/handoff_tickets`/`/api/conversation/context`
+   的 curl 命令直接贴了完整的真实 JWT（`eyJ` 开头）。token 不能进仓库、也不能进日志——AGENT_LOG
+   会被提交进 git，跟"日志脱敏"是同一条硬性规则的道理。审查时发现，已经用
+   `git grep -n "eyJ"` 搜过整个仓库（含 docs、scripts、tests），命中的 3 处全部在
+   AGENT_LOG.md 里，已经全部替换成 `<u_a_1001的token>` 这种占位写法，替换后重新搜索确认为空
+   （`git grep -n "eyJ"` 无输出）。以后贴 curl 验证记录时，token 一律用占位符，不贴真实值——
+   哪怕是开发环境的测试 token，也不留在会被提交的文件里。
 
 ---

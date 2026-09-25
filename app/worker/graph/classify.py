@@ -12,6 +12,7 @@ LLM 调用失败或超时时，降级为 worker 自己的关键词规则（route
 关键词也判断不出来，就打上 fallback_reason=llm_unavailable，回复"LLM 不可用"固定话术。
 """
 import re
+import time
 import uuid
 
 from openai import APIConnectionError, APIError, APITimeoutError
@@ -191,6 +192,10 @@ async def _classify_with_llm(state: GraphState, session: AsyncSession) -> dict:
         + list(state.get("history", []))
         + [{"role": "user", "content": user_content}]
     )
+    # llm_ms 只在真的发起了网络调用时才累加（阶段三 3.8 第二轮）：熔断打开是在发请求之前就
+    # 拦下的，没有真实的网络耗时，不计入；API 调用失败那条分支是真的发了请求（可能还带了内部
+    # 重试）才失败的，等待时间是真实花掉的，要算
+    llm_call_start = time.monotonic()
     try:
         response = await chat_completion(messages=messages, tools=to_openai_tools(), tool_choice="auto")
     except CircuitBreakerOpenError:
@@ -200,7 +205,10 @@ async def _classify_with_llm(state: GraphState, session: AsyncSession) -> dict:
         return result
     except (APIError, APITimeoutError, APIConnectionError) as exc:
         logger.warning("LLM 分类调用失败，降级为关键词规则", error=str(exc))
-        return _keyword_fallback_classify(state["content"])
+        result = _keyword_fallback_classify(state["content"])
+        result["llm_ms"] = state.get("llm_ms", 0) + (time.monotonic() - llm_call_start) * 1000
+        return result
+    llm_ms = state.get("llm_ms", 0) + (time.monotonic() - llm_call_start) * 1000
 
     usage = extract_usage_from_response(response)
     estimated = usage is None
@@ -222,7 +230,7 @@ async def _classify_with_llm(state: GraphState, session: AsyncSession) -> dict:
     message = response.choices[0].message
     tool_calls = message.tool_calls or []
     if not tool_calls:
-        return {"intent": "chitchat", "route_source": "llm"}
+        return {"intent": "chitchat", "route_source": "llm", "llm_ms": llm_ms}
 
     call = tool_calls[0]
     parsed = parse_tool_call(call.function.name, call.function.arguments or "{}")
@@ -237,6 +245,7 @@ async def _classify_with_llm(state: GraphState, session: AsyncSession) -> dict:
             "route_source": "llm",
             "fallback_reason": "invalid_output",
             "tools_meta": tools_meta,
+            "llm_ms": llm_ms,
         }
 
     intent = _TOOL_NAME_TO_INTENT.get(parsed.name, "fallback")
@@ -245,6 +254,7 @@ async def _classify_with_llm(state: GraphState, session: AsyncSession) -> dict:
         "route_source": "llm",
         "tool_call": {"name": parsed.name, "args": parsed.args.model_dump(mode="json")},
         "tools_meta": tools_meta,
+        "llm_ms": llm_ms,
     }
     if parsed.is_high_risk:
         update_fields["intent"] = "high_risk"

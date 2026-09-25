@@ -58,6 +58,18 @@ class GraphState(TypedDict, total=False):
     # 给 reply_end 的 meta 用，跟 circuit_breaker 是并列但不同原因的两种"没真的调 LLM"
     budget_exceeded: bool
 
+    # ---------- 阶段三 3.8 第二轮：演示控制台流程图回放用的真实打点 ----------
+    # 只加计时和记录，不参与任何业务判断——这三个字段是"Jo 批准的第二处后端改动"（AGENT_LOG
+    # 3.8 一节有原因和范围说明）。path 是这条消息实际经过的图节点名，按执行顺序追加（由
+    # graph.py 的 _timed() 包装器统一打点，不需要每个节点自己维护）；timings 是每个节点自己的
+    # 耗时（毫秒）；llm_ms 是这条消息里真正花在等 LLM（mock-llm/DeepSeek）网络调用上的时间，
+    # 跟 timings 里某个节点的总耗时是两回事——一个节点里除了等 LLM，还有数据库查询、Guard
+    # 处理这些非 LLM 的开销，llm_ms 单独摘出来才能在阶段四拆分"系统自己的耗时"和"mock/真实
+    # LLM 的耗时"。
+    path: List[str]
+    timings: dict  # {node_name: 毫秒}
+    llm_ms: float
+
 
 @dataclass
 class GraphContext:
