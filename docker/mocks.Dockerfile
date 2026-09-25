@@ -12,6 +12,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY mocks/ ./mocks/
 COPY tests/ ./tests/
+# mock-im（阶段三第 7 步的演示控制台）要按开发用签发方式生成 token（app.common.auth）、
+# 按 tenant_id+user_id 查真实角色（app.common.db/models），所以这个共用镜像也要带上 app/；
+# 其余 4 个 mock 服务不引用这些模块，多带这些文件对它们没有影响
+COPY app/ ./app/
 
 # 各 mock 服务共用本镜像，实际启动哪个模块由 docker-compose 的 command 决定
 CMD ["python", "-m", "mocks.mock_llm.main"]

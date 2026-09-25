@@ -8,6 +8,12 @@
 阶段二（业务能力）已完成：在阶段一的骨架上用 LangGraph 编排出意图识别 + 七类业务节点（知识问答、
 财务查询、平台指令二次确认、转人工等），细节见下面"意图路由"一节和 `docs/PHASE2.md`。
 
+阶段三（提醒、上下文、保护、成本、演示）已完成：独立的 `scheduler` 服务扫描到期提醒并推送；
+超过最近 N 条的历史对话压成摘要；gateway 加了限流和 Redis 故障降级，worker 加了熔断、有上限的
+重试和死信队列；每次 LLM 调用记 token 用量、机构按天限额、Prometheus 暴露成本和运行指标；
+`mock-im` 从简单聊天页面升级成带身份切换、10 个 E2E 场景快捷键和 `reply_end.meta` 透视面板的
+演示控制台。细节见 `docs/PHASE3.md` 和下面各节。
+
 ## 架构图
 
 ```mermaid
@@ -31,8 +37,15 @@ gateway 和 worker 之间没有直接调用关系，完全靠 RabbitMQ（上行�
 
 ## 设计假设
 
-gateway 直接作为 IM 长连接入口；mock-im 扮演 IM 客户端（一个简单网页聊天界面），用于演示和手工测试。
-现实场景里 gateway 前面通常还有一层真实的 IM/网关接入层，这里为了在阶段一跑通完整链路先简化掉。
+gateway 直接作为 IM 长连接入口；mock-im 扮演 IM 客户端（阶段三升级成演示控制台，见下面
+`http://localhost:8080` 相关说明），用于演示和手工测试。现实场景里 gateway 前面通常还有一层
+真实的 IM/网关接入层，这里为了在阶段一跑通完整链路先简化掉。
+
+演示控制台的 `GET /api/token` 是演示专用接口，模拟"平台登录系统签发 token"这件事——真实环境里
+token 应该由平台自己的登录系统签发，gateway 只负责验签（`app.common.auth.decode_access_token`），
+不负责签发，签发和验证是两个独立的职责，不应该耦合在同一个服务里。mock-im 之所以要读 JWT 签名
+密钥、连数据库查用户角色，是因为它在演示环境里临时扮演的是"签发方"这个角色，仅限这一个用途；
+接真实平台之后，`/api/token` 这个接口和 mock-im 这一层都可以整个去掉，gateway 的验签逻辑不用动。
 
 ## 意图路由（阶段二）
 
@@ -73,7 +86,7 @@ worker 收到一条消息后，先过 `app/worker/graph/classify.py` 判出意�
 | gateway | 8000 | `GATEWAY_HOST_PORT` | `/health` `/ready` `/metrics` `/ws` |
 | worker 健康检查 | 8011（可扩到 8011-8019） | `WORKER_HEALTH_HOST_PORT` | `/health` `/metrics`；业务逻辑跑在同一进程里，这个端口只做探活；写成范围是为了 `docker compose up -d --scale worker=N` 时每个副本都能各自映射到宿主机，不会因为抢同一个端口启动失败（容器内部固定还是 8001） |
 | scheduler 健康检查 | 8002（可扩到 8002-8009） | `SCHEDULER_HEALTH_HOST_PORT` | `/health` `/metrics`；同样是范围端口，理由跟 worker 一致（容器内部固定是 8002） |
-| mock-im | 8080 | `MOCK_IM_HOST_PORT` | 浏览器打开 `http://localhost:8080` 手工聊天 |
+| mock-im | 8080 | `MOCK_IM_HOST_PORT` | 演示控制台，浏览器打开 `http://localhost:8080`：顶部切身份（自动签发 token，不用再手工粘贴），左边聊天窗口 + 10 个 E2E 场景快捷键，右边 `reply_end.meta` 透视面板 |
 | mock-llm | 8100 | `MOCK_LLM_HOST_PORT` | OpenAI 兼容接口 + `/admin/config`；工具调用走确定性规则（`mocks/mock_llm/rules.py`） |
 | mock-knowledge | 8101 | `MOCK_KNOWLEDGE_HOST_PORT` | `/search`（可选检索后端，见下）+ `/admin/config` |
 | mock-platform | 8102 | `MOCK_PLATFORM_HOST_PORT` | `/commands`（幂等）、`/users/{id}/subscriptions`、`/admin/commands`、`/agents/status` + `/admin/config` |
@@ -83,7 +96,7 @@ worker 收到一条消息后，先过 `app/worker/graph/classify.py` 判出意�
 
 ```bash
 cp .env.example .env    # 按需修改，尤其是密码类变量
-make up                 # 起基础设施 + gateway/worker + 5 个 mock 服务
+make up                 # 起基础设施 + gateway/worker/scheduler + 5 个 mock 服务
 make migrate             # 建表
 make seed                # 种两个租户、七个用户 + 建知识库索引（等价于 seed.py + reindex.py）
 make demo                # 生成 token -> 发消息看三个耗时 -> 同 message_id 重发看 duplicate
@@ -96,11 +109,13 @@ make reindex             # 等价于 docker compose run --rm tools python script
 ```
 
 跑起来之后可以：
-- 浏览器打开 `http://localhost:8080`（mock-im），粘贴 `docker compose run --rm tools python scripts/gen_token.py --tenant t_a --user u_a_1001` 生成的 token，手工聊天
+- 浏览器打开 `http://localhost:8080`（演示控制台），顶部下拉框选一个身份直接连（token 由控制台后端现场签发，不用再手工跑 `gen_token.py` 粘贴），左下角点 10 个 E2E 场景按钮快捷发送，右边看每次回复的透视面板
 - 浏览器打开 `http://localhost:15672`（RabbitMQ 管理界面），看 `inbound.messages`/`inbound.dead` 两个队列
 - `make logs` 看所有服务的结构化 JSON 日志
 - `docker compose stop mock-llm` 之后再发消息，验证 worker 会推送降级回复且不崩
 - `docker compose run --rm tools python scripts/phase2_smoke.py` 把阶段二的 9 个 E2E 场景串起来跑一遍，打印 PASS/FAIL
+- `docker compose run --rm tools python scripts/phase3_smoke.py` 把阶段三的场景（提醒推送/修改/取消、上下文摘要、限流、熔断、预算降级）串起来跑一遍
+- 浏览器打开 `http://localhost:8011/metrics`（端口以 `docker compose port worker 8001` 实际输出为准）看 worker 的 Prometheus 指标
 
 ## 命令行工具（`scripts/`）
 
@@ -118,8 +133,11 @@ make reindex             # 等价于 docker compose run --rm tools python script
 | `finance_probe.py --tenant t_a --acting u_a_1001 --target u_a_1004 --kind invoices` | 绕过 worker，直接以某人身份请求 mock-finance，证明 mock-finance 自己也会独立拒绝越权 |
 | `reindex.py` | 增量重建知识库索引（按文件内容哈希判断要不要重算），`--force` 全量重建 |
 | `phase2_smoke.py` | 阶段二收尾冒烟测试，串起 9 个 E2E 场景 |
+| `phase3_smoke.py` | 阶段三冒烟测试：提醒推送/修改/取消、上下文摘要、限流、熔断降级、预算降级 |
+| `rate_limit_burst.py --tenant t_a --user u_a_1001` | 10 秒内连发 N 条消息，打印每条 ack 状态，验证限流阈值 |
+| `dlq_replay.py` | 把 `inbound.dead` 里的消息逐条取出、`x-retry-count` 清零后重新投回 `inbound.messages`（根因修好之后找回死信） |
 | `seed.py` | 种子数据（可重复跑） |
-| `gen_token.py --tenant t_a --user u_a_1001` | 生成一个可以在 mock-im 里手工登录用的 JWT |
+| `gen_token.py --tenant t_a --user u_a_1001` | 生成一个 JWT；演示控制台自己会现场签发 token，这个脚本主要给 `chat.py`/`sql.py` 之外的手工排查用 |
 
 ## 知识库文件格式（`data/knowledge/{tenant_id}/*.md`）
 
@@ -166,6 +184,9 @@ worker 处理完一条消息，最后一帧 `reply_end` 会带一个 `meta` 对�
 | `guard.dropped_sentences` | OutputGuard 因为出处核对不通过而整句丢弃的句子数（只有知识问答场景会 >0） |
 | `guard.banned_phrases_removed` | OutputGuard 删掉的禁用套话（"作为AI"之类）出现次数 |
 | `risk_flags` | 这轮命中的风险标记，如 `sensitive_request`、`prompt_injection_suspected`；转人工记录里还会额外汇总 `finance_forbidden_attempt`、`repeated_dissatisfaction`、`high_risk_pending`（见 `app/worker/graph/handoff.py`） |
+| `context.history_messages` / `context.has_summary` | 阶段三第 3 步：这轮 LLM 请求带了几条原文历史、有没有附带历史摘要 |
+| `circuit_breaker` | 阶段三第 5 步：这轮因为熔断打开被跳过、没真的发请求的服务名，如 `["llm"]`、`["finance"]`，没有就是空数组 |
+| `budget_exceeded` | 阶段三第 6 步：机构今日 token 预算是否已经用完导致这轮跳过了 LLM 调用 |
 
 ## 目录说明
 
@@ -176,16 +197,18 @@ app/
   gateway/     # WebSocket 接入层：鉴权、去重、投递 MQ、ACK、Redis 推送转发（不调用 LLM）
   worker/      # 消费队列：LangGraph 编排（意图路由 + 业务节点）、调 LLM、写回复、推流式分片
     graph/     # classify/knowledge/finance/command/handoff/guard/style 等节点实现
-  scheduler/   # 占位，阶段三的提醒调度
+  scheduler/   # 独立服务：每秒扫一次到期提醒，FOR UPDATE SKIP LOCKED 取批、先推送再提交
 mocks/
-  mock_im/         # 网页聊天客户端，演示和手工测试用
+  mock_im/         # 演示控制台：身份切换（现场签发 token）、聊天窗口、场景快捷键、meta 透视面板
   mock_llm/        # OpenAI 兼容的假 LLM，工具调用走确定性规则（rules.py），行为可通过 /admin/config 调整
   mock_knowledge/  # 假检索后端（可选，RETRIEVER=mock_knowledge 时启用）
   mock_platform/   # 假平台指令系统：低风险/高风险指令、幂等键、故障模式
   mock_finance/    # 假财务系统：订单/账单/发票/退费/余额，自己也做一层越权校验
 docker/
   app.Dockerfile   # gateway / worker / scheduler / tools 共用
-  mocks.Dockerfile # 5 个 mock 服务共用
+  mocks.Dockerfile # 5 个 mock 服务共用；镜像里也拷贝了 app/（阶段三第 7 步加的），
+                   # 但只有 mock-im 用得到（现场签发 token 要用 app.common.auth/db），
+                   # 其余 4 个 mock 服务不引用这些模块
 migrations/    # Alembic 迁移
 scripts/       # 命令行工具，见上面"命令行工具"一节
 tests/unit/    # 纯函数和轻量假对象单测（pytest + pytest-asyncio），不连真实数据库；
@@ -197,7 +220,7 @@ docs/          # REQUIREMENTS.md（需求原文）、PHASE*.md（各阶段任务
 
 | 目标 | 作用 |
 |---|---|
-| `make up` | 启动基础设施 + gateway/worker + 5 个 mock 服务（不含 `tools`，见下） |
+| `make up` | 启动基础设施 + gateway/worker/scheduler + 5 个 mock 服务（不含 `tools`，见下） |
 | `make down` | 停止所有服务 |
 | `make logs` | 跟着看所有服务日志 |
 | `make ps` | 看各服务状态 |
@@ -228,3 +251,20 @@ docs/          # REQUIREMENTS.md（需求原文）、PHASE*.md（各阶段任务
 | `PLATFORM_TIMEOUT_SECONDS` | `3` | worker 调 mock-platform 的超时；只对超时/5xx/连接错误重试，最多 2 次，间隔 0.5s/1s |
 | `MOCK_PLATFORM_MODE` | `normal` | mock-platform 故障模式：`normal`/`timeout`（永久挂起，验证重试耗尽）/`slow_commit`（延迟后成功，验证幂等键找回结果）/`error500` |
 | `PENDING_ACTION_TTL_SECONDS` | `300` | 高风险指令待确认操作的有效期，超过还没确认就按超时处理 |
+
+## 新增的环境变量（阶段三）
+
+同样只列关键项、不是"密码/密钥"类的，完整列表见 `.env.example`：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `CONVERSATION_HISTORY_LIMIT` | `10` | 最近几条消息原样保留，更早的压成摘要；摘要超过这个阈值的未覆盖消息数才重新生成 |
+| `SCHEDULER_INTERVAL_SECONDS` | `1` | scheduler 扫描到期提醒的间隔 |
+| `SCHEDULER_BATCH_SIZE` | `100` | scheduler 每轮 `FOR UPDATE SKIP LOCKED` 最多取几条 |
+| `RATE_LIMIT_USER_PER_10S` | `20` | 单用户 10 秒内最多几条消息，超了 ack 返回 `rate_limited` |
+| `RATE_LIMIT_TENANT_PER_SEC` | `2000` | 单机构每秒最多几条消息 |
+| `REDIS_RECONNECT_MIN_SECONDS` / `REDIS_RECONNECT_MAX_SECONDS` | `0.5` / `30` | gateway 订阅 Redis 频道断线重连的退避区间（翻倍增长，封顶后面这个值） |
+| `CB_FAILURE_THRESHOLD` / `CB_OPEN_SECONDS` | `5` / `30` | LLM、mock-finance 各自的熔断器：连续失败几次打开、打开多久后进入半开试探 |
+| `LLM_MAX_RETRIES` / `FINANCE_MAX_RETRIES` / `PLATFORM_MAX_RETRIES` | `1` / `1` / `2` | 各自的重试次数上限（重试之间的退避间隔另有单独的配置项，见 `.env.example`） |
+| `DLQ_MAX_RETRIES` | `3` | 消息处理时出现意外异常，重新入队几次还失败就进 `inbound.dead` |
+| `DEFAULT_DAILY_TOKEN_BUDGET` | 空（不限额） | 机构没在 `tenants.daily_token_budget` 单独设置时用这个值 |

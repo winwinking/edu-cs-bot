@@ -2,69 +2,145 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8" />
-<title>mock-im</title>
+<title>演示控制台</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 20px auto; padding: 0 16px; }
-  h1 { font-size: 18px; }
-  #conn-row { display: flex; gap: 8px; margin-bottom: 8px; }
-  #conn-row input { flex: 1; padding: 6px; }
-  #status { font-size: 13px; color: #888; margin-bottom: 12px; }
-  #status.connected { color: #2a7; }
-  #status.error { color: #c33; }
-  #log { border: 1px solid #ddd; border-radius: 6px; height: 420px; overflow-y: auto; padding: 10px; margin-bottom: 8px; }
-  .bubble { max-width: 80%; padding: 8px 12px; border-radius: 10px; margin: 6px 0; white-space: pre-wrap; word-break: break-word; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; background: #f5f6f8; color: #222; }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  h3 { font-size: 14px; margin: 0 0 8px; color: #555; }
+
+  #topbar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+  #topbar select { padding: 6px; }
+  #status { font-size: 13px; color: #888; padding: 4px 10px; border-radius: 12px; background: #eee; }
+  #status.connected { color: #fff; background: #2a7; }
+  #status.connecting { color: #fff; background: #e8a33d; }
+  #status.error { color: #fff; background: #c33; }
+
+  #main { display: flex; gap: 16px; align-items: flex-start; }
+  #left { flex: 3; min-width: 0; }
+  #right { flex: 2; min-width: 280px; }
+
+  .card { background: #fff; border: 1px solid #e2e2e2; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+
+  #log { height: 420px; overflow-y: auto; }
+  .bubble { max-width: 85%; padding: 8px 12px; border-radius: 10px; margin: 6px 0; white-space: pre-wrap; word-break: break-word; }
   .user { background: #daf0ff; margin-left: auto; text-align: right; }
   .assistant { background: #f0f0f0; }
-  .meta { font-size: 12px; color: #999; margin: 4px 0; text-align: center; }
-  .meta.error-meta { color: #c33; }
-  #input-row { display: flex; gap: 8px; }
+  .reminder { background: #fff3cd; border: 1px solid #ffe69c; }
+  .meta-line { font-size: 12px; color: #999; margin: 4px 0; text-align: center; }
+  .meta-line.error-meta { color: #c33; }
+
+  #input-row { display: flex; gap: 8px; margin-top: 8px; }
   #input-row input { flex: 1; padding: 8px; }
-  button { padding: 8px 14px; cursor: pointer; }
+  button { padding: 7px 12px; cursor: pointer; border: 1px solid #ccc; border-radius: 4px; background: #fff; }
+  button:hover:not(:disabled) { background: #f0f0f0; }
   button:disabled { cursor: not-allowed; opacity: 0.5; }
+  button.primary { background: #2a7; color: #fff; border-color: #2a7; }
+
+  #scenario-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+  #scenario-buttons button { font-size: 12px; padding: 6px 8px; }
+  .hint { font-size: 12px; color: #999; margin-top: 6px; }
+
+  .panel-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px dashed #eee; font-size: 13px; }
+  .panel-row:last-child { border-bottom: none; }
+  .panel-key { color: #888; }
+  .panel-val { text-align: right; max-width: 65%; word-break: break-word; }
+  .flag-on { color: #c33; font-weight: bold; }
+  .flag-off { color: #999; }
+  #panel-empty { color: #999; font-size: 13px; }
 </style>
 </head>
 <body>
-  <h1>mock-im（演示用网页聊天客户端）</h1>
+  <h1>演示控制台（mock-im）</h1>
 
-  <div id="conn-row">
-    <input id="token" placeholder="粘贴 JWT token（scripts/gen_token.py 生成）" />
-    <button id="connect-btn">连接</button>
+  <div id="topbar">
+    <label>身份：</label>
+    <select id="identity">
+      <option value="">-- 选择身份 --</option>
+    </select>
+    <div id="status">未连接</div>
   </div>
-  <div id="status">未连接</div>
 
-  <div id="log"></div>
+  <div id="main">
+    <div id="left">
+      <div class="card">
+        <div id="log"></div>
+        <div id="input-row">
+          <input id="content" placeholder="输入消息内容，先选身份再发" disabled />
+          <button id="send-btn" disabled>发送</button>
+          <button id="resend-btn" disabled>重复发送上一条</button>
+        </div>
+      </div>
 
-  <div id="input-row">
-    <input id="content" placeholder="输入消息内容" disabled />
-    <button id="send-btn" disabled>发送</button>
-    <button id="resend-btn" disabled>重发上一条</button>
+      <div class="card">
+        <h3>10 个 E2E 场景快捷发送</h3>
+        <div id="scenario-buttons"></div>
+        <div class="hint">带 * 的场景（7、8）要先用 scripts/mockctl.py 把 mock-finance/mock-llm
+          切到 timeout/invalid_json 模式才能看到对应的降级效果，这里点击只发原句。</div>
+      </div>
+    </div>
+
+    <div id="right">
+      <div class="card">
+        <h3>透视面板（最近一次回复的 reply_end meta）</h3>
+        <div id="panel"><div id="panel-empty">还没有回复</div></div>
+      </div>
+    </div>
   </div>
 
   <script>
     const GATEWAY_HOST_PORT = "__GATEWAY_HOST_PORT__";
-    const conversationId = crypto.randomUUID();
+
+    // 顶部身份切换的 5 个预置身份（PHASE3.md 第 7 步指定的这几个）：role 不在这里写死，
+    // 由 mock-im 后端 /api/token 查真实数据库返回，这里只是给下拉框一个好认的标签
+    const IDENTITIES = [
+      { tenantId: "t_a", userId: "u_a_1001", label: "t_a / 张小明（学生）" },
+      { tenantId: "t_a", userId: "u_a_1002", label: "t_a / 张爸爸（家长）" },
+      { tenantId: "t_a", userId: "u_a_1003", label: "t_a / 客服小李（坐席）" },
+      { tenantId: "t_a", userId: "u_a_1004", label: "t_a / 王小华（学生，跟张小明无关联）" },
+      { tenantId: "t_b", userId: "u_b_1001", label: "t_b / 李小红（学生）" },
+    ];
+
+    // 10 个 E2E 场景的原句（跟 scripts/phase2_smoke.py + scripts/phase3_smoke.py 里的场景 1~10 一致）
+    const SCENARIOS = [
+      { label: "场景1 知识问答", text: "寒假班请假会退课时费吗？" },
+      { label: "场景2 发票查询", text: "我上个月的发票开了吗？" },
+      { label: "场景3 越权查询", text: "帮我查一下 u_a_1004 的发票" },
+      { label: "场景4 关闭续费", text: "帮我把自动续费关了" },
+      { label: "场景4 确认", text: "确认关闭" },
+      { label: "场景5 创建提醒", text: "明天早上 9 点提醒我交作业" },
+      { label: "场景6 转人工", text: "转人工" },
+      { label: "场景7 财务超时*", text: "我上个月的发票开了吗？" },
+      { label: "场景8 LLM非法JSON*", text: "帮我把自动续费关了" },
+      { label: "场景9 重复消息", text: "你好，在吗" },
+      { label: "场景10 无命中", text: "你们的校车几点发车？" },
+    ];
 
     const $ = (id) => document.getElementById(id);
     const statusEl = $("status");
     const logEl = $("log");
-    const tokenEl = $("token");
+    const identityEl = $("identity");
     const contentEl = $("content");
-    const connectBtn = $("connect-btn");
     const sendBtn = $("send-btn");
     const resendBtn = $("resend-btn");
+    const scenarioButtonsEl = $("scenario-buttons");
+    const panelEl = $("panel");
 
     let ws = null;
+    let currentIdentity = null; // { tenantId, userId, label }
+    let conversationId = null;
     let lastMessage = null; // { messageId, content }
     const bubblesByReplyTo = {};
+    const pending = {}; // messageId -> { sentAt, firstChunkAt }
 
     function setStatus(text, cls) {
       statusEl.textContent = text;
       statusEl.className = cls || "";
     }
 
-    function addMeta(text, isError) {
+    function addMetaLine(text, isError) {
       const div = document.createElement("div");
-      div.className = "meta" + (isError ? " error-meta" : "");
+      div.className = "meta-line" + (isError ? " error-meta" : "");
       div.textContent = text;
       logEl.appendChild(div);
       logEl.scrollTop = logEl.scrollHeight;
@@ -74,6 +150,14 @@
       const div = document.createElement("div");
       div.className = "bubble user";
       div.textContent = text;
+      logEl.appendChild(div);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function addReminderBubble(title, text) {
+      const div = document.createElement("div");
+      div.className = "bubble reminder";
+      div.textContent = "🔔 " + title + "：" + text;
       logEl.appendChild(div);
       logEl.scrollTop = logEl.scrollHeight;
     }
@@ -89,46 +173,97 @@
       return div;
     }
 
-    connectBtn.addEventListener("click", () => {
-      const token = tokenEl.value.trim();
-      if (!token) {
-        addMeta("请先填 token", true);
+    function panelRow(key, val, cls) {
+      return `<div class="panel-row"><span class="panel-key">${key}</span>` +
+        `<span class="panel-val ${cls || ""}">${val}</span></div>`;
+    }
+
+    function renderPanelForNonReply(kind, traceId) {
+      let html = "";
+      html += panelRow("状态", kind);
+      html += panelRow("trace_id", traceId || "（无）");
+      panelEl.innerHTML = html;
+    }
+
+    function renderPanel(entry) {
+      const meta = entry.meta || {};
+      const tools = (meta.tools || []).map((t) => `${t.name}:${t.status}`).join("、") || "（无）";
+      const citations = (meta.citations || [])
+        .map((c) => `《${c.doc_title}》第${c.clause_no}条(${c.score})`)
+        .join("；") || "（无）";
+      const circuitBreaker = (meta.circuit_breaker || []).join("、");
+      const ctx = meta.context || {};
+
+      let html = "";
+      html += panelRow("意图", `${meta.intent || "-"}（来源：${meta.route_source || "-"}）`);
+      html += panelRow("调用的工具", tools);
+      html += panelRow("引用的知识来源", citations);
+      html += panelRow("ACK 耗时", entry.ackMs != null ? entry.ackMs + " ms" : "-");
+      html += panelRow("首 token 耗时", entry.firstChunkMs != null ? entry.firstChunkMs + " ms" : "（模板回复，无分片）");
+      html += panelRow("完整耗时", entry.totalMs != null ? entry.totalMs + " ms" : "-");
+      html += panelRow("trace_id", entry.traceId || "-");
+      html += panelRow("熔断降级", circuitBreaker || "无", circuitBreaker ? "flag-on" : "flag-off");
+      html += panelRow("预算降级", meta.budget_exceeded ? "是" : "否", meta.budget_exceeded ? "flag-on" : "flag-off");
+      html += panelRow("限流降级", "否", "flag-off"); // 走到这里说明这条消息没被限流，限流的消息走 renderPanelForNonReply
+      html += panelRow("上下文", `原文 ${ctx.history_messages ?? 0} 条，摘要：${ctx.has_summary ? "有" : "无"}`);
+      panelEl.innerHTML = html;
+    }
+
+    function resetConversationState() {
+      logEl.innerHTML = "";
+      panelEl.innerHTML = '<div id="panel-empty">还没有回复</div>';
+      lastMessage = null;
+      resendBtn.disabled = true;
+      for (const key in bubblesByReplyTo) delete bubblesByReplyTo[key];
+      for (const key in pending) delete pending[key];
+    }
+
+    async function connectAs(identity) {
+      setStatus("正在获取 token...", "connecting");
+      contentEl.disabled = true;
+      sendBtn.disabled = true;
+      identityEl.disabled = true;
+
+      let tokenResp;
+      try {
+        const resp = await fetch(`/api/token?tenant_id=${identity.tenantId}&user_id=${identity.userId}`);
+        if (!resp.ok) throw new Error(await resp.text());
+        tokenResp = await resp.json();
+      } catch (e) {
+        setStatus("获取 token 失败", "error");
+        identityEl.disabled = false;
+        addMetaLine("获取 token 失败：" + e.message, true);
         return;
       }
 
-      // 按钮真正禁用要等 onopen（异步）才发生，这之前如果又点一次会造出第二个 WebSocket，
-      // 两个连接会被 gateway 各自转发同一份回复，页面上文字就会重复——这里同步禁用 + 关掉旧连接兜底
-      connectBtn.disabled = true;
+      // 切换身份：断开旧连接、清空聊天窗口和透视面板、换一个新的 conversation_id
       if (ws) {
-        ws.onopen = null;
-        ws.onclose = null;
-        ws.onmessage = null;
-        ws.onerror = null;
+        ws.onopen = ws.onclose = ws.onmessage = ws.onerror = null;
         ws.close();
       }
+      resetConversationState();
+      currentIdentity = identity;
+      conversationId = crypto.randomUUID();
 
       const host = window.location.hostname;
-      const url = `ws://${host}:${GATEWAY_HOST_PORT}/ws?token=${encodeURIComponent(token)}`;
+      const url = `ws://${host}:${GATEWAY_HOST_PORT}/ws?token=${encodeURIComponent(tokenResp.token)}`;
       ws = new WebSocket(url);
 
       ws.onopen = () => {
-        setStatus("已连接（conversation_id: " + conversationId + "）", "connected");
+        setStatus(`已连接：${identity.label}（${tokenResp.role}）`, "connected");
         contentEl.disabled = false;
         sendBtn.disabled = false;
-        connectBtn.disabled = true;
-        tokenEl.disabled = true;
+        identityEl.disabled = false;
       };
 
       ws.onclose = (ev) => {
         setStatus("连接已关闭（code: " + ev.code + "）", "error");
         contentEl.disabled = true;
         sendBtn.disabled = true;
-        connectBtn.disabled = false;
-        tokenEl.disabled = false;
       };
 
       ws.onerror = () => {
-        addMeta("WebSocket 出错", true);
+        addMetaLine("WebSocket 出错", true);
       };
 
       ws.onmessage = (ev) => {
@@ -136,35 +271,90 @@
         try {
           msg = JSON.parse(ev.data);
         } catch (e) {
-          addMeta("收到无法解析的消息: " + ev.data, true);
+          addMetaLine("收到无法解析的消息: " + ev.data, true);
           return;
         }
+        const now = performance.now();
         switch (msg.type) {
-          case "ack":
-            addMeta(`ACK message_id=${msg.message_id} status=${msg.status} trace_id=${msg.trace_id}`);
+          case "ack": {
+            const p = pending[msg.message_id];
+            if (p) p.ackAt = now;
+            if (msg.status === "rate_limited") {
+              addMetaLine(`ACK message_id=${msg.message_id} status=rate_limited：${msg.detail}`, true);
+              renderPanelForNonReply("被限流（未生成回复）", msg.trace_id);
+            } else if (msg.status === "duplicate") {
+              addMetaLine(`ACK message_id=${msg.message_id} status=duplicate（重复消息，不会有新回复）`);
+              renderPanelForNonReply("重复消息（未生成新回复）", msg.trace_id);
+            } else {
+              addMetaLine(`ACK message_id=${msg.message_id} status=accepted trace_id=${msg.trace_id}`);
+            }
+            if (p) p.traceId = msg.trace_id;
             break;
+          }
           case "reply_chunk": {
+            const p = pending[msg.reply_to];
+            if (p && p.firstChunkAt == null) p.firstChunkAt = now;
             const bubble = getOrCreateAssistantBubble(msg.reply_to);
             bubble.textContent += msg.delta;
             logEl.scrollTop = logEl.scrollHeight;
             break;
           }
-          case "reply_end":
+          case "reply_end": {
             delete bubblesByReplyTo[msg.reply_to];
-            addMeta(`回复结束 reply_to=${msg.reply_to}`);
+            addMetaLine(`回复结束 reply_to=${msg.reply_to}`);
+            const p = pending[msg.reply_to];
+            if (p) {
+              p.endAt = now;
+              renderPanel({
+                meta: msg.meta,
+                traceId: p.traceId,
+                ackMs: p.ackAt != null ? Math.round(p.ackAt - p.sentAt) : null,
+                firstChunkMs: p.firstChunkAt != null ? Math.round(p.firstChunkAt - p.sentAt) : null,
+                totalMs: Math.round(p.endAt - p.sentAt),
+              });
+            }
+            break;
+          }
+          case "reminder":
+            addReminderBubble(msg.title, msg.text);
             break;
           case "error":
-            addMeta(`ERROR code=${msg.code} detail=${msg.detail}`, true);
+            addMetaLine(`ERROR code=${msg.code} detail=${msg.detail}`, true);
             break;
           default:
-            addMeta("未知消息类型: " + JSON.stringify(msg), true);
+            addMetaLine("未知消息类型: " + JSON.stringify(msg), true);
         }
       };
+    }
+
+    function populateIdentitySelect() {
+      IDENTITIES.forEach((identity, idx) => {
+        const opt = document.createElement("option");
+        opt.value = String(idx);
+        opt.textContent = identity.label;
+        identityEl.appendChild(opt);
+      });
+    }
+
+    function populateScenarioButtons() {
+      SCENARIOS.forEach((scenario) => {
+        const btn = document.createElement("button");
+        btn.textContent = scenario.label;
+        btn.title = scenario.text;
+        btn.addEventListener("click", () => sendMessage(scenario.text));
+        scenarioButtonsEl.appendChild(btn);
+      });
+    }
+
+    identityEl.addEventListener("change", () => {
+      const idx = identityEl.value;
+      if (idx === "") return;
+      connectAs(IDENTITIES[Number(idx)]);
     });
 
     function sendMessage(content, reuseMessageId) {
       if (!ws || ws.readyState !== WebSocket.OPEN) {
-        addMeta("还没连接", true);
+        addMetaLine("还没连接，先选一个身份", true);
         return;
       }
       const messageId = reuseMessageId || crypto.randomUUID();
@@ -174,6 +364,7 @@
         conversation_id: conversationId,
         content: content,
       };
+      pending[messageId] = { sentAt: performance.now(), ackAt: null, firstChunkAt: null, endAt: null, traceId: null };
       ws.send(JSON.stringify(payload));
       addUserBubble(content + (reuseMessageId ? "（重发，同一个 message_id）" : ""));
       lastMessage = { messageId, content };
@@ -195,6 +386,9 @@
       if (!lastMessage) return;
       sendMessage(lastMessage.content, lastMessage.messageId);
     });
+
+    populateIdentitySelect();
+    populateScenarioButtons();
   </script>
 </body>
 </html>

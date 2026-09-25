@@ -2576,3 +2576,114 @@ $ docker compose run --rm tools python scripts/phase3_smoke.py
 本节本身就是人工审查驱动的修复记录，不再重复。
 
 ---
+
+## 步骤 7：演示控制台和收尾
+
+**日期**：2026-09-25
+
+**改动/新建模块**：
+- `docker/mocks.Dockerfile`：加 `COPY app/ ./app/`——mock-im 要按 tenant_id+user_id 现场签发开发用 token（复用 `app.common.auth`）、查真实角色（`app.common.db`/`app.common.models`），需要这些模块；其余 4 个 mock 服务不引用，多带这些文件对它们没有影响。
+- `docker-compose.yml`：`mock-im` 服务加 `env_file: .env`（要读 `DATABASE_URL`/`JWT_SECRET` 等）和 `depends_on: postgres: condition: service_healthy`。
+- `mocks/mock_im/main.py`：新增 `GET /api/token?tenant_id=&user_id=`——按数据库里的真实角色现场签发 JWT（复用 `create_access_token`，跟 `scripts/chat.py` 的签发方式一样），密钥来自环境变量，不写死在页面或代码里；查不到用户返回 404。
+- `mocks/mock_im/templates/index.html`：从简单聊天页面重写成演示控制台——顶部身份下拉框（5 个预置身份，切换会先调 `/api/token`、断开旧连接、清空聊天窗口和透视面板、连新的 token）；聊天窗口保留原有的流式显示和"重发上一条"，新增提醒推送单独样式（🔔 前缀，浅黄底）；左下角 10 个 E2E 场景快捷按钮（原句取自 `phase2_smoke.py`/`phase3_smoke.py` 里已有的场景文案）；右边透视面板，客户端用 `performance.now()` 记 ack/首 token/完整耗时三个时间戳，`reply_end.meta` 里的意图、工具、知识来源、熔断/预算降级标记、上下文信息直接渲染；限流/重复消息走 ack 就能判断，不等 `reply_end` 也能显示对应状态。
+- `scripts/phase3_smoke.py`：新增 4 个场景——`scenario_reminder_update_and_cancel`（创建→改时间→取消，每步查库确认落库）、`scenario_rate_limit_degrade`（连发 `RATE_LIMIT_USER_PER_10S+5` 条，只读 ack 不等回复，跟 `rate_limit_burst.py` 是同一个技巧）、`scenario_circuit_breaker_degrade`（mock-llm 切 error500，连发够 `CB_FAILURE_THRESHOLD+3` 条，不依赖"第几条打开"这个具体数字——步骤 3 检查点 C 已经记录过这个教训；打开后等 `CB_OPEN_SECONDS+2` 秒确认自动恢复，不把熔断状态遗留给后面的场景）、`scenario_budget_degrade`（机构预算设成 0，不管今天用没用过都必定超限，验证新话术 `FALLBACK_BUDGET_EXCEEDED_REPLY`，改完立刻恢复）。新增公共小工具：`_set_mock_mode`、`_send_and_wait`（同一条连接连续发消息用）、`_cancel_all_active_reminders`（避免上一次跑剩下的提醒让"改/取消"变成"需要澄清"）。
+- `README.md`：更新 `make up` 描述（漏了 scheduler）；mock-im/scheduler 的介绍从"占位"/"简单聊天页面"改成实际实现；命令行工具表补 `phase3_smoke.py`/`rate_limit_burst.py`/`dlq_replay.py`；`reply_end.meta` 字段表补 `context`/`circuit_breaker`/`budget_exceeded`；新增"新增的环境变量（阶段三）"一节；目录说明里 scheduler/mock_im 的注释同步更新。
+- `.env.example`：核对过，`app/common/config.py` 里全部 79 个 Settings 字段在 `.env.example` 里都有对应项，没有缺的，不用改。
+
+**计划外改动**：
+- `docker/mocks.Dockerfile`、`docker-compose.yml`（mock-im 服务定义）：这两处不在 PHASE3.md 第 7 步"做什么"逐条列出的范围里，是把 mock-im 升级成能签发 token 的过程中发现必须改的（mock-im 之前只是纯静态页面服务，不连数据库、没有 JWT 密钥，要满足"token 由已有的开发用签发方式生成，密钥来自环境变量"这条要求就必须让它能访问 `app.common.auth`/`app.common.db`）。影响：只影响 **mock-im** 这一个服务的镜像内容和启动依赖；mocks 镜像是 5 个 mock 服务共用的，`mock-llm`/`mock-knowledge`/`mock-platform`/`mock-finance` 这四个服务的镜像里也会多出 `app/` 目录，但它们的代码不引用这些模块，运行时行为不受影响（多占的镜像体积很小，几个 mock 服务本来就不大）。
+
+**验证**：
+
+mock-im 后端（真实 docker）：
+```
+$ curl -s "http://localhost:8080/api/token?tenant_id=t_a&user_id=u_a_1001"
+{"token":"eyJhbGciOiJIUzI1NiIs...","name":"张小明","role":"student"}
+$ curl -s "http://localhost:8080/api/token?tenant_id=t_a&user_id=nope"
+{"detail":"用户不存在：tenant=t_a user=nope，先跑 make seed"}
+$ curl -s -w "\nHTTP_STATUS:%{http_code}\n" "http://localhost:8080/api/token?tenant_id=t_a&user_id=u_b_1001"
+{"detail":"用户不存在：tenant=t_a user=u_b_1001，先跑 make seed"}
+HTTP_STATUS:404
+$ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/
+200
+```
+`u_b_1001` 真实属于 `t_b`，配成 `tenant_id=t_a` 时被拒绝——查询条件本身是 `WHERE tenant_id=:tenant_id AND id=:user_id`，跨机构的用户在这条查询里天然查不到，跟"随便填一个不存在的 user_id"走的是同一条 404 路径、返回同一句话，不会因为"用户其实存在、只是租户不对"而额外暴露信息。
+
+前端 JS 语法/HTML 结构（Node 语法检查 + 标签配对检查，替代不了浏览器里的真实交互，见下面"浏览器验证"）：
+```
+$ node -e "...new Function(js)..."
+JS SYNTAX OK
+$ python -c "...统计 div/select/button/span/label/input 标签数量..."
+opens  Counter({'div': 16, 'button': 2, 'span': 2, 'label': 1, 'select': 1, 'input': 1})
+closes Counter({'div': 16, 'button': 2, 'span': 2, 'label': 1, 'select': 1})
+```
+（`input` 是自闭合元素，本来就没有闭合标签，数量对不上是正常的）
+
+协议契合度（用一个跟页面 JS 完全一样的消息格式，模拟"选身份→连接→发消息→收 ack/reply_chunk/reply_end/reminder"这一整套流程，验证后端返回的字段跟前端 JS 期待读取的字段名完全对得上）：
+```
+== token 接口 ==
+u_a_1001: 张小明 student
+u_b_1001: 李小红 student
+
+== 场景1（t_a，知识问答）==
+reply: 依据《课程服务协议》第 4.2 条、《课程服务协议》第 5.2 条：...
+meta.citations: [{'doc_title': '课程服务协议', 'clause_no': '4.2', ...}, ...]
+
+== 场景3（越权查询）==
+reply: 这个账号的财务信息不属于你，我这边不能查询。如果需要，请本人登录后再问我。
+meta.tools: [{'name': 'query_finance', 'status': 'forbidden'}]
+
+== 场景9（重复消息，用同一个 message_id 重发）==
+ack1: accepted ack2: duplicate
+
+== 场景1（t_b，同一句话，应该引用不同来源）==
+reply: 依据《课程服务协议》第 4.2 条、《课程服务协议》第 4.1 条：...
+meta.citations: [..., {'doc_title': '请假规则', 'clause_no': '1.2', ...}]
+```
+t_a 和 t_b 问同一句话，引用来源确实不同（t_b 第三条是"请假规则"，t_a 没有这篇文档）。
+
+提醒推送（同一条连接上创建提醒 → 快进 → 收到 `type=reminder` 消息，字段跟页面 JS 的 `addReminderBubble(msg.title, msg.text)` 对得上）：
+```
+ack accepted
+reply_end meta.intent= reminder
+got type= reminder
+reminder title= 开会 text= 提醒：明天 09:00 开会，还有 30 分钟开始。
+```
+
+`phase3_smoke.py`（新增 4 个场景 + 原有 2 个）：
+```
+$ docker compose run --rm tools python scripts/phase3_smoke.py
+[PASS] 场景5 创建提醒并按时收到推送：push_ok=True 延迟=0.448363
+[PASS] 场景(上下文) 25 条消息后生成历史摘要：db_ok=True meta={'history_messages': 10, 'has_summary': True}
+[PASS] 场景(提醒) 修改和取消：create='已设置提醒：明天 09:00 开会，提前 30 分钟在 IM' update='已把"开会"的提醒改到 09 月 26 日 10:00，提前' cancel='已取消"开会"的提醒。' update_db_ok=True cancel_db_ok=True
+[PASS] 场景(限流) 超过上限降级为 rate_limited：limit=20 accepted=20 rate_limited=5
+[PASS] 场景(熔断) LLM 连续失败降级并自动恢复：saw_circuit_open=True recovered=True（等了 32.0 秒确认恢复)
+[PASS] 场景(预算) 机构预算耗尽降级并恢复：degrade_reply='这个问题我这边暂时处理不了。你可以换个说法再问一次，或者回复"转人工"，我帮你转' degrade_ok=True restored_ok=True
+
+全部 6 个场景 PASS
+```
+
+回归：
+```
+$ docker compose run --rm tools pytest -q tests/unit -rs
+182 passed, 1 skipped in 7.00s
+$ docker compose run --rm tools python scripts/phase2_smoke.py
+全部 9 个场景 PASS
+$ git status --short | grep -i "\.env$"
+（无输出，.env 没有出现在 git status 里）
+```
+
+**浏览器验证**：
+本次会话没有可用的浏览器自动化工具，agent 没有用真实浏览器操作过，只做了上面几类替代验证（后端接口直接调用、JS 语法检查、HTML 标签配对、用脚本模拟页面 JS 的协议交互），能确认"数据和协议是对的"，不能确认"页面在浏览器里长什么样、点击是否顺手"。这部分由 Jo 亲手在浏览器里按 PHASE3.md 的验证清单实际操作确认，结果如下：
+- 身份切换、10 个 E2E 场景快捷按钮、透视面板各字段渲染、切换身份时断开旧连接并重连，均正常。
+- 回复按句流式输出，符合"先经 OutputGuard 逐句检查再发送"的设计（不是整段生成完才一次性显示）。
+- 手动连发两条内容相同的消息，各自都收到一次回复——去重键是 `message_id`，不是消息内容，两条消息各自的 `message_id` 不同就不算重复，这是预期行为，不是 bug（真正的去重验证要用同一个 `message_id` 重发，见"重复发送上一条"按钮）。
+- 连续快速发送触发限流提示，正常。
+
+**设计说明**：
+- 演示控制台的"重复发送上一条"用的是浏览器内存里的 `lastMessage`，刷新页面或切换身份后会清空。Jo 审查后确认记为设计说明，不列入已知问题：重发的语义本来就是"上一条"，切换身份之后"上一条"自然应该失效，刷新页面清空也是浏览器页面的正常行为，不是缺陷。
+
+**人工审查与修复点**：
+无（本步骤是按 PHASE3.md 第 7 步开发，不是审查驱动的修复）。
+
+---
