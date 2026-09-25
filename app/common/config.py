@@ -99,6 +99,34 @@ class Settings(BaseSettings):
     scheduler_interval_seconds: float = 1
     scheduler_batch_size: int = 100
 
+    # ---------- 限流（阶段三 4，设计决定 8）----------
+    rate_limit_user_per_10s: int = 20
+    rate_limit_tenant_per_sec: int = 2000
+
+    # ---------- Redis 断线重连（阶段三 4，gateway 订阅回复用）----------
+    # 重连间隔从这个值开始，每次翻倍，封顶在 max；不能无限等，也不能一直用固定间隔猛敲 Redis
+    redis_reconnect_min_seconds: float = 0.5
+    redis_reconnect_max_seconds: float = 30
+
+    # ---------- 熔断器（阶段三 5，设计决定 10）：LLM 和 mock-finance 各一个，状态存进程内存 ----------
+    cb_failure_threshold: int = 5
+    cb_open_seconds: float = 30
+
+    # ---------- 重试（阶段三 5，设计决定 11）：次数和退避间隔都放配置，不写死在代码里 ----------
+    llm_max_retries: int = 1
+    llm_retry_backoff_seconds: float = 0.3
+    finance_max_retries: int = 1
+    finance_retry_backoff_seconds: float = 0.2
+    # 抖动范围：实际退避 = base + uniform(0, jitter)，避免多个请求同时超时后又同时重试撞在一起
+    finance_retry_backoff_jitter_seconds: float = 0.1
+    platform_max_retries: int = 2
+    # 平台指令保留原来"第 1 次重试等 0.5 秒、第 2 次等 1 秒"的阶梯退避，用一个基数乘以第几次重试算出来
+    platform_retry_backoff_base_seconds: float = 0.5
+
+    # ---------- 死信（阶段三 5，设计决定 12）----------
+    # 消息头 x-retry-count 达到这个值还失败，就不再重新投回队列，直接进 inbound.dead
+    dlq_max_retries: int = 3
+
     # ---------- 服务端口 ----------
     gateway_host_port: int = 8000
     worker_health_host_port: int = 8011

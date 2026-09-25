@@ -18,6 +18,7 @@ from openai import APIConnectionError, APIError, APITimeoutError
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.common.circuit_breaker import CircuitBreakerOpenError
 from app.common.llm_client import chat_completion
 from app.common.logging import get_logger
 from app.common.models import Conversation, PendingAction, PendingActionStatus
@@ -175,6 +176,11 @@ async def _classify_with_llm(state: GraphState) -> dict:
     )
     try:
         response = await chat_completion(messages=messages, tools=to_openai_tools(), tool_choice="auto")
+    except CircuitBreakerOpenError:
+        logger.warning("LLM 熔断打开，降级为关键词规则")
+        result = _keyword_fallback_classify(state["content"])
+        result["circuit_breaker"] = ["llm"]
+        return result
     except (APIError, APITimeoutError, APIConnectionError) as exc:
         logger.warning("LLM 分类调用失败，降级为关键词规则", error=str(exc))
         return _keyword_fallback_classify(state["content"])

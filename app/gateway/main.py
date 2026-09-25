@@ -8,7 +8,7 @@ from app.common.auth import TokenError, decode_access_token
 from app.common.db import check_db_connection
 from app.common.logging import bind_trace_context, clear_trace_context, configure_logging, get_logger
 from app.common.mq import declare_topology, get_confirm_channel, get_connection
-from app.common.redis import check_redis_connection
+from app.common.redis import check_redis_connection, note_redis_result
 
 from app.gateway.connection_manager import manager
 from app.gateway.message_handler import handle_inbound_message
@@ -37,7 +37,11 @@ app = FastAPI(title="gateway", lifespan=lifespan)
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok"}
+    # Redis 不可用时仍然返回 200（设计决定 9：限流/去重/推送都能在没有 Redis 的情况下降级运行，
+    # gateway 本身没有挂，不该被存活探针重启），只在返回内容里标出降级状态给人看
+    redis_ok = await check_redis_connection()
+    note_redis_result(redis_ok)
+    return {"status": "ok" if redis_ok else "degraded", "redis": "up" if redis_ok else "down"}
 
 
 @app.get("/ready")

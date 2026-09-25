@@ -50,6 +50,10 @@ class GraphState(TypedDict, total=False):
     # 到阈值）/ llm（LLM 选了 transfer_to_human 工具），由 classify 按命中的分支设置
     handoff_trigger: Optional[str]
 
+    # 本轮因为熔断打开而被跳过、没真的发请求的服务名（阶段三第 5 步，设计决定 10），
+    # 比如 ["llm"]、["finance"]；给 reply_end 的 meta 用，客户端/演示控制台标出"熔断降级"
+    circuit_breaker: List[str]
+
 
 @dataclass
 class GraphContext:

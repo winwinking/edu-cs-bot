@@ -1977,4 +1977,281 @@ $ docker compose down
 ```
 
 **人工审查与修复点**：
-（等 Jo 验证后再补充）
+无（检查点 B 审查提出的问题都在下面"步骤 3 检查点 B 修复"一节）。
+
+---
+
+## 步骤 3 检查点 B 修复
+
+**日期**：2026-09-25
+
+**触发**：Jo 审查检查点 B（步骤 3）时提出四件事，见下面逐条记录。
+
+### 1. `tests/unit/test_context_summary.py` 的 9 条测试对应哪几类验证要求
+
+| 测试名 | 覆盖的要求 |
+| --- | --- |
+| `test_below_threshold_does_not_regenerate` | 超过阈值才生成摘要（低于/等于阈值不生成） |
+| `test_above_threshold_regenerates` | 超过阈值才生成摘要（超过阈值触发） |
+| `test_append_summary_block_returns_unchanged_content_without_summary` | 摘要放在 user 消息（没摘要时不改内容，间接确认这个函数只管"要不要拼"） |
+| `test_append_summary_block_appends_history_summary_tag` | 摘要放在 user 消息（拼进 `<历史摘要>` 块） |
+| `test_classify_puts_summary_in_user_message_not_system` | 摘要放在 user 消息而不是 system prompt（走真实 classify 调用路径断言） |
+| `test_build_summary_messages_keeps_transcript_out_of_system_message` | 摘要放在 user 消息而不是 system prompt（生成摘要这个请求本身也不能把旧摘要/对话原文放 system） |
+| `test_generated_summary_is_masked_before_returning` | 摘要存库前已脱敏 |
+| `test_generate_summary_returns_none_on_llm_failure` | 额外覆盖：LLM 调用失败时返回 None（不在 Jo 要求的三类里，是补充） |
+| `test_generate_summary_returns_none_on_empty_llm_output` | 额外覆盖：LLM 返回空内容时返回 None（同上，补充） |
+
+三类要求（超过阈值才生成、摘要放 user 不放 system、存库前脱敏）都有测试覆盖，没有缺的，不用补。
+
+### 2. `conversation_summaries.covered_until` 的含义
+
+`covered_until` 是时间戳列（`DateTime(timezone=True)`），不是一个数字，存的是"这次摘要覆盖到了哪条消息"——具体说，是触发这次生成时，"最近 10 条"边界之前最后一条未覆盖消息的 `created_at`。用 `phase3_smoke.py` 的 `s_context` 会话（`t_a`/`u_a_1001`，`conversation_id=3ab377a1-0287-5905-8cda-5a1198ce9be8`）实际数据核对：
+
+```
+$ docker compose run --rm tools python scripts/sql.py "select conversation_id, covered_until, updated_at from conversation_summaries where conversation_id='3ab377a1-0287-5905-8cda-5a1198ce9be8'"
+conversation_id                       covered_until                    updated_at
+3ab377a1-0287-5905-8cda-5a1198ce9be8  2026-09-25 03:04:10.819952+00:00  2026-09-25 03:04:16.759985+00:00
+
+$ docker compose run --rm tools python scripts/sql.py "select row_number() over (order by created_at asc) as rn_asc, role, left(content,20) as content, created_at from messages where conversation_id='3ab377a1-0287-5905-8cda-5a1198ce9be8' order by created_at asc"
+（50 行，第 36 行：assistant | 好的，我在。你可以直接说你的问题。 | 2026-09-25 03:04:10.819952+00:00，跟上面 covered_until 完全一致）
+```
+
+这条会话总共发了 25 轮（50 条消息：user+assistant 各一条）。摘要只在"最近 10 条之前、还没被覆盖的消息数超过 10 条"时才重新生成，不是每条消息都触发；最后一次真正触发生成，是第 46 条消息入库（第 23 轮的 assistant 回复）那一刻——那一刻"最近 10 条"的边界（`offset(limit-1)` 也就是倒数第 10 条）正好是第 37 条消息，`covered_until` 存的就是边界前一条（第 36 条）的时间，即触发那一刻"最近 10 条之前的最后一条"。之后又发生了 2 轮（第 47~50 条消息），但未覆盖消息数只涨到 4 条，没有再次超过阈值触发新一轮生成，所以 `covered_until` 一直停在第 36 条，不会跟着最新的"最近 10 条"边界实时挪动——这是设计上的正常行为（只在超阈值时才重算，不是每条消息都追着挪），不是 bug。
+
+### 3. 修改提醒"保留原日期"的规则补进真实 LLM 能看到的地方
+
+之前这条规则（"修改提醒时用户只给了时间没给日期，保留原提醒的日期"）只写在 `mocks/mock_llm/rules.py` 的确定性规则里，真实 LLM（DeepSeek）走 function calling 时看不到 mock 的内部规则，接真实 LLM 后这个 bug 会复现。规则本身是固定文字、不含用户输入，符合"用户输入不得拼进 system prompt"的例外，放进 `manage_reminder` 工具 `event_time` 参数的 `description` 里（这段文字会原样进到发给真实 LLM 的 function-calling schema 里）：
+
+**改动**：
+- `app/common/tools.py`：`ManageReminderArgs.event_time` 的 `description` 从"LLM 理解后的本地时间，格式 YYYY-MM-DD HH:MM"扩展成加一句"修改提醒（action=update）时，如果用户只说了新的时间、没有说新的日期，日期要沿用 `<提醒列表>` 里这条提醒原来的日期，不要默认成今天。"
+
+**验证**：
+```
+$ docker compose run --rm tools pytest -q tests/unit -rs
+144 passed, 1 skipped in 6.76s
+$ docker compose run --rm mock-llm pytest -q tests/unit/test_mock_llm_rules.py
+38 passed in 0.07s
+$ docker compose run --rm tools python scripts/phase3_smoke.py
+全部 2 个场景 PASS
+$ docker compose run --rm tools python scripts/phase2_smoke.py
+全部 9 个场景 PASS
+```
+mock-llm 仍然靠 `rules.py` 里那套确定性规则跑（这条 description 对 mock-llm 没有实际作用，mock-llm 不读 tools 的 description），所以以上验证只能确认没有回归；这条 description 要接真实 DeepSeek 之后才能验证真的起作用，属于阶段四的事。
+
+**人工审查发现**：日期问题之前只在 mock 层修复，真实 LLM 需要提示词约束——已按上述方式补上。
+
+### 4. 已知问题补充
+
+- mock-llm 生成历史摘要返回固定文案（`_HISTORY_SUMMARY_REPLY`），只能验证"摘要生成→存库→下一轮读取拼回 `<历史摘要>`"这条链路走得通，不能验证摘要内容质量（有没有真的抓住重点、有没有遗漏），要接真实 LLM 后才能评估。
+
+**人工审查与修复点**：
+本节本身就是人工审查驱动的修复记录，不再重复。
+
+---
+
+## 步骤 3.4：gateway 这边的保护（限流 + Redis 降级）
+
+**日期**：2026-09-25
+
+**改动/新建模块**：
+- `app/common/config.py`：新增 `rate_limit_user_per_10s`（默认 20）、`rate_limit_tenant_per_sec`（默认 2000）、`redis_reconnect_min_seconds`（默认 0.5）、`redis_reconnect_max_seconds`（默认 30）
+- `.env.example`：对应新增配置项，带注释
+- `app/common/redis.py`：新增 `note_redis_result()`——进程级别共用的"Redis 可用/不可用"状态，只在状态翻转时各打一条日志，去重、限流、发布/订阅都调它上报，不用各自维护一份状态
+- `app/common/rate_limit.py`：新建。`check_rate_limit()` 用 Lua 脚本把"INCR + 首次 EXPIRE"合成一个原子操作；`check_user_and_tenant_rate_limit()` 按用户（10 秒 20 条）和按机构（1 秒 2000 条）各查一次，任意一个超限就算超限；Redis 报错时放行（设计决定 9）
+- `app/common/schemas.py`：`AckMessage.status` 加 `rate_limited`，加 `detail` 字段（只有 rate_limited 会带提示文案）
+- `app/gateway/message_handler.py`：限流检查插到校验之后、去重之前（设计决定 8）；去重的 Redis 调用包一层 try/except，报错就跳过去重继续投递，不再让整条消息处理失败；投递失败时删 dedup key 那一步也包一层，避免"删的时候 Redis 又恰好挂了"抛出去
+- `app/gateway/connection_manager.py`：`_listen()` 从"订阅一次、失败就退出"改成"断线自动重连，退避从 0.5 秒翻倍到封顶 30 秒，重连成功清零"；`RedisError` 之外的异常（主要是 `asyncio.CancelledError`）行为不变，不影响原来那套"旧监听任务被换下场"的处理
+- `app/gateway/main.py`：`/health` 改成查一次 Redis，返回 `{"status": "ok"/"degraded", "redis": "up"/"down"}`，Redis 不可用时依然是 HTTP 200（不能让 Redis 挂了触发 gateway 自己被健康检查重启）
+- `app/worker/pubsub.py`：三个 `publish_*` 函数改成统一走 `_publish()`，Redis 发布失败只记日志、不往外抛异常——回复已经生成好、该存库的照样存库，不能因为推不出去就让 worker 把这条处理成功的消息当异常重新走死信流程
+- `app/scheduler/pubsub.py`：加 `note_redis_result()` 上报，发布失败该抛的异常继续抛（不变——scheduler 自己的"先推送再提交"逻辑本来就要靠这个异常判断这一条要不要跳过，见 `app/scheduler/loop.py`，这次没改）
+- `scripts/rate_limit_burst.py`：新建，10 秒内连发 N 条消息打印每条 ack 状态，验证限流用
+- `tests/unit/test_rate_limit.py`：新建 5 条——limit 内放行、超 limit 拒绝、正好等于 limit 放行、Redis 报错放行、机构维度超限也算超限
+- `tests/unit/test_gateway_rate_limit_dedup.py`：新建 3 条——被限流的消息不写去重键不投递、去重 Redis 报错时跳过去重照常投递、Redis 正常时重复消息仍被正确识别
+
+**计划外改动**：无，`docker-compose.yml`、`Makefile`、`Dockerfile` 都没有改动——新配置项走 `env_file: .env`，四个服务（gateway/worker/scheduler/tools）共用同一份 `.env`，不用在 compose 里逐个声明 `environment:`。
+
+**验证**：
+
+限流（真实 docker，10 秒内连发 30 条）：
+```
+$ docker compose run --rm tools python scripts/rate_limit_burst.py --tenant t_a --user u_a_1001 --count 30
+[1/30] status=accepted ... [20/30] status=accepted detail=None
+[21/30] status=rate_limited detail=发得有点快，稍等几秒再发。
+...
+[30/30] status=rate_limited detail=发得有点快，稍等几秒再发。
+
+汇总：accepted=20 rate_limited=10
+```
+前 20 条 accepted，第 21~30 条 rate_limited，跟 `RATE_LIMIT_USER_PER_10S=20` 默认值完全对上。
+
+Redis 挂了（真实 `docker compose stop redis`）：
+```
+$ curl -s http://localhost:8000/health
+{"status":"ok","redis":"up"}
+$ docker compose stop redis
+$ curl -s http://localhost:8000/health
+{"status":"degraded","redis":"down"}
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv redis_down_test "你好"
+[ack] status=accepted trace_id=...
+（超过 30 秒没收到 reply_end，超时退出——Redis 挂了，回复没法实时推送，符合设计决定 9 的代价）
+$ docker compose run --rm tools python scripts/sql.py "select role, status, content from messages ... order by created_at desc limit 2"
+assistant  (无 status)  好的，我在。你可以直接说你的问题。
+user       replied       你好
+```
+消息照样处理完、照样存库、user 消息照样标 replied，只是没能实时推给客户端——这正是设计要的降级行为，不是 bug。
+
+```
+$ docker compose logs gateway --tail 50 | grep -i redis
+{"event": "Redis 不可用，已降级", ...}
+{"event": "限流检查调用 Redis 失败，放行", "key": "ratelimit:user:t_a:u_a_1001", ...}
+{"event": "订阅 Redis 频道时断线，将重连", "backoff_seconds": 0.5, ...}
+{"event": "限流检查调用 Redis 失败，放行", "key": "ratelimit:tenant:t_a", ...}
+{"event": "去重检查调用 Redis 失败，跳过去重", ...}
+{"event": "订阅 Redis 频道时断线，将重连", "backoff_seconds": 1.0, ...}
+...backoff_seconds 依次 2.0、4.0、8.0、16.0...
+
+$ docker compose logs worker --tail 50 | grep -i redis
+{"event": "Redis 不可用，已降级", ...}
+{"event": "推送到 Redis 频道失败，已跳过", ...}（后续同样的失败不再重复打"降级"这条，只有各自的操作日志）
+```
+"Redis 不可用，已降级"在 gateway、worker 各只出现 1 次（转折点日志，符合设计决定 9），订阅重连的退避日志会随着 Redis 持续挂着按翻倍间隔重复出现，这是预期的重试节奏日志，不是刷屏。
+
+```
+$ docker compose start redis
+$ docker compose run --rm tools python scripts/chat.py --tenant t_a --user u_a_1001 --conv redis_down_test "你好，Redis 恢复了吗"
+...正常收到流式回复和 reply_end...
+"circuit_breaker": []
+$ docker compose logs gateway --tail 20 | grep 恢复
+{"event": "Redis 已恢复"}
+$ docker compose logs worker --tail 20 | grep 恢复
+{"event": "Redis 已恢复"}
+$ curl -s http://localhost:8000/health
+{"status":"ok","redis":"up"}
+```
+gateway、worker 各打了 1 条"Redis 已恢复"，符合验证要求。
+
+单元测试：
+```
+$ docker compose run --rm tools pytest -q tests/unit -rs
+169 passed, 1 skipped in 6.86s
+$ docker compose run --rm tools python scripts/phase2_smoke.py
+全部 9 个场景 PASS
+$ docker compose run --rm tools python scripts/phase3_smoke.py
+全部 2 个场景 PASS
+```
+
+**建议记为已知问题**：
+- gateway 订阅回复的重连退避日志（"订阅 Redis 频道时断线，将重连"）会随 Redis 持续故障按翻倍间隔（封顶 30 秒）反复打印，不是"只打一条"——跟设计决定 9 里特指的"可用→不可用/不可用→恢复"这一对转折点日志是两回事，这条是每次重连尝试都打，目的是让人能看到重连还在进行。如果这个频率仍然嫌多，可以改成"只在第一次断线和真正重连成功时各打一条，中间的重试不打日志"，但那样故障期间完全看不到"系统还在正常重试"的信号，权衡后先保留现在的做法，让 Jo 决定要不要改。
+
+**人工审查与修复点**：
+无（本步骤是按 PHASE3.md 第 4 步开发，不是审查驱动的修复）。
+
+---
+
+## 步骤 3.5：worker 这边的保护（熔断 + 有上限的重试 + 死信）
+
+**日期**：2026-09-25
+
+**改动/新建模块**：
+- `app/common/config.py`：新增 `cb_failure_threshold`（默认 5）、`cb_open_seconds`（默认 30）、`llm_max_retries`（默认 1）、`llm_retry_backoff_seconds`（默认 0.3）、`finance_max_retries`（默认 1）、`finance_retry_backoff_seconds`（默认 0.2）、`finance_retry_backoff_jitter_seconds`（默认 0.1）、`platform_max_retries`（默认 2）、`platform_retry_backoff_base_seconds`（默认 0.5）、`dlq_max_retries`（默认 3）
+- `.env.example`：对应新增配置项，带注释
+- `app/common/circuit_breaker.py`：新建。`CircuitBreaker` 三态状态机（closed/open/half_open），状态存在进程内存里（设计决定 10）；`half_open` 时用一个 `_probing` 标记只放行 1 个试探请求，其余并发请求继续当熔断处理；`CircuitBreakerOpenError` 是熔断打开时抛出的异常，调用方按"这个服务暂时不可用"处理
+- `app/common/llm_client.py`：`AsyncOpenAI` 显式传 `max_retries=0`（设计决定 11，避免 SDK 自己的重试和我们这层叠加）；`chat_completion`/`stream_chat_completion` 都先查熔断器 `allow_request()`，不通过直接抛 `CircuitBreakerOpenError`；只对超时/5xx 重试（次数、退避见配置）；`stream_chat_completion` 只重试"还没吐出任何 chunk"的失败，一旦开始迭代到内容就不再重试，避免重复生成/发送
+- `app/common/finance_client.py`：加熔断（`FinanceCircuitOpen`，是 `FinanceUnavailable` 的子类，方便调用方按现有的 except 分支处理，又能单独判断是不是熔断导致的）；重试退避从固定 0.2 秒改成 `finance_retry_backoff_seconds` 加 `[0, jitter)` 随机抖动，避免一批超时的请求在同一时刻集体重试
+- `app/common/platform_client.py`：重试次数和退避基数改成从配置读（行为不变：还是 2 次重试，0.5 秒/1 秒退避），不再写死在模块常量里
+- `app/worker/graph/state.py`：`GraphState` 加 `circuit_breaker: List[str]`，记录这一轮因为熔断被跳过的服务名
+- `app/worker/graph/classify.py`：`_classify_with_llm` 加一条 `except CircuitBreakerOpenError`，降级为关键词规则的同时把 `circuit_breaker=["llm"]` 写进返回值
+- `app/worker/graph/graph.py`：`respond()` 加一条 `except CircuitBreakerOpenError`（生成模式下的降级和"LLM 调用失败"走一样的固定话术兜底）；`_build_meta` 加 `circuit_breaker` 字段
+- `app/worker/graph/finance.py`：`except FinanceUnavailable` 分支里判断 `isinstance(exc, FinanceCircuitOpen)`，是的话把 `circuit_breaker=["finance"]` 写进返回值
+- `app/worker/consumer.py`：`_on_message` 读消息头 `x-retry-count`（没有就是 0），不可预期异常时：小于 `DLQ_MAX_RETRIES` 就发一条 `x-retry-count+1` 的新消息到原队列、等 publisher confirm 之后 ack 原消息；等于就 `reject(requeue=False)` 进死信。消息体本身解析不出来的（`json.JSONDecodeError`/`KeyError`/`TypeError`）不受这条规则影响，一律直接进死信
+- `scripts/dlq_replay.py`：新建，把 `inbound.dead` 里的消息逐条取出、`x-retry-count` 清零后重新投回 `inbound.messages`
+- `tests/unit/test_circuit_breaker.py`：新建 6 条，覆盖阈值内不熔断、达阈值熔断、成功清零失败计数、到时间半开只放 1 个试探、试探成功恢复、试探失败继续熔断并重新计时
+- `tests/unit/test_llm_retry.py`：新建 4 条，覆盖超时重试 1 次后成功、重试次数不超上限、熔断打开时根本不发请求、调用成功后熔断计数清零
+- `tests/unit/test_finance_circuit.py`：新建 2 条，覆盖熔断打开时不发 HTTP 请求、退避间隔确实带了随机抖动
+- `tests/unit/test_consumer_retry.py`：新建 5 条，覆盖消息体损坏直接进死信不重试、意外异常按次数加 1 重新入队、到阈值进死信、没有 `x-retry-count` 头时按 0 处理、正常处理成功只 ack 不重试
+
+**计划外改动**：无，`docker-compose.yml` 未改动。
+
+**验证**：
+
+LLM 熔断（真实 docker，`mockctl.py llm mode=error500`）：
+```
+$ docker compose run --rm tools python scripts/mockctl.py llm mode=error500
+$ 连发 8 条闲聊（scripts/chat.py，不同 --conv）
+第 1~5 条：meta.circuit_breaker=[]（还在正常失败重试阶段）
+第 6~8 条：meta.circuit_breaker=["llm"]
+
+$ docker compose logs worker --tail 200 | grep 熔断
+{"service": "llm", "failures": 5, "event": "连续失败达到阈值，熔断打开", ...}
+{"event": "LLM 熔断打开，降级为关键词规则", ...} × 3
+
+$ docker compose logs mock-llm --tail 30
+（前 5 条各打 2 次 500，第 6~8 条完全没有 POST /v1/chat/completions 记录，只有健康检查——
+证明熔断打开期间确实一次请求都没有真的发出去）
+
+$ docker compose run --rm tools python scripts/mockctl.py llm mode=normal
+（等到第 6 条触发熔断打开的约 47 秒之后再发一条）
+meta.circuit_breaker=[]
+$ docker compose logs worker --tail 20 | grep 熔断
+{"service": "llm", "event": "熔断进入半开，等待试探请求", ...}
+{"service": "llm", "event": "熔断恢复", ...}
+```
+
+财务熔断：
+```
+$ docker compose run --rm tools python scripts/mockctl.py finance mode=error500
+$ 连发 6 条"我上个月的发票开了吗？"
+第 1~4 条：meta.circuit_breaker=[]，第 5~6 条：meta.circuit_breaker=["finance"]
+$ docker compose run --rm tools python scripts/sql.py "select kind, status from followup_tasks ... limit 6"
+（6 行 finance_query / open）
+$ docker compose run --rm tools python scripts/sql.py "select action, result from audit_logs where action='query_finance' ... limit 6"
+（6 行 query_finance / upstream_error）
+$ docker compose run --rm tools python scripts/mockctl.py finance mode=normal
+```
+followup_tasks 和审计都有记录，熔断打开前后用户看到的都是同一句"财务系统暂时查不到你的信息"，只是熔断打开之后这句话不再真的等一次 HTTP 超时/500 才说出来。
+
+死信（真实 `docker compose stop postgres`，注意：`docker compose run` 默认会因为 `depends_on: postgres: condition: service_healthy` 顺手把 postgres 拉起来，必须带 `--no-deps` 才是真的在测 postgres 挂了的情况）：
+```
+$ docker compose stop postgres
+$ docker compose run --rm --no-deps tools python <临时脚本，手动生成 token 后走 websockets 直连 gateway>
+{"type":"ack","status":"accepted",...}
+
+$ docker compose logs worker --since 20s | grep -v health
+{"retry_count": 1, "event": "处理消息出现不可预期异常，重新投回原队列", ...}
+{"retry_count": 2, "event": "处理消息出现不可预期异常，重新投回原队列", ...}
+{"retry_count": 3, "event": "处理消息出现不可预期异常，重新投回原队列", ...}
+{"retry_count": 3, "event": "处理消息出现不可预期异常，重试次数用完，进死信", "level": "error", ...}
+
+$ docker exec edu-cs-bot-rabbitmq-1 rabbitmqctl list_queues
+inbound.dead 1  inbound.messages 0
+
+$ docker compose start postgres
+$ docker compose run --rm tools python scripts/dlq_replay.py
+重投了 1 条消息
+$ docker exec edu-cs-bot-rabbitmq-1 rabbitmqctl list_queues
+inbound.dead 0  inbound.messages 0
+$ docker compose run --rm tools python scripts/sql.py "select role, content, status from messages where content like '%数据库挂了%'"
+user  数据库挂了的时候发的消息  replied
+```
+3 次重试（`x-retry-count` 1→2→3）之后第 4 次尝试进死信，跟 `DLQ_MAX_RETRIES=3` 的定义一致；`dlq_replay.py` 重投后立刻被正常处理完。
+
+单元测试：
+```
+$ docker compose run --rm tools pytest -q tests/unit -rs
+169 passed, 1 skipped in 6.86s
+$ docker compose run --rm mock-llm pytest -q tests/unit/test_mock_llm_rules.py
+38 passed in 0.06s
+$ docker compose run --rm tools python scripts/phase2_smoke.py
+全部 9 个场景 PASS
+$ docker compose run --rm tools python scripts/phase3_smoke.py
+全部 2 个场景 PASS
+```
+
+**建议记为已知问题**：
+- 死信前的 3 次重试之间没有等待间隔（PHASE3.md 预设的已知问题，这里是真正落地实现后确认符合这个预设）：验证时看到 4 次尝试在 3 秒多一点之内就全部打完，数据库短暂抖动一下就可能把一条消息在几秒内打进死信，不会等一等再试。
+- 熔断状态每个 worker 进程各自维护，不共享（同样是 PHASE3.md 预设的已知问题）：开 3 个 worker 时，同一个 LLM 故障要让 3 个 worker 分别各自攒够 5 次失败才会都熔断，中间那几秒还是会有请求打到已经挂了的上游。
+
+**人工审查与修复点**：
+无（本步骤是按 PHASE3.md 第 5 步开发，不是审查驱动的修复）。
+
+---

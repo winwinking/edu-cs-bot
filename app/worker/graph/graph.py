@@ -10,6 +10,7 @@ from typing import Any
 from langgraph.graph import END, StateGraph
 from openai import APIConnectionError, APIError, APITimeoutError
 
+from app.common.circuit_breaker import CircuitBreakerOpenError
 from app.common.llm_client import stream_chat_completion
 from app.common.logging import get_logger
 from app.worker.graph.classify import classify
@@ -121,6 +122,8 @@ def _build_meta(state: GraphState, guard: OutputGuard) -> dict[str, Any]:
             "history_messages": len(state.get("history", [])),
             "has_summary": bool(state.get("history_summary")),
         },
+        # 本轮因为熔断打开被跳过的服务（阶段三第 5 步），没有就是空列表
+        "circuit_breaker": state.get("circuit_breaker", []),
     }
 
 
@@ -152,6 +155,14 @@ async def respond(tenant_id: str, user_id: str, reply_to: str, state: GraphState
                     first_token_seen = True
                 await emit(guard.feed(delta))
             await emit(guard.flush())
+        except CircuitBreakerOpenError:
+            logger.warning("LLM 熔断打开，生成回复降级为固定话术")
+            state["circuit_breaker"] = list(state.get("circuit_breaker", [])) + ["llm"]
+            if not chunks:
+                fallback_guard = OutputGuard()
+                await emit(fallback_guard.feed(FALLBACK_LLM_UNAVAILABLE_REPLY))
+                await emit(fallback_guard.flush())
+                guard = fallback_guard
         except (APIError, APITimeoutError, APIConnectionError) as exc:
             logger.warning("生成回复时 LLM 调用失败", error=str(exc))
             if not chunks:

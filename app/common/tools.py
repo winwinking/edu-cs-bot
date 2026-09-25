@@ -123,9 +123,17 @@ class ManageReminderArgs(BaseModel):
 
     action: ManageReminderAction
     title: Optional[str] = Field(default=None, max_length=100, description="提醒标题，如“交作业”“家长会”")
-    # 形如 "2026-09-26 09:00"，是不是在将来、时区合不合法由 reminder_rules 校验，这里只挡格式
+    # 形如 "2026-09-26 09:00"，是不是在将来、时区合不合法由 reminder_rules 校验，这里只挡格式。
+    # description 是固定文字、不含用户输入，可以放这里指导 LLM 计算 event_time（人工审查发现：
+    # 这条"修改时保留原日期"的规则原来只写在 mock-llm 的确定性规则里，接真实 LLM 时它看不到，
+    # 必须把规则本身也放进真实 LLM 能读到的地方，即工具参数的 description）
     event_time: Optional[str] = Field(
-        default=None, description="LLM 理解后的本地时间，格式 YYYY-MM-DD HH:MM"
+        default=None,
+        description=(
+            "LLM 理解后的本地时间，格式 YYYY-MM-DD HH:MM。修改提醒（action=update）时，"
+            "如果用户只说了新的时间、没有说新的日期，日期要沿用 <提醒列表> 里这条提醒原来的日期，"
+            "不要默认成今天。"
+        ),
     )
     repeat: Optional[Literal["none", "daily", "weekly", "workdays"]] = Field(
         default=None, description="重复规则，不传视为 none（只提醒一次）"

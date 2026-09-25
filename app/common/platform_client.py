@@ -1,8 +1,9 @@
 """调用 mock-platform 的客户端（PHASE2.md 2.10 第 2 点）。
 
-超时 3 秒；只对超时、5xx、连接错误重试，最多 2 次，间隔 0.5 秒和 1 秒；4xx 不重试——4xx 是参数
-问题，重试不会变成 2xx。因为每次执行指令都带幂等键，重试也不会让 mock-platform 把同一个指令
-执行两次。
+超时 3 秒；只对超时、5xx、连接错误重试，最多 2 次（次数和退避基数见配置：第 N 次重试等
+base*N 秒，默认 0.5 秒和 1 秒，跟阶段二时一样，只是改成从配置读，不再写死在代码里）；
+4xx 不重试——4xx 是参数问题，重试不会变成 2xx。因为每次执行指令都带幂等键，重试也不会让
+mock-platform 把同一个指令执行两次。
 """
 import asyncio
 from typing import Any, Optional
@@ -16,7 +17,6 @@ settings = get_settings()
 logger = get_logger(__name__)
 
 _RETRYABLE_STATUS = {500, 502, 503, 504}
-_RETRY_BACKOFF_SECONDS = (0.5, 1.0)
 
 
 class PlatformUnavailable(Exception):
@@ -27,9 +27,10 @@ async def _request(
     method: str, path: str, *, json_body: Optional[dict] = None, params: Optional[dict] = None
 ) -> dict[str, Any]:
     last_error: Optional[BaseException] = None
-    for attempt in range(3):  # 1 次 + 最多 2 次重试
+    max_attempts = settings.platform_max_retries + 1
+    for attempt in range(max_attempts):
         if attempt > 0:
-            await asyncio.sleep(_RETRY_BACKOFF_SECONDS[attempt - 1])
+            await asyncio.sleep(settings.platform_retry_backoff_base_seconds * attempt)
         logger.info(
             "调用 mock-platform",
             method=method,

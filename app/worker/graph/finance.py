@@ -9,7 +9,7 @@ from typing import Any, Optional
 
 from sqlalchemy import select
 
-from app.common.finance_client import FinanceForbidden, FinanceUnavailable, fetch_finance_data
+from app.common.finance_client import FinanceCircuitOpen, FinanceForbidden, FinanceUnavailable, fetch_finance_data
 from app.common.logging import get_logger
 from app.common.masking import mask_bank_card, mask_email
 from app.common.models import AuditLog, FollowupStatus, FollowupTask, GuardianLink, User, UserRole
@@ -228,7 +228,10 @@ async def finance(state: GraphState, runtime) -> dict[str, Any]:
             "tools_meta": [{"name": "query_finance", "status": "forbidden"}],
         }
     except FinanceUnavailable as exc:
-        logger.warning("财务系统查询失败，记一条跟进任务", kind=kind, error=str(exc))
+        is_circuit_open = isinstance(exc, FinanceCircuitOpen)
+        logger.warning(
+            "财务系统查询失败，记一条跟进任务", kind=kind, error=str(exc), circuit_open=is_circuit_open
+        )
         await _write_audit_log(session, target_user=target_user, result="upstream_error", **audit_kwargs)
         await _write_followup_task(
             session,
@@ -239,10 +242,13 @@ async def finance(state: GraphState, runtime) -> dict[str, Any]:
             period=period,
             target_user_id=target_user_id,
         )
-        return {
+        result: dict[str, Any] = {
             "reply_plan": {"mode": "template", "text": FINANCE_UPSTREAM_ERROR_REPLY},
             "tools_meta": [{"name": "query_finance", "status": "upstream_error"}],
         }
+        if is_circuit_open:
+            result["circuit_breaker"] = list(state.get("circuit_breaker", [])) + ["finance"]
+        return result
 
     reply_text = _REPLY_BUILDERS[kind](data)
     await _write_audit_log(session, target_user=target_user, result="success", **audit_kwargs)

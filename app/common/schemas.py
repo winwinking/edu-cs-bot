@@ -30,8 +30,10 @@ class AckMessage(BaseModel):
 
     type: Literal["ack"] = "ack"
     message_id: str
-    status: Literal["accepted", "duplicate"]
+    status: Literal["accepted", "duplicate", "rate_limited"]
     trace_id: str
+    # 只有 rate_limited 会带这句话，客户端直接显示；accepted/duplicate 不需要额外文案
+    detail: Optional[str] = None
 
 
 class ReplyChunkMessage(BaseModel):
