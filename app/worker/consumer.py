@@ -13,6 +13,7 @@ from functools import partial
 import aio_pika
 from aio_pika.abc import AbstractExchange, AbstractRobustConnection
 
+from app.common.alerts import raise_alert
 from app.common.config import get_settings
 from app.common.logging import bind_trace_context, clear_trace_context, get_logger
 from app.common.mq import DEAD_QUEUE, INBOUND_QUEUE, INBOUND_ROUTING_KEY, declare_topology, get_confirm_channel, get_connection
@@ -65,6 +66,7 @@ async def _on_message(message: aio_pika.IncomingMessage, *, inbound_exchange: Ab
         await message.reject(requeue=False)
         messages_total.labels(result="dead_letter", intent="").inc()
         message_dead_letter_total.inc()
+        raise_alert("dead_letter", reason="malformed_body")
         process_seconds.observe(time.monotonic() - start)
         clear_trace_context()
         return
@@ -95,6 +97,7 @@ async def _on_message(message: aio_pika.IncomingMessage, *, inbound_exchange: Ab
             await message.reject(requeue=False)
             messages_total.labels(result="dead_letter", intent="").inc()
             message_dead_letter_total.inc()
+            raise_alert("dead_letter", reason="retries_exhausted", retry_count=retry_count)
     finally:
         process_seconds.observe(time.monotonic() - start)
         clear_trace_context()

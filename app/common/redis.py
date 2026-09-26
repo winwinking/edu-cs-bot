@@ -1,6 +1,7 @@
 """redis.asyncio 客户端，全项目共用一个连接池。"""
 from redis import asyncio as aioredis
 
+from app.common.alerts import raise_alert
 from app.common.config import get_settings
 from app.common.logging import get_logger
 
@@ -38,4 +39,5 @@ def note_redis_result(ok: bool) -> None:
         _redis_available = True
     elif not ok and _redis_available:
         logger.warning("Redis 不可用，已降级")
+        raise_alert("redis_unavailable")
         _redis_available = False

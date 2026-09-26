@@ -3927,3 +3927,247 @@ CI 的 `cp .env.example .env` 这一步被再次触发（`.env.example` 里这�
 （唯一 import `app.common` 的 mock 服务），其余 4 个 mock 服务不受影响。
 
 ---
+
+## 步骤 4.5：最小告警 + 19 种故障注入命令 + FAULT_INJECTION.md 骨架
+
+**日期**：2026-09-26
+
+**改动/新建模块**：
+- 新增 `app/common/alerts.py`：`raise_alert(alert_type, **fields)`，统一打一条
+  `level=error`、`event=alert`、带 `alert_type` 的结构化日志，同时把
+  `alerts_total{alert_type=...}`（Prometheus Counter）加一。
+- 修改 `app/common/circuit_breaker.py`：熔断从 closed/half_open 变成 open 的两处
+  （连续失败达到阈值、半开试探失败）各调用一次 `raise_alert("circuit_breaker_open", ...)`。
+- 修改 `app/worker/consumer.py`：消息进死信的两处（消息体解析失败、重试次数用完）各调用一次
+  `raise_alert("dead_letter", ...)`。
+- 修改 `app/common/redis.py`：`note_redis_result()` 里"可用变不可用"的翻转点调用一次
+  `raise_alert("redis_unavailable")`。
+- 新增四个故障注入专用小脚本（PHASE4.md 4.5 关键设计决定第 4 条允许"mockctl、
+  docker compose stop/start、小脚本都行"）：
+  - `scripts/bad_token_probe.py`：故障 2，现场签发一个过期/签名不对的 token 并直接连
+    gateway，打印拒绝结果，避免 Windows cmd 下用 `for /f` 传两条命令之间的变量
+  - `scripts/publish_malformed_message.py`：故障 7，绕过 gateway 直接往 `inbound.messages`
+    发一条 body 不是合法 JSON 的消息（gateway 自己的校验会挡住这种消息，没法从 WebSocket
+    这一层造出这个故障）
+  - `scripts/purge_dead_queue.py`：故障 7 的恢复，清空死信队列；不用已有的
+    `dlq_replay.py`——那条坏消息重投回去只会立刻再进一次死信
+  - `scripts/exhaust_token_budget.py`：故障 17，直接把某机构"今天"的 token 用量 Redis key
+    写成超大值（复用 `app.common.llm_usage._budget_key()` 同一份 key 算法），不用真的发几百万
+    字对话去刷预算
+- 新增 `docs/FAULT_INJECTION.md`：19 种故障各一节，每节两条命令（注入/恢复）+ 五个留空项
+  （Jo 的预测/现象/查了哪里/证据/原因与结论，由 Jo 亲手做故障演练时填），全部命令在本机
+  Windows cmd 里逐条跑过一遍确认真的生效（过程见下面"验证"）。
+
+**为什么这么做**：
+- 告警只加在这三个触发点、只做到"日志 + 指标"，不接真实通道：PHASE4.md 关键设计决定第 5 条
+  原文就是这么定的，接哪个通道留作已知问题。
+- 三处都调同一个 `raise_alert()` 而不是各自拼日志字段：保证格式统一（字段名、`event` 的值都
+  一样），以后想接真实通道，只用改这一个函数。
+- `raise_alert()` 不手动传 `trace_id`/`tenant_id`：三个触发点通常都在
+  `bind_trace_context()` 已经绑定过的协程上下文里（worker 处理一条消息、gateway 处理一次
+  WebSocket 连接），structlog 的 contextvars 处理器自动带上，不用重复传；本机验证时
+  `redis_unavailable` 这一条是从 `/health` 端点触发的，当时确实没有绑定 trace 上下文，日志里
+  就没有这两个字段——这是设计上"没有就不写"的预期结果，不是漏了。
+- 4 个新脚本都是"故障注入专用的一次性小工具"，不是业务代码，不会被生产镜像用到（`tools`
+  容器本身就不进生产部署，跟 4.2 那次"测试代码不进生产镜像"是两回事）。
+
+**验证**（原样输出，节选）：
+
+1）`docs/FAULT_INJECTION.md` 目录（19 种故障标题）：
+```
+入口：1 gateway 停了 / 2 token 错误或过期 / 3 用户刷消息触发限流 / 4 重复 message_id /
+5 RabbitMQ 停了
+worker：6 worker 停了、队列积压【必测】 / 7 格式坏的消息进死信【必测】 / 8 数据库停了
+下游：9 mock-llm 延迟 5 秒【必测】 / 10 mock-llm 返回 500 触发熔断【必测】 /
+11 mock-llm 返回幻觉内容【必测】 / 12 mock-llm 返回非法 JSON / 13 mock-finance 超时【必测】/
+14 mock-finance 返回 500【必测】 / 15 mock-platform 超时 / 16 知识库没命中 /
+17 机构 token 预算用完
+推送：18 Redis 重启【必测】 / 19 scheduler 停一段时间再启动
+```
+
+2）故障 10（mock-llm 500 触发熔断）连续发 5 条消息后，worker 日志里的 `event=alert` 原文：
+```
+{"alert_type": "circuit_breaker_open", "service": "llm", "reason": "failure_threshold_reached",
+"failures": 5, "event": "alert", "trace_id": "41a5e380f6b9419ca6ca1bf440fe4cdd",
+"tenant_id": "t_a", "level": "error", "timestamp": "2026-09-26T04:01:01.257123Z"}
+```
+
+3）故障 7（格式坏的消息进死信）的 `event=alert` 原文（顺带验证死信告警）：
+```
+{"alert_type": "dead_letter", "reason": "malformed_body", "event": "alert", "tenant_id": "t_a",
+"trace_id": "e382e3a0-cceb-4a38-b6da-26a463ac4913", "level": "error",
+"timestamp": "2026-09-26T03:54:29.737436Z"}
+```
+
+4）故障 18（Redis 重启）的 `event=alert` 原文（`redis_unavailable` 这条没有 trace_id/tenant_id，
+是从 `/health` 端点触发的，当时没有绑定 trace 上下文，符合前面"为什么这么做"里说的预期）：
+```
+{"alert_type": "redis_unavailable", "event": "alert", "level": "error",
+"timestamp": "2026-09-26T04:05:40.821386Z"}
+```
+
+5）19 种故障逐一跑过一遍注入 + 恢复，全部确认生效（不是猜的），关键几条摘录：
+- 故障 3（限流）：`rate_limit_burst.py` 打完 30 条，第 21 条起变成 `rate_limited`；
+  `redis-cli DEL` 两个 key 之后等窗口过期，重新打一轮，第 1 条又是 `accepted`
+- 故障 4（重复 message_id）：同一个 message_id 发两次，第二次 `[ack] status=duplicate`；
+  `redis-cli DEL dedup:...` 之后再发一次，变回 `[ack] status=accepted`
+- 故障 6（worker 停了）：`docker compose stop worker` 后发消息，
+  `rabbitmqctl list_queues` 看到 `inbound.messages` 有积压（3 条）；
+  `docker compose start worker` 后几秒内积压清零
+- 故障 8（数据库停了）：`docker compose stop postgres` 后 `curl /ready` 返回
+  `{"postgres":false,"redis":true,"rabbitmq":true}`（HTTP 503），gateway 进程本身没有崩、
+  没被 Docker 判定不健康重启；`docker compose start postgres` 后恢复成
+  `{"postgres":true,"redis":true,"rabbitmq":true}`
+- 故障 9（LLM 延迟 5 秒）：设置 `latency_ms=5000` 后一条消息（分类 + 生成两次调用）
+  `llm_ms` 记录到 10534.2（毫秒）
+- 故障 10（熔断）：见上面第 2 条；等 `cb_open_seconds`（30 秒）后再发一条消息触发半开试探
+  成功，`/metrics` 里 `worker_circuit_breaker_state{service="llm"}` 从 2 变回 0
+- 故障 13/14（财务超时/500）：回复都是"财务系统暂时查不到你的信息，这次查询我已记录，
+  稍后回复你。"，没有编造任何金额
+- 故障 15（平台超时）：确认关闭后回复"这次没有关闭成功，我已记录。你可以稍后再试，或者回复
+  "转人工"。"，`mockctl platform reset` 之后确认订阅状态（春季数学班 auto_renew）和 mode
+  一起恢复正常
+- 故障 18（Redis 重启）：见上面第 4 条；`curl /health` 从 `{"status":"degraded","redis":"down"}`
+  恢复成 `{"status":"ok","redis":"up"}`，gateway/worker 全程没有被重启
+- 全部验证完，`docker compose ps` 确认 11 个服务都是 healthy，
+  `rabbitmqctl list_queues` 确认 `inbound.messages`/`inbound.dead` 都是 0，
+  三个 mock 服务的 `/admin/config` 都确认已经 reset 回默认值，重新跑一遍 `make test`
+  （204 passed 1 skipped / 38 passed / 11 passed / 10 passed）全部通过
+
+**已知问题**：
+- 告警不接真实通道（钉钉/邮件/短信），只做到"结构化日志 + Prometheus 计数器"，PHASE4.md
+  关键设计决定第 5 条本身就是这么定的，不算遗漏。
+- 熔断器状态是每个 worker 进程自己内存里的（阶段三就记下的已知问题），多开几个 worker 副本时
+  熔断打开这条告警会在每个副本各打一次，不会互相同步。
+- 故障 2（token 错误/过期）、16（知识库没命中）、19（scheduler 停一段时间）这三种不需要改动
+  任何持久状态就能演示，恢复命令要么是空动作、要么只是重新验证一次正常路径。
+
+**计划外改动**：无（`docker-compose.yml`、`Makefile`、`docker/*.Dockerfile`、`.env.example`
+均未改动，故障注入用到的四个新脚本都在 `scripts/` 目录，走 `tools` 容器已有的挂载，不需要改
+镜像构建）。
+
+---
+
+## 检查点 F 审查：FAULT_INJECTION.md 里一条命令在 Windows cmd 下会解析出错
+
+**日期**：2026-09-26
+
+【人工审查发现】故障注入文档第 10 条（mock-llm 500 触发熔断）里查熔断器状态那条命令原来写的是：
+```
+docker compose port worker 8001
+curl -s http://localhost:<上一步打印的宿主机端口>/metrics | findstr worker_circuit_breaker_state
+```
+这是按"先查端口、再手动替换进 URL"这个思路写的，但 `<上一步打印的宿主机端口>` 这个占位符本身
+用了尖括号——在 Windows cmd 里 `<` 和 `>` 是输入/输出重定向符，不是普通字符，这一整行贴进 cmd
+不会提示"这是占位符记得替换"，而是直接按重定向语法解析出错，不算"能直接运行"。
+
+修复：不再依赖"先查宿主机映射端口、再手动拼 URL"这一步，改成让 `tools` 容器通过 docker 内部
+网络直接访问 `worker` 服务固定的容器内部端口 8001（`worker:8001`，不受宿主机端口映射范围
+影响），一条命令跑完，不需要人工替换任何东西：
+```
+docker compose run --rm tools python -c "import urllib.request; print(urllib.request.urlopen('http://worker:8001/metrics', timeout=5).read().decode())" | findstr worker_circuit_breaker_state
+```
+在 PowerShell 和 Git Bash 里都验证过这条新命令能正常跑出 `worker_circuit_breaker_state` 那几行。
+
+**改动文件**：`docs/FAULT_INJECTION.md`（只改了故障 10 这一处的"查熔断器状态"命令块，其余
+18 种故障的命令逐条检查过 `grep`/`$()`/`export`/单引号包裹 JSON/行尾反斜杠续行/`awk`/`sed`
+这几种 cmd 不支持的写法，均未发现，不需要改）。
+
+---
+
+## 检查点 F 审查：scripts/ 目录被 COPY 进 gateway/worker/scheduler 生产镜像
+
+**日期**：2026-09-26
+
+【人工审查发现】审查 4.5 时发现 `scripts/` 整个目录在 `docker/app.Dockerfile` 的 `base`
+构建阶段被 `COPY scripts/ ./scripts/`，而 gateway、worker、scheduler 用的都是这个 `base`
+阶段构建出来的镜像（`docker-compose.yml` 的 `x-app-build` 锚点 `target: base`），等于这三个
+对外提供服务的生产容器里都带着一整套操作脚本——其中包括能用 `JWT_SECRET` 现场签发 token 的
+（`gen_token.py`、`chat.py`、`rate_limit_burst.py`、`phase2_smoke.py`、`phase3_smoke.py`、
+`bad_token_probe.py`），也包括能重置/修改数据、清空死信队列的（`seed.py`、`reindex.py`、
+`dlq_replay.py`、`mockctl.py`、`publish_malformed_message.py`、`purge_dead_queue.py`、
+`exhaust_token_budget.py`）。这个问题从阶段一仓库初始化、`app.Dockerfile` 第一次写
+`COPY scripts/ ./scripts/` 起就存在，跟 4.2 修的"测试代码进生产镜像"是同一类问题，但当时
+没有一起查出来。
+
+**排查过程**：在 `Makefile`、`docker-compose.yml`、`README.md`、`docker/*.Dockerfile`、
+`scripts/demo.sh` 里搜了一遍所有调用 `scripts/` 下脚本的地方，确认 `make seed`（种子+重建
+索引）、`make reindex`、`make demo`（含 `demo.sh` 内部调的 `gen_token.py`/`ws_client.py`）、
+README 里列的所有命令行工具用法，全部是 `docker compose run --rm tools ...`，都跑在一次性的
+`tools` 容器里；`docker-compose.yml` 里 gateway/worker/scheduler 自己的启动命令是
+`python -m app.gateway.main`/`app.worker.main`/`app.scheduler.main`，`grep -rn "from scripts
+\|import scripts" app/` 也确认 `app/` 下的业务代码从不 import `scripts/` 里任何东西——三个
+生产服务的容器里从来没有任何一处真的需要用到镜像里的 `scripts/`。
+
+**修复**：`docker/app.Dockerfile` 把 `COPY scripts/ ./scripts/` 从 `base` 阶段挪到只有
+`tools` 才会构建到的 `FROM base AS tools` 阶段（挪到 `requirements-dev.txt`/`pytest.ini`
+那两行旁边，跟它们一样只在 `tools` 镜像里存在）。因为查出来的所有调用方式本来就都是走
+`tools` 容器，不依赖 gateway/worker/scheduler 容器里的 `scripts/`，`Makefile`、
+`docker-compose.yml`、`README.md` 都不需要改。
+
+**改动文件**：`docker/app.Dockerfile`。影响服务：gateway、worker、scheduler 的镜像（这三个
+从此不再带 `scripts/`）；`tools` 镜像不受影响（仍然带完整的 `scripts/`，因为一次性排障/演示/
+种子数据这些操作本来就该在 `tools` 容器里做）；5 个 mock 服务用的是 `docker/mocks.Dockerfile`，
+本来就没 `COPY scripts/`，不受影响。
+
+**验证**（原样输出，节选）：
+
+1）`docker compose build`：`app`/`mocks` 相关镜像全部 `Built`；另外单独
+`docker compose --profile tools build tools mocks-tools` 把两个一次性容器镜像也重新构建了
+（`docker compose build` 默认不构建带 `profiles` 的服务）：
+```
+Image edu-cs-bot/app:latest Built
+Image edu-cs-bot/mocks:latest Built
+Image edu-cs-bot/app-tools:latest Built
+Image edu-cs-bot/mocks-tools:latest Built
+```
+
+2）`make up` 之后 `docker compose ps`，11 个服务全部 healthy，没有一个 `Restarting`：
+```
+edu-cs-bot-gateway-1          Up 16 seconds (healthy)
+edu-cs-bot-mock-finance-1     Up 16 seconds (healthy)
+edu-cs-bot-mock-im-1          Up 16 seconds (healthy)
+edu-cs-bot-mock-knowledge-1   Up 16 seconds (healthy)
+edu-cs-bot-mock-llm-1         Up 16 seconds (healthy)
+edu-cs-bot-mock-platform-1    Up 16 seconds (healthy)
+edu-cs-bot-postgres-1         Up 3 hours (healthy)
+edu-cs-bot-rabbitmq-1         Up 3 hours (healthy)
+edu-cs-bot-redis-1            Up 3 hours (healthy)
+edu-cs-bot-scheduler-1        Up 16 seconds (healthy)
+edu-cs-bot-worker-1           Up 10 seconds (healthy)
+```
+
+3）`docker compose exec gateway ls /app/scripts` / `worker` / `scheduler`，三个都确认目录
+不存在：
+```
+ls: cannot access '/app/scripts': No such file or directory
+```
+（gateway、worker、scheduler 三个都是这条一模一样的报错）
+
+`docker compose run --rm tools ls /app/scripts`，能列出全部 20 个脚本（含本轮新增的
+`bad_token_probe.py`/`exhaust_token_budget.py`/`publish_malformed_message.py`/
+`purge_dead_queue.py`），跟移动前一致。
+
+4）`make test`：`204 passed, 1 skipped`（unit + 覆盖率）/ `38 passed`（mock-llm 规则）/
+`11 passed`（integration）/ `10 passed`（e2e），全部通过。
+
+5）`docker compose run --rm tools python scripts/phase2_smoke.py`：全部 9 个场景 PASS。
+`docker compose run --rm tools python scripts/phase3_smoke.py`：全部 6 个场景 PASS。
+
+6）`make demo`：三步都跑通（生成 token、发消息看三段耗时、重发同 message_id 看 duplicate）。
+终端上会打印一个真实 JWT（`demo.sh` 设计上就是打印给人看的演示脚本），这里按规则不贴真实值，
+用 `<demo.sh生成的token>` 代替；关键结果：`[ACK] status=accepted`，`[完整回复]` 正常生成，
+第二次 `[ACK] status=duplicate`。
+
+7）`docker compose run --rm tools python scripts/mockctl.py llm reset`：
+`[llm] 已重置：{"latency_ms": 300, "error_rate": 0.0, "mode": "normal"}`。
+
+验证完额外确认了 `finance`/`platform` 两个 mock 也是 `mode: normal`（之前几轮验证已经 reset
+过，这轮没有再动它们），`git status --porcelain` 只多了 `docker/app.Dockerfile` 一条
+`M`，其余是本轮之前几个检查点已经在等待确认的改动，没有新的意外改动。
+
+**已知问题**：无新增；`scripts/` 里仍然存在的"能签发 token/能改数据"的脚本本身没有减少，只是
+不再随 gateway/worker/scheduler 的生产镜像分发出去——这些脚本的存在本身（给排障/演示用）是
+PHASE 文档里明确要求的能力，不是需要消除的问题。
+
+---

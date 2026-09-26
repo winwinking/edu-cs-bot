@@ -12,7 +12,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app/ ./app/
 COPY alembic.ini .
 COPY migrations/ ./migrations/
-COPY scripts/ ./scripts/
 
 # 阶段四 4.2：tests/ 不 COPY 进这一阶段——gateway/worker/scheduler 是要跑起来对外提供服务的
 # 生产镜像，带着测试代码违反"测试代码不进生产镜像"的硬性规则。tools 是唯一需要跑 pytest 的
@@ -29,6 +28,16 @@ CMD ["python", "-m", "app.gateway.main"]
 # `build.target: tools`，其余服务用 `build.target: base`，两边镜像名也不同
 # （edu-cs-bot/app-tools:latest vs edu-cs-bot/app:latest），不会互相覆盖。
 FROM base AS tools
+
+# 阶段四检查点 F 审查发现：scripts/ 原来跟 app/ 一起 COPY 进上面的 base 阶段，导致
+# gateway/worker/scheduler 的生产镜像里也带着一整套操作工具脚本——里面既有能用 JWT_SECRET
+# 现场签发 token 的（gen_token.py/chat.py 等），也有能重置/修改数据、清空死信队列的
+# （seed.py/reindex.py/dlq_replay.py/mockctl.py 等）。这些脚本只在 `docker compose run tools
+# ...` 这种一次性排障/演示场景下才会被用到，gateway/worker/scheduler 自己的启动命令
+# （`python -m app.xxx.main`）和 Makefile 里的 migrate/seed/reindex/demo 从来不会在
+# gateway/worker/scheduler 容器里执行 scripts/ 下的任何文件，挪到只有 tools 才有的这个阶段
+# 不影响任何现有调用方式。
+COPY scripts/ ./scripts/
 
 COPY requirements-dev.txt .
 RUN pip install --no-cache-dir -r requirements-dev.txt

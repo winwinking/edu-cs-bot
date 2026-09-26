@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 
 from prometheus_client import Gauge
 
+from app.common.alerts import raise_alert
 from app.common.logging import get_logger
 
 logger = get_logger(__name__)
@@ -82,9 +83,11 @@ class CircuitBreaker:
             self._set_state("open")
             self._opened_at = time.monotonic()
             logger.warning("熔断试探请求失败，继续熔断", service=self.name)
+            raise_alert("circuit_breaker_open", service=self.name, reason="half_open_probe_failed")
             return
         self._failure_count += 1
         if self._failure_count >= self.failure_threshold and self._state != "open":
             self._set_state("open")
             self._opened_at = time.monotonic()
             logger.warning("连续失败达到阈值，熔断打开", service=self.name, failures=self._failure_count)
+            raise_alert("circuit_breaker_open", service=self.name, reason="failure_threshold_reached", failures=self._failure_count)
