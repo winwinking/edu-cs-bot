@@ -106,3 +106,83 @@ async def test_duplicate_message_still_detected_when_redis_healthy(monkeypatch):
 
     assert ws.sent[-1]["status"] == "duplicate"
     assert exchange.published == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_json_replies_with_error_and_does_not_publish():
+    ws = _FakeWebSocket()
+    exchange = _FakeExchange()
+
+    await handle_inbound_message(
+        ws, tenant_id="t_a", user_id="u_a_1001", raw_text="不是 JSON", exchange=exchange
+    )
+
+    assert ws.sent[-1]["code"] == "invalid_json"
+    assert exchange.published == []
+
+
+@pytest.mark.asyncio
+async def test_message_failing_schema_validation_replies_with_error():
+    ws = _FakeWebSocket()
+    exchange = _FakeExchange()
+    # 缺 content 字段，Pydantic 校验不通过
+    raw_text = json.dumps({"type": "message", "message_id": "m1", "conversation_id": "c1"})
+
+    await handle_inbound_message(ws, tenant_id="t_a", user_id="u_a_1001", raw_text=raw_text, exchange=exchange)
+
+    assert ws.sent[-1]["code"] == "invalid_message"
+    assert exchange.published == []
+
+
+@pytest.mark.asyncio
+async def test_publish_failure_rolls_back_dedup_key_so_retry_is_not_treated_as_duplicate(monkeypatch):
+    # 幂等的另一面：投递失败时如果不把刚写的去重键删掉，客户端稍后用同一个 message_id 重试
+    # 会被误判成"重复消息"而永远收不到处理，这段测的就是这个回滚
+    async def fake_rate_limit(tenant_id, user_id):
+        return True
+
+    monkeypatch.setattr(message_handler_module, "check_user_and_tenant_rate_limit", fake_rate_limit)
+    fake_redis = _FakeRedisClient()
+    monkeypatch.setattr(message_handler_module, "redis_client", fake_redis)
+
+    class _FailingExchange:
+        async def publish(self, message, *, routing_key: str, timeout: float) -> None:
+            raise RuntimeError("MQ 挂了")
+
+    ws = _FakeWebSocket()
+
+    await handle_inbound_message(
+        ws, tenant_id="t_a", user_id="u_a_1001", raw_text=_raw_message(), exchange=_FailingExchange()
+    )
+
+    assert ws.sent[-1]["code"] == "mq_publish_failed"
+    assert fake_redis.delete_calls == 1  # 去重键被回滚删除
+
+
+@pytest.mark.asyncio
+async def test_publish_failure_dedup_rollback_tolerates_redis_error(monkeypatch):
+    # 回滚去重键这一步自己也可能因为 Redis 又恰好挂了而失败，不能让这个失败盖掉真正的错误回复
+    async def fake_rate_limit(tenant_id, user_id):
+        return True
+
+    monkeypatch.setattr(message_handler_module, "check_user_and_tenant_rate_limit", fake_rate_limit)
+
+    class _FlakyDeleteRedisClient(_FakeRedisClient):
+        async def delete(self, key) -> None:
+            self.delete_calls += 1
+            raise RedisError("连不上")
+
+    fake_redis = _FlakyDeleteRedisClient()
+    monkeypatch.setattr(message_handler_module, "redis_client", fake_redis)
+
+    class _FailingExchange:
+        async def publish(self, message, *, routing_key: str, timeout: float) -> None:
+            raise RuntimeError("MQ 挂了")
+
+    ws = _FakeWebSocket()
+
+    await handle_inbound_message(
+        ws, tenant_id="t_a", user_id="u_a_1001", raw_text=_raw_message(), exchange=_FailingExchange()
+    )
+
+    assert ws.sent[-1]["code"] == "mq_publish_failed"

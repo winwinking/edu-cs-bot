@@ -2,6 +2,9 @@
 
 记录每个已完成步骤改了什么、关键设计决策是什么。"人工审查与修复点"由 Jo 填写。
 
+本文中出现的银行卡号、邮箱、手机号均为 mock 服务中编造的测试数据，出现在 grep 命令里的原值是
+用来验证日志脱敏的搜索关键字。
+
 ---
 
 ## 步骤 1.1：仓库初始化
@@ -3348,5 +3351,452 @@ $ docker compose run --rm tools python scripts/phase3_smoke.py
 满足 NFR-4 和"提醒操作可追踪"的要求，属于 agent 自查发现（不是 Jo 指出的），已按 Jo 的决定
 修复（只改 `app/scheduler/loop.py`）；gateway"连接断开"日志复用最后一条消息 trace_id 这一点，
 Jo 审查后决定保留，记为设计说明，不算问题。
+
+---
+
+## 步骤 4.1：丰富 mock 数据
+
+**改动**：
+- `mocks/mock_finance/main.py`：`_ACCOUNTS`（每个账号一笔订单）拆成三张表——`_ORDERS`
+  （`(tenant_id, user_id) -> 最近三个月各一笔订单`，每笔带 `months_ago`/发票状态/金额/课程名）、
+  `_REFUNDS`（退费状态，跟月份无关）、`_BALANCES`（余额）。新增 `_ym_offset(n)` 统一算"往前推
+  n 个月是哪年哪月"（处理跨年），`_last_month_ym()` 改成 `_ym_offset(1)` 的薄封装；
+  `_find_order_for_period()` 按月份从订单列表里挑一条。`/orders`/`/bills`/`/invoices` 三个
+  接口改成先查订单列表、按 `period` 精确匹配月份；`/refunds`/`/balance` 改查新表。
+  三个账号覆盖：u_a_1001 发票已开具+退费审核中+余额 120，u_a_1004 发票未开具+无退费记录+
+  余额 0，u_b_1001 发票已开具+退费已完成+余额 300——六种题目点名的状态都有着落。
+- `mocks/mock_platform/main.py`：`_DEFAULT_CONFIG`/`AdminConfigUpdate` 加 `queue_length`
+  （默认 3）、`avg_wait_minutes`（默认 5）两个字段，`/agents/status` 改成从配置读而不是写死
+  `3`/`5`，配合 mockctl 可以现场调排队人数。
+- `scripts/seed.py`：`TENANTS` 加 `daily_token_budget`（t_a=2000000，t_b=500000）；`main()`
+  里 tenants 的写入从 `ON CONFLICT DO NOTHING` 改成 `ON CONFLICT DO UPDATE`（按种子数据里
+  除 `id` 外的全部字段更新）——种子脚本要能重复跑，老环境里已经存在但字段还是旧值（比如
+  `daily_token_budget` 还是 `NULL`）的机构，重新跑一次 seed 就能追上最新配置；users/
+  guardian_links 不是"配置"，保持 `DO NOTHING`，不动。
+- `scripts/phase3_smoke.py`：`scenario_budget_degrade()` 测试前先 `SELECT` 出 t_b 当前的
+  `daily_token_budget` 真实值，改成 0 触发降级，测完恢复成"读到的原值"而不是硬编码 `NULL`——
+  t_b 现在种子数据里有真实预算（500000），再无脑改回 `NULL` 会把种子配置冲掉。
+
+**关键设计点**：
+1. 订单按月份存成列表、退费/余额单独建表，是因为 `/orders`、`/bills`、`/invoices` 三个接口
+   都带 `period` 参数、需要"不同月份返回不同数据"，而 `/refunds`、`/balance` 接口根本没有
+   `period` 参数、本来就是"账号级别的一个值"，两种数据的"变化维度"不一样，硬塞进同一张按月份
+   索引的表反而要重复三份退费/余额数据。
+2. `_ym_offset()` 用 `年*12+(月-1)-n` 再取商余的算法处理跨年，不是每次都判断"是不是 1 月"——
+   `_last_month_ym()` 原来的实现只处理了"减 1 个月"这一种跨年情况，`months_ago` 现在要支持
+   1/2/3，继续用 if 分支判断会越写越啰嗦，换算法本身就能处理任意偏移量。
+3. seed.py 的 tenants 改成 `DO UPDATE`：这是本阶段唯一一处从"只插入不更新"改成"更新"的种子
+   数据，因为机构级配置（预算、服务时间、时区）理应"以代码里的种子数据为准，重新种一次就生效"，
+   跟"用户/家长关联这类业务数据不该被种子脚本覆盖"是两个不同的语义，所以只改了 tenants 这一处，
+   没有连带改 users/guardian_links。
+
+**验证**：
+
+1）三个用户的订单/退费/余额（mock-finance 是外部系统，数据在它自己的内存里，不在我们的
+Postgres 里，`scripts/sql.py` 查不到——这一点跟 PHASE4.md 原文"用 scripts/sql.py 查"的说法
+不一致，是本阶段发现的一处文档和架构的偏差，详见下面"计划外/偏差说明"，改用
+`scripts/finance_probe.py` 直接查 mock-finance）：
+```
+== t_a/u_a_1001 ==
+-- 上月发票 --
+{"invoices":[{"order_no":"EDU-20260812-8831","amount":2399.0,"status":"已开具","sent_at":"2026-08-18","email":"l***@example.com"}]}
+-- 退费 --
+{"refunds":[{"status":"审核中","amount":2399.0,"bank_card":"尾号 7890"}]}
+-- 余额 --
+{"balance":120.0}
+== t_a/u_a_1004 ==
+-- 上月发票 --
+{"invoices":[{"order_no":"EDU-20260805-1122","amount":1899.0,"status":"未开具","sent_at":null,"email":null}]}
+-- 退费 --
+{"refunds":[]}
+-- 余额 --
+{"balance":0.0}
+== t_b/u_b_1001 ==
+-- 上月发票 --
+{"invoices":[{"order_no":"EDU-20260820-2233","amount":2599.0,"status":"已开具","sent_at":"2026-08-20","email":"l***@example.com"}]}
+-- 退费 --
+{"refunds":[{"status":"已完成","amount":300.0,"bank_card":"尾号 7890"}]}
+-- 余额 --
+{"balance":300.0}
+```
+另外用显式 `period`（2026-07/2026-06）验证了 u_a_1001/u_a_1004 两个月前、三个月前的订单也各不
+相同（课程名、金额、发票状态都不一样），证明"多笔订单"不是同一条数据换了个月份标签。
+
+2）坐席在线/不在线切换：
+```
+$ python scripts/mockctl.py platform agents_online=false
+$ python scripts/chat.py --tenant t_a --user u_a_1001 --conv s41_offline "转人工"
+人工客服现在不在线，服务时间是每天 9:00 至 21:00。你可以直接在这里留言，我会连同刚才的情况一起转给客服，上班后优先回复你。
+
+$ python scripts/mockctl.py platform agents_online=true
+$ python scripts/chat.py --tenant t_a --user u_a_1001 --conv s41_online "转人工"
+已为你转接人工客服，前面还有 3 位，预计 5 分钟接入。刚才的情况我已经同步给客服，不用再重复描述。
+```
+额外验证排队人数可调（PHASE4.md 原文要求）：`mockctl.py platform queue_length=8
+avg_wait_minutes=12` 之后再发一次"转人工"，回复变成"前面还有 8 位，预计 12 分钟接入"，验证完
+`mockctl.py platform reset` 复原。
+
+3）tenants 表预算：
+```
+$ python scripts/sql.py "select id, daily_token_budget from tenants order by id"
+id      daily_token_budget
+t_a     2000000
+t_b     500000
+```
+
+4）`phase3_smoke.py` 预算降级场景 + 恢复验证：
+```
+$ python scripts/sql.py "select id, daily_token_budget from tenants where id='t_b'"
+t_b     500000
+$ python scripts/phase3_smoke.py
+[PASS] 场景(预算) 机构预算耗尽降级并恢复：...
+全部 6 个场景 PASS
+$ python scripts/sql.py "select id, daily_token_budget from tenants where id='t_b'"
+t_b     500000
+```
+预算值全程是 500000，没有被测试脚本改成 `NULL` 或漏恢复。
+
+同时跑了 `phase2_smoke.py`（9 个场景全 PASS）和 `pytest tests/unit -q`（182 passed, 1
+skipped）确认订单数据结构改动没有影响阶段二、三已有的场景。
+
+**计划外改动/偏差说明**：
+- PHASE4.md 4.1 验证要求"用 `scripts/sql.py` 查三个用户的订单"，但订单数据从阶段二起就一直
+  存在 mock-finance 自己的内存里（`_ORDERS` 这几个字典），不在我们的 Postgres 数据库里——
+  mock-finance 是"假的外部系统"，这是阶段二就定下的设计（financial 数据不进本地库，逼着财务
+  查询走真实的"调外部系统"路径，不能绕过网络调用直接读库）。`scripts/sql.py` 只连
+  Postgres，查不到这些数据，属于 PHASE4.md 文档描述和现有架构对不上，不是这次引入的新问题。
+  改用 `scripts/finance_probe.py`（阶段二就有的工具，直接以某人身份请求 mock-finance）验证，
+  效果等价（同样能看到 order_id/状态/金额），已经在上面"验证"第 1 条注明。
+
+**人工审查与修复点**：
+【人工审查发现，检查点 E】上面"验证"第 1 条把 `finance_probe.py` 的原始返回原样贴了进去，
+里面带了 u_a_1001、u_b_1001 两个账号完整的邮箱地址和银行卡号——这些是 mock-finance 里编造
+的测试数据，不是真实用户信息，但仍然违反"日志/文档不留敏感信息原文"这条硬性规则的精神，
+AGENT_LOG.md 会被提交进 git，跟真实密钥/token 不能进仓库是同一个道理。已改成脱敏形式（邮箱按
+`app/common/masking.py` 的 `mask_email()` 规则脱敏，银行卡按 `mask_bank_card()` 的规则只留
+后四位）。同时在 AGENT_LOG.md 开头加了一段说明：文中出现的银行卡号/邮箱/手机号都是 mock
+数据，历史记录里 grep 命令用到的原值是拿来当搜索关键字验证"日志里查不到这个值"用的，不是
+泄漏，予以保留、不做改动。
+
+---
+
+## 步骤 4.2：单元测试与覆盖率、测试代码不进生产镜像、CI
+
+**改动**：
+- `requirements.txt`：新增 `pytest-cov==7.1.0`（及其依赖 `coverage==7.16.1`），按项目约定的
+  流程（装上、`pip freeze`、整体替换）锁版本号。
+- `docker/app.Dockerfile`、`docker/mocks.Dockerfile`：**不再 `COPY tests/` 进镜像**（阶段二
+  就记下的已知问题）。改成 `COPY pytest.ini .`（新文件，见下）。
+- `docker-compose.yml`：`tools` 服务加一条 `volumes: ./tests:/app/tests:ro`——测试代码不进
+  镜像之后，`tools` 这个一次性容器靠运行时挂载拿到 `tests/`，只读即可，不需要重新构建镜像
+  就能跑到最新测试代码。新增 `mocks-tools` 服务（复用 `mocks` 镜像、`profiles: ["tools"]`、
+  同样挂载 `./tests:/app/tests:ro`、`restart: "no"`）——`tests/unit/test_mock_llm_rules.py`
+  要 `import mocks.mock_llm.rules`，只有 mocks 镜像里有这个包，不能用 `tools`（app 镜像）跑；
+  又不能像以前那样直接 `docker compose run --rm mock-llm pytest ...`，因为 mock-llm 是要一直
+  跑着对外提供服务的容器，不该有 `tests/` 挂载，所以单独开一个 profile=tools 的一次性服务。
+- `pytest.ini`（新文件）：`asyncio_mode = strict` + `asyncio_default_test_loop_scope =
+  session`。写 tests/integration 时发现，`app.common.db.AsyncSessionLocal`/`app.common.redis.
+  redis_client` 这些模块级单例背后的连接池绑定在"第一次被用到时那个事件循环"上，
+  pytest-asyncio 默认每个测试函数各开一个新事件循环（function 级），第二个用到这些单例的
+  测试就会报 `RuntimeError: ... attached to a different loop`；改成整次 pytest 运行共用一个
+  事件循环（跟 `scripts/phase2_smoke.py` 等冒烟脚本"一个 `asyncio.run()` 跑到底"是同一个思路）
+  就不再出这个问题。tests/unit 不连真实 DB/Redis（该 mock 的地方都用假对象替掉了），这个改动
+  对它们没有影响。
+- `Makefile`：`test` 目标从"待实现"改成依次跑 unit（带核心模块覆盖率）、mock-llm 规则测试
+  （通过 `mocks-tools`）、integration、e2e 四层，任何一层失败（非 0 退出码）整体失败。
+- `tests/unit/test_worker_handler_idempotency.py`（新文件）：覆盖 `app/worker/handler.py`
+  的幂等核心逻辑——`_upsert_user_message` 的 inserted/retry/done 三种结果、`_resolve_
+  conversation` 的新建/已存在且归属正确/越权/两个 worker 并发创建同一会话的竞态四种情况、
+  `_metric_result` 纯函数、`_load_recent_messages`/`_insert_assistant_message`/`_mark_user_
+  message_replied` 三个辅助函数、`process_inbound_message` 里不碰 LangGraph 的两条早返回分支
+  （forbidden/duplicate）。手写一个 `_FakeSession`（按调用顺序消费预置的 `execute` 结果，
+  `add`/`flush`/`rollback`/`commit` 只记调用次数），不连真实数据库，跟 tests/unit 里其它文件
+  手写假对象是同一个思路。
+- `tests/unit/test_gateway_rate_limit_dedup.py`：补了三个测试——非法 JSON、Pydantic 校验
+  失败、MQ 投递失败时回滚刚写的去重键（含"回滚这一步自己也失败"的兜底分支）。
+- `tests/unit/test_mock_llm_rules.py`：docstring 更新，说明现在要用 `mocks-tools` 而不是
+  直接 `docker compose run --rm mock-llm pytest ...`（原因见上面 `docker-compose.yml` 那条）。
+
+**关键设计点**：
+1. 六类核心模块选的是：意图路由→`app/worker/graph/classify.py`、权限校验→`app/common/
+   permissions.py`、幂等→`app/gateway/message_handler.py`（Redis 层去重）+ `app/worker/
+   handler.py`（DB 层去重，两层各自独立防线，见 3.4/3.5 设计）、脱敏→`app/common/masking.py`、
+   日程规则→`app/common/reminder_rules.py`、工具参数校验→`app/common/tools.py`。**没有把
+   `app/worker/graph/graph.py`（`_route()` 所在文件）算进"意图路由"这一类**：`_route()` 本身
+   只有十几行、职责是"根据已经分类好的 intent 决定分派到哪个 LangGraph 节点"，但这个文件
+   剩下 100 多行是 `_build_graph()`/`_timed()` 这类图搭建/打点的胶水代码，硬凑 70% 覆盖率
+   要么逼着我给这些胶水代码写没有实际意义的测试，要么把统计口径做窄到只算 `_route()` 那几行、
+   跟"文件覆盖率"这个说法本身对不上，所以选了真正做"意图判断"这件事的 `classify.py` 作为
+   代表，`_route()` 的路由分支已经被 `tests/unit/test_classify_confirm_boundaries.py` 等既有
+   测试间接跑到（通过 `phase2_smoke.py`/`phase3_smoke.py` 走过全部业务分支）。
+2. `app/worker/handler.py` 原来只有 28%（`_upsert_user_message` 这个真正的幂等判断逻辑完全
+   没测），是本阶段发现的一处覆盖率缺口，不是"为了凑数字硬测"——这个函数正是题目 6.1 明确点名
+   要覆盖的"幂等"，之前完全没有单元测试，只靠 `phase2_smoke.py` 场景 9（重复 `message_id`）
+   间接覆盖过"inserted"和"done"两条路径，"retry"（上次处理到一半崩溃）这条路径此前没有任何
+   测试覆盖过。
+3. `process_inbound_message` 本身（整个函数 85 行里最大的一段）故意没有强行冲高覆盖率：它
+   要调真实的 `COMPILED_GRAPH.ainvoke` 和 `respond()`，属于"部件接在一起"的集成行为，不是
+   单一函数的判断逻辑，硬用假对象把整个 LangGraph 图 mock 掉换来的覆盖率数字没有实际验证
+   价值——这条路径已经被 4.4 的 10 个 E2E 场景真实跑过完整链路，符合 PHASE4.md"单元/集成/
+   E2E 三层各测各的，不是所有代码都该出现在同一层"的分工原则。
+4. CI 只接了 unit 这一层（不是 unit+integration+e2e 一起跑）：`docs/PHASE4.md` 4.2 原文
+   明确写"加 GitHub Actions：push 到 main 时自动跑 unit 测试"，只提了 unit；integration/e2e
+   要起完整的 docker compose（postgres/redis/rabbitmq/5 个 mock/gateway/worker/scheduler），
+   跑起来慢得多，且第一次跑要在 CI 里 build 好几个镜像，成本和当前"最小可用 CI"的定位不符，
+   放进已知问题/后续规划里更合适，没有擅自扩大范围。
+
+**验证**：
+
+1）覆盖率报告（核心模块 + 总计）：
+```
+Name                             Stmts   Miss  Cover   Missing
+--------------------------------------------------------------
+app/common/masking.py               21      0   100%
+app/common/permissions.py           16      0   100%
+app/common/reminder_rules.py        61      1    98%   96
+app/common/tools.py                117      2    98%   59, 150
+app/gateway/message_handler.py      83      0   100%
+app/worker/graph/classify.py       155     28    82%   ...
+app/worker/handler.py               85     15    82%   186-234
+--------------------------------------------------------------
+TOTAL                              538     46    91%
+200 passed, 1 skipped in 9.61s
+```
+六类核心模块全部 ≥70%（最低 82%），总计 91%。`app/worker/handler.py` 剩下没覆盖的 186-234 行
+就是上面第 3 条设计点说的 `process_inbound_message` 主干（依赖真实 LangGraph 图），符合预期。
+
+2）`mocks-tools` 跑 mock-llm 自身规则测试，不再被跳过：
+```
+$ docker compose run --rm mocks-tools pytest tests/unit/test_mock_llm_rules.py -q
+......................................                                   [100%]
+38 passed in 0.35s
+```
+
+3）`docker compose run --rm --no-deps <gateway|worker|mock-llm> ls /app`，均无 `tests`：
+```
+[gateway] alembic.ini  app  migrations  pytest.ini  requirements.txt  scripts
+[worker]  alembic.ini  app  data  migrations  pytest.ini  requirements.txt  scripts
+[mock-llm] app  mocks  pytest.ini  requirements.txt
+```
+（这是本步骤当时的状态，`pytest.ini` 那会儿还在里面；检查点 E 审查后已经改成两阶段构建，
+`pytest.ini`/`pytest` 本体都不在这几个服务的镜像里了，最新验证见下面"人工审查与修复点"。）
+
+4）`.github/workflows/ci.yml` 全文见仓库该路径，内容摘要：`on: push branches: [main]`，单个
+job `unit-tests`，步骤为 checkout → `cp .env.example .env` → `docker compose build tools` →
+跑 `pytest tests/unit` 并输出覆盖率报告（`--cov` 参数跟本地/Makefile 完全一致）。
+
+**计划外改动**：新增 `pytest.ini`（见上面"关键设计点"第 1 条改动列表），不是 PHASE4.md
+点名要做的事，是写 tests/integration 时被 `RuntimeError: attached to a different loop`
+逼出来的必需修复——不加这个配置，tests/integration 和 tests/e2e 里任何用到真实数据库/Redis
+的测试，只要文件里有第二个测试函数就必定失败。（这个文件原本被 `app.Dockerfile`/`mocks.
+Dockerfile` COPY 进镜像根目录，检查点 E 审查后已经改成只进 `tools` 构建阶段，详见下面
+"人工审查与修复点"。）
+
+**人工审查与修复点**：
+【人工审查发现，检查点 E】审查这一步时发现，本轮新加的 `pytest-cov`/`coverage`（还有本轮新加
+的 `pytest.ini`）被 `docker/app.Dockerfile`、`docker/mocks.Dockerfile` 直接 COPY/装进了
+gateway/worker/scheduler 和 5 个 mock 服务共用的生产镜像，跟 4.2 本身"测试代码不进生产镜像"
+这条目标冲突——测试工具不该出现在跑起来对外提供服务的容器里，即使不是"代码"本身也一样。
+追查发现范围比这次新加的还大：`pytest==9.1.1`、`pytest-asyncio==1.4.0` 从阶段一起就直接写在
+`requirements.txt` 里，生产镜像其实一直带着测试框架本体，只是这次加 `pytest-cov` 之后才被
+审查揪出来。
+
+修复方式：测试相关的依赖整体拆到新文件 `requirements-dev.txt`（`pytest`/`pytest-asyncio`/
+`pytest-cov`/`coverage`，以及经过实测确认只有它们才需要的间接依赖 `iniconfig`/`pluggy`/
+`Pygments`——用一次干净环境只装生产依赖、对比 `pip freeze` 结果的方式实测出来的，不是猜的）；
+两个 Dockerfile 都改成两段构建：`base` 阶段（只装 `requirements.txt`，不含 `pytest.ini`，
+gateway/worker/scheduler/5 个 mock 服务用这一阶段）+ `tools` 阶段（`FROM base`，多装
+`requirements-dev.txt`、多 `COPY pytest.ini .`，只有 tools/mocks-tools 用这一阶段）；
+`docker-compose.yml` 里 `x-app-build`/`x-mocks-build` 两个锚点显式加 `build.target: base`，
+`tools`/`mocks-tools` 两个服务改成各自独立的镜像名（`edu-cs-bot/app-tools:latest`、
+`edu-cs-bot/mocks-tools:latest`）+ `build.target: tools`，不再复用锚点里的 `image`/`build`——
+避免两个不同 target 的构建结果争抢同一个镜像 tag，谁后构建就把谁盖过去。
+
+改动的 5 个文件：`requirements.txt`（删掉 7 行测试相关依赖）、新增 `requirements-dev.txt`、
+`docker/app.Dockerfile`、`docker/mocks.Dockerfile`、`docker-compose.yml`。
+
+验证（原样输出）：
+```
+$ docker compose exec gateway python -c "import pytest"
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'pytest'
+
+$ docker compose exec worker python -c "import pytest"
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'pytest'
+
+$ docker compose exec mock-llm python -c "import pytest"
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'pytest'
+
+$ docker compose exec gateway ls /app/pytest.ini
+ls: cannot access '/app/pytest.ini': No such file or directory
+```
+`make test` 重新跑一遍，四层仍然全部通过（`EXIT_CODE=0`）；`phase2_smoke.py`（9 个场景 PASS）、
+`phase3_smoke.py`（6 个场景 PASS）确认拆分依赖之后业务功能没受影响。
+
+---
+
+## 步骤 4.3：集成测试
+
+**新增**：`tests/integration/_helpers.py`（连接 gateway/DB/RabbitMQ 的公用小工具，抄自
+`scripts/phase2_smoke.py`/`phase3_smoke.py` 的写法，给 pytest 用例复用）+ 5 个测试文件，
+共 11 个用例，覆盖题目 6.2 点名的六项（IM 入站、队列各算半项，其余四项各一个文件）：
+
+- `test_im_inbound_and_queue.py`：① gateway 收到消息回 ACK、RabbitMQ 里多一条（用 RabbitMQ
+  management API 的 `message_stats.publish` 累计计数算差值，不直接比"当前队列长度"——那个数字
+  会被 worker 很快消费掉，比很容易 flaky）；② worker 消费后 ack（同样用 `message_stats.ack`
+  累计计数算差值）；③ 格式坏的消息（缺 `content` 字段）直接绕过 gateway 发到 `im.inbound`
+  交换机，确认落进 `inbound.dead` 死信队列。
+- `test_llm_mock_tool_call.py`：直接调 `app.common.llm_client.chat_completion` 打真实网络
+  请求到 mock-llm，喂给 `app.common.tools.parse_tool_call` 做 JSON Schema 校验，确认财务
+  问题、平台指令两种场景都能拿到结构化、能通过校验的工具调用。
+- `test_knowledge_retrieval_tenant_isolation.py`：用 `t_b` 独有的活动条款关键词"三人拼团"
+  （`t_a` 对应位置是"老带新"，两边用词完全不同）当查询词，t_a 查不到、t_b 能查到，证明
+  `WHERE tenant_id = :tenant_id` 这条过滤真的生效，不是"看起来对但其实没测出问题"。
+- `test_finance_mock_auth.py`：直接调 `fetch_finance_data`，正确 token+自己的数据能查、
+  没有关联关系的越权查询抛 `FinanceForbidden`（对应 mock-finance 返回 403）、家长查真正
+  关联的学员能放行（反证：拒绝的原因是没有关联关系，不是这个 `acting_user_id` 被写死拒绝）。
+- `test_reminder_scheduler_push.py`：直接插一条马上到期的 `Reminder`（不经过 worker 的
+  `manage_reminder` 工具调用，因为这里测的是 scheduler 这个组件本身），订阅 Redis 频道
+  确认 5 秒内收到推送，再查数据库确认 `repeat=daily` 的下一次触发时间被正确算出来（往后推
+  了一天以上）。
+
+**关键设计点**：
+1. RabbitMQ management API 的 `message_stats` 是按固定间隔（约 5 秒）汇总的快照，不是发布
+   那一刻就实时更新——第一版直接查一次就断言失败了（`90 == 90+1`），改成轮询到差值出现再
+   断言，符合"外部系统的可观测数据有采集延迟"这个现实。
+2. worker 和 scheduler 都是"先把结果发给外部（客户端/Redis），发完再落库/更新状态"（分别是
+   `app/worker/handler.py` 的"先 respond() 再插入 assistant 消息"、`app/scheduler/loop.py`
+   的"先推送再提交"这两条既有设计决定），意味着"客户端收到消息"和"对应的数据库写入完成"之间
+   有一次数据库网络往返的时间差。第一版测试查一次数据库就断言，在完整跑 `tests/integration`
+   全部 11 个用例时偶发 `NoResultFound`/字段还是旧值，单独跑这一个文件反而不出现（因为
+   单独跑时机器负载低、这个时间差短到可以忽略）——加轮询之后跑了 3 次都稳定通过。
+3. `tests/integration/test_reminder_scheduler_push.py` 直接操作数据库插入 `Reminder`，不
+   走 WebSocket 发消息创建：这里要测的是 scheduler 这一个组件本身（真的每秒扫描、真的推
+   Redis、真的按重复规则算下一次时间），跟"用户怎么创建提醒"是两件不同的事，后者归 tests/e2e
+   场景 5 管（4.4）。
+
+**验证**：
+```
+$ docker compose run --rm tools pytest tests/integration -v
+tests/integration/test_finance_mock_auth.py::test_correct_token_and_own_data_succeeds PASSED
+tests/integration/test_finance_mock_auth.py::test_cross_user_query_without_guardian_link_is_forbidden PASSED
+tests/integration/test_finance_mock_auth.py::test_guardian_link_allows_parent_to_query_linked_student PASSED
+tests/integration/test_im_inbound_and_queue.py::test_gateway_ack_and_publish_to_rabbitmq PASSED
+tests/integration/test_im_inbound_and_queue.py::test_worker_consumes_and_acks_the_message PASSED
+tests/integration/test_im_inbound_and_queue.py::test_malformed_message_goes_to_dead_letter_queue PASSED
+tests/integration/test_knowledge_retrieval_tenant_isolation.py::test_tenant_a_cannot_retrieve_tenant_b_only_clause PASSED
+tests/integration/test_knowledge_retrieval_tenant_isolation.py::test_tenant_b_can_retrieve_its_own_clause PASSED
+tests/integration/test_llm_mock_tool_call.py::test_mock_llm_returns_structured_tool_call_for_finance_question PASSED
+tests/integration/test_llm_mock_tool_call.py::test_mock_llm_returns_structured_tool_call_for_platform_command PASSED
+tests/integration/test_reminder_scheduler_push.py::test_due_reminder_is_pushed_within_5_seconds_and_next_trigger_is_recomputed PASSED
+
+============================== 11 passed in 8.81s ===============================
+```
+连跑 3 次（含排查上面第 2 条时间差问题期间的重跑）都是 11 passed，没有出现间歇性失败。
+
+**人工审查与修复点**：本轮尚未经 Jo 审查，检查点 E 反馈后回填。
+
+---
+
+## 步骤 4.4：E2E 测试（题目 6.3 的 10 个场景）
+
+**新增**：`tests/e2e/_helpers.py`（直接复用 `tests/integration/_helpers.py`，E2E 和
+integration 的区别是"测不测完整用户可见链路"，不是连接方式，没必要抄两份）+ 10 个测试文件
+`test_e2e_01_*` 到 `test_e2e_10_*`，每个场景一个文件、一个测试函数，都从 WebSocket 发消息
+进去，每个检查三件事（回复内容 / 数据库状态 / meta 或审计）。
+
+**关键设计点**：
+1. 每个场景的 `conversation_id` 用 `uuid5(tenant, user, 独立标签)` 生成，标签里带一段
+   `uuid4` 后缀（如 `e2e_s1_a1b2c3d4`），保证每次跑测试都是全新会话，不会跟
+   `scripts/phase2_smoke.py`（用的是 `s1`/`s2` 这种固定标签）或者上一次测试运行撞到同一个
+   会话，也不用在测试结束时清理数据。
+2. **发现并修了两处赶工时的问题**（写完第一版全量跑 `tests/e2e` 才暴露出来，不是设计阶段
+   就想到的）：
+   - 场景 5（提醒推送）第一版用"最近一条 `intent=reminder_push` 的消息"来找 scheduler
+     写的推送记录，`t_a` 机构下如果同时有其它提醒（哪怕是别的测试、别的用户）在差不多的时间
+     触发，会挑到错的那一条。改成按 `meta.reminder_id` 精确匹配这条自己创建的提醒
+     （`Message.meta["reminder_id"].astext == str(reminder_id)`，JSONB 字段过滤）。
+   - 场景 8（LLM 非法 JSON 兜底）第一版断言用错了话术常量：写成了 `FALLBACK_LLM_
+     UNAVAILABLE_REPLY`（"系统这会儿有点忙……"，这句对应的是"LLM 调不通/熔断"），而
+     `invalid_json` 模式对应的实际是 `FALLBACK_INVALID_OUTPUT_REPLY`（"这句话我没能准确
+     理解……"）——两条兜底话术语义不同（一个是"稍后再试"，一个是"换个说法"），写测试时看错了
+     常量名，跑起来直接断言失败，不是隐藏很深的 bug，改对常量即可。
+   - 这两处都是**跟 3.2 节"步骤 4.3 关键设计点第 2 条"同一类"先发给客户端/发布到 Redis、
+     再落库"的时序问题**：场景 1（知识问答）、2（发票查询）落库的 assistant 消息，场景 5
+     scheduler 写的推送消息，都补了轮询（`tests/e2e/_helpers.py` 新增的 `poll_until()`），
+     不是查一次数据库就断言。
+3. 场景 4（关闭自动续费）验证"mock-platform 只被真正调用了一次"时，用请求确认阶段返回的
+   `pending_action_id` 拼出跟 `app/worker/graph/command.py` 里完全相同的 `idempotency_key`
+   格式（`{tenant_id}:{conversation_id}:{action}:{pending_id}`），再去 `/admin/commands`
+   精确匹配这一条，而不是数"这个用户这个动作总共被调用了几次"——后者在测试反复运行、`u_a_
+   1001` 名下积累了多次历史调用记录之后会不准确。同时在测试开头 `reset_mock("platform")`，
+   避免"春季数学班"因为之前跑过 `phase2_smoke.py` 或本文件自己已经是关闭状态，导致直接落进
+   "已经是关闭状态"分支、测不出真正的确认流程。
+4. 场景 10（知识库无命中）验证"没有调 LLM 生成"时，没有去 mock `chat_completion` 断言它
+   没被调用（respond() 内部调用方式跟这条业务分支强耦合，mock 起来脆），改用已有的分段耗时
+   打点（阶段三第 8 步引入的 `meta.timings`）：`respond` 阶段耗时如果 <200ms，只可能是走了
+   模板直出分支，真的调一次 LLM 生成（意图识别之外还要再叠加一次流式生成）耗时不可能这么短——
+   拿场景 1（真的命中知识库、走生成分支）的 `timings.respond` 实测值（通常 >1000ms）作对照。
+
+**验证**：
+```
+$ docker compose run --rm tools pytest tests/e2e -v
+tests/e2e/test_e2e_01_knowledge_policy.py::test_knowledge_policy_question_cites_knowledge_base PASSED
+tests/e2e/test_e2e_02_finance_invoice_masking.py::test_invoice_query_reply_and_stored_message_are_both_masked PASSED
+tests/e2e/test_e2e_03_finance_cross_user_forbidden.py::test_user_a_querying_user_b_finance_is_forbidden_end_to_end PASSED
+tests/e2e/test_e2e_04_disable_auto_renew_confirmation.py::test_disable_auto_renew_requires_confirmation_then_executes_exactly_once PASSED
+tests/e2e/test_e2e_05_reminder_push.py::test_reminder_created_via_chat_is_pushed_within_5_seconds PASSED
+tests/e2e/test_e2e_06_handoff_with_summary.py::test_handoff_ticket_carries_summary_intent_and_attempted_actions PASSED
+tests/e2e/test_e2e_07_finance_timeout_no_fabrication.py::test_finance_timeout_does_not_fabricate_and_records_followup PASSED
+tests/e2e/test_e2e_08_llm_invalid_json_fallback.py::test_llm_invalid_json_falls_back_without_executing_any_tool PASSED
+tests/e2e/test_e2e_09_duplicate_message_id.py::test_duplicate_message_id_is_only_processed_once PASSED
+tests/e2e/test_e2e_10_knowledge_no_hit.py::test_knowledge_no_hit_does_not_fabricate_and_skips_llm_generation PASSED
+
+============================= 10 passed in 14.69s ==============================
+```
+连跑 3 次都是 10 passed。另外跑了一次完整 `make test`（unit -> mock-llm 规则 -> integration
+-> e2e 四层顺序执行），全部通过，最后一层输出同上。
+
+**人工审查与修复点**：
+【人工审查发现，检查点 E】场景 4（`test_e2e_04_disable_auto_renew_confirmation.py`）原来验证
+"mock-platform 只被真正调用了一次"时，在测试里自己拼了一份跟 `app/worker/graph/command.py`
+里完全相同的 `idempotency_key` 格式（`{tenant_id}:{conversation_id}:{action}:{pending_id}`）
+去精确匹配。这样做和业务代码的实现细节耦合太紧：如果业务代码生成 key 的公式本身有 bug（比如
+漏掉某个字段导致同一会话下两次不同的确认操作会撞出同一个 key），测试和业务代码用的是同一个
+（有问题的）公式，测试永远发现不了这类问题；而且原来的测试只制造了一次"确认关闭"，没有测过
+"重复确认会不会重复执行"这个幂等最核心的场景。
+
+修复：改成直接按 `(tenant_id, user_id, action)` 三个维度数 mock-platform 真正执行过的指令
+条数，确认前后比较差值，不再重建 `idempotency_key` 字符串——不管业务代码内部怎么生成 key，
+只要"实际执行的次数"不对，测试就会失败。同时在第一次"确认关闭"成功之后，同一个会话里再发一次
+"确认关闭"，断言指令条数仍然只比确认前多 1（第二次的回复内容不做断言，只打印出来）。
+
+单独跑这个测试（`-s` 打印第二次确认的回复）：
+```
+tests/e2e/test_e2e_04_disable_auto_renew_confirmation.py::test_disable_auto_renew_requires_confirmation_then_executes_exactly_once [场景4] 第二次'确认关闭'的回复：'这个操作已经处理过了。'
+PASSED
+
+============================== 1 passed in 1.20s ===============================
+```
+完整 `tests/e2e` 重新跑一遍（修复后）：
+```
+tests/e2e/test_e2e_01_knowledge_policy.py::test_knowledge_policy_question_cites_knowledge_base PASSED
+tests/e2e/test_e2e_02_finance_invoice_masking.py::test_invoice_query_reply_and_stored_message_are_both_masked PASSED
+tests/e2e/test_e2e_03_finance_cross_user_forbidden.py::test_user_a_querying_user_b_finance_is_forbidden_end_to_end PASSED
+tests/e2e/test_e2e_04_disable_auto_renew_confirmation.py::test_disable_auto_renew_requires_confirmation_then_executes_exactly_once PASSED
+tests/e2e/test_e2e_05_reminder_push.py::test_reminder_created_via_chat_is_pushed_within_5_seconds PASSED
+tests/e2e/test_e2e_06_handoff_with_summary.py::test_handoff_ticket_carries_summary_intent_and_attempted_actions PASSED
+tests/e2e/test_e2e_07_finance_timeout_no_fabrication.py::test_finance_timeout_does_not_fabricate_and_records_followup PASSED
+tests/e2e/test_e2e_08_llm_invalid_json_fallback.py::test_llm_invalid_json_falls_back_without_executing_any_tool PASSED
+tests/e2e/test_e2e_09_duplicate_message_id.py::test_duplicate_message_id_is_only_processed_once PASSED
+tests/e2e/test_e2e_10_knowledge_no_hit.py::test_knowledge_no_hit_does_not_fabricate_and_skips_llm_generation PASSED
+
+============================= 10 passed in 14.46s ==============================
+```
 
 ---

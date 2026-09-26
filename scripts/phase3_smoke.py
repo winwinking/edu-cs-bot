@@ -367,12 +367,17 @@ async def scenario_budget_degrade() -> tuple[str, bool]:
     """第 7 步收尾场景：机构 daily_token_budget 设成 0（不管今天用没用过都必定超限，比设成
     一个具体数字更稳定，不依赖这个机构今天已经用了多少），验证预算降级：意图识别跳过 LLM、
     关键词规则也判断不出意图时，回复的是"预算耗尽"专用话术（不是"系统这会儿有点忙"，见
-    AGENT_LOG 步骤 6 审查修复第 1 条）。改完立刻改回 NULL，并用真实一次调用确认已经恢复。"""
+    AGENT_LOG 步骤 6 审查修复第 1 条）。阶段四 4.1 起 t_b 的种子数据有真实预算（500000），
+    不再是 NULL，所以测试前先读出原值，测试后恢复成这个原值，不能再无脑改回 NULL
+    （PHASE4.md 4.1 明确要求）。"""
     tenant, user = "t_b", "u_b_1001"
     conversation_id = _conversation_id(tenant, user, "s_budget")
     token = await _get_token(tenant, user)
 
     async with AsyncSessionLocal() as session:
+        original_budget = (
+            await session.execute(select(Tenant.daily_token_budget).where(Tenant.id == tenant))
+        ).scalar_one()
         await session.execute(update(Tenant).where(Tenant.id == tenant).values(daily_token_budget=0))
         await session.commit()
 
@@ -381,7 +386,9 @@ async def scenario_budget_degrade() -> tuple[str, bool]:
             r = await _send_and_wait(ws, conversation_id, "你好呀")
     finally:
         async with AsyncSessionLocal() as session:
-            await session.execute(update(Tenant).where(Tenant.id == tenant).values(daily_token_budget=None))
+            await session.execute(
+                update(Tenant).where(Tenant.id == tenant).values(daily_token_budget=original_budget)
+            )
             await session.commit()
 
     degrade_ok = r["meta"].get("budget_exceeded") is True and "这个问题我这边暂时处理不了" in r["reply"]

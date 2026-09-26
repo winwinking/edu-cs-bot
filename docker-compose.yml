@@ -1,11 +1,15 @@
 name: edu-cs-bot
 
-# gateway / worker / scheduler / tools 共用同一个镜像，用 YAML anchor 避免每个服务都抄一遍
+# gateway / worker / scheduler 共用同一个镜像，用 YAML anchor 避免每个服务都抄一遍。
+# target: base 显式指定构建到 docker/app.Dockerfile 的 base 阶段（不含 pytest 等测试工具，
+# 阶段四 4.2 审查修复）——tools 服务需要 tools 阶段、镜像名也不同，不复用这个锚点，见下面
+# tools 服务自己的 image/build
 x-app-build: &app-build
   image: edu-cs-bot/app:latest
   build:
     context: .
     dockerfile: docker/app.Dockerfile
+    target: base
 
 x-app-healthcheck: &app-healthcheck
   healthcheck:
@@ -14,12 +18,14 @@ x-app-healthcheck: &app-healthcheck
     timeout: 5s
     retries: 10
 
-# 5 个 mock 服务共用同一个镜像和健康检查方式，用 YAML anchor 避免每个服务都抄一遍
+# 5 个 mock 服务共用同一个镜像和健康检查方式，用 YAML anchor 避免每个服务都抄一遍。
+# target: base 同上，不含测试工具；mocks-tools 服务不复用这个锚点，见它自己的 image/build
 x-mocks-build: &mocks-build
   image: edu-cs-bot/mocks:latest
   build:
     context: .
     dockerfile: docker/mocks.Dockerfile
+    target: base
   restart: unless-stopped
 
 x-mocks-healthcheck: &mocks-healthcheck
@@ -34,16 +40,45 @@ x-mocks-healthcheck: &mocks-healthcheck
 services:
   # 一次性任务用的容器：迁移、种子数据这类活不需要一直跑着，跟 gateway/worker/scheduler 共用同一个镜像
   # profiles 让它不随 make up 启动，只有 docker compose run 显式叫它的时候才会起来，干完活就退出
+  # 一次性任务用的容器：迁移、种子数据、跑 tests/unit+integration+e2e 这类活不需要一直跑着。
+  # 阶段四 4.2 审查修复：不复用 x-app-build 这个锚点（那个锚点指向 base 阶段，没有 pytest），
+  # 单独给自己的 image 名（edu-cs-bot/app-tools:latest）+ build.target: tools——这样它跟
+  # gateway/worker/scheduler 用的 edu-cs-bot/app:latest 是两个完全独立的镜像，不会因为构建
+  # 顺序不同而互相覆盖谁有没有测试工具。
   tools:
-    <<: *app-build
+    image: edu-cs-bot/app-tools:latest
+    build:
+      context: .
+      dockerfile: docker/app.Dockerfile
+      target: tools
     profiles: ["tools"]
     env_file:
       - .env
     volumes:
       - ./data/knowledge:/app/data/knowledge:ro
+      # 测试代码不进镜像（app.Dockerfile 的 tools 阶段也不 COPY tests/），靠挂载在运行时
+      # 拿到测试代码，只读即可
+      - ./tests:/app/tests:ro
     depends_on:
       postgres:
         condition: service_healthy
+
+  # 阶段四 4.2：跑 tests/unit/test_mock_llm_rules.py 专用的一次性容器——这个测试要 import
+  # mocks.mock_llm.rules，只有 mocks 镜像里有这个包，tools（app 镜像）没有，所以不能复用 tools；
+  # 又不能像以前那样直接 `docker compose run --rm mock-llm pytest ...`，因为常驻的 mock-llm
+  # 服务现在用的是不含测试工具的 base 阶段。这里单独给自己的 image 名
+  # （edu-cs-bot/mocks-tools:latest）+ build.target: tools，理由跟上面 tools 服务一样。
+  mocks-tools:
+    image: edu-cs-bot/mocks-tools:latest
+    build:
+      context: .
+      dockerfile: docker/mocks.Dockerfile
+      target: tools
+    profiles: ["tools"]
+    # 一次性容器，不需要也不应该像 mock-llm 等常驻服务那样意外重启
+    restart: "no"
+    volumes:
+      - ./tests:/app/tests:ro
 
   gateway:
     <<: [*app-build, *app-healthcheck]

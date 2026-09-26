@@ -7,8 +7,22 @@ from app.common.db import AsyncSessionLocal
 from app.common.models import GuardianLink, Tenant, User, UserRole
 
 TENANTS = [
-    {"id": "t_a", "name": "星辰教育", "service_hours": "9:00 至 21:00", "timezone": "Asia/Shanghai"},
-    {"id": "t_b", "name": "启明学堂", "service_hours": "8:30 至 20:30", "timezone": "Asia/Shanghai"},
+    # 阶段四 4.1：给两个机构设不同的每日 token 预算，演示控制台的状态条才有"用量 / 上限"可显示；
+    # t_b 的预算比 t_a 小很多，方便压测/演示时更容易触发预算降级
+    {
+        "id": "t_a",
+        "name": "星辰教育",
+        "service_hours": "9:00 至 21:00",
+        "timezone": "Asia/Shanghai",
+        "daily_token_budget": 2_000_000,
+    },
+    {
+        "id": "t_b",
+        "name": "启明学堂",
+        "service_hours": "8:30 至 20:30",
+        "timezone": "Asia/Shanghai",
+        "daily_token_budget": 500_000,
+    },
 ]
 
 USERS = [
@@ -80,10 +94,18 @@ GUARDIAN_LINKS = [
 
 async def main() -> None:
     async with AsyncSessionLocal() as session:
-        # ON CONFLICT DO NOTHING：种子脚本要能重复跑，不能因为已经种过就报唯一约束冲突
+        # tenants 用 ON CONFLICT DO UPDATE：机构配置（预算、服务时间等）以这份种子数据为准，
+        # 重新跑 seed 要能把老环境里已经存在、但字段还是旧值（比如 daily_token_budget 还是 NULL）
+        # 的机构更新到最新配置，不是插不进去就算了
         for tenant in TENANTS:
-            stmt = pg_insert(Tenant).values(**tenant).on_conflict_do_nothing(index_elements=["id"])
+            stmt = pg_insert(Tenant).values(**tenant)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["id"],
+                set_={k: stmt.excluded[k] for k in tenant if k != "id"},
+            )
             await session.execute(stmt)
+        # users/guardian_links 保持 ON CONFLICT DO NOTHING：种子脚本要能重复跑，不能因为已经
+        # 种过就报唯一约束冲突，但这两类不是"配置"，不需要每次都覆盖成种子里的值
         for user in USERS:
             stmt = pg_insert(User).values(**user).on_conflict_do_nothing(index_elements=["id"])
             await session.execute(stmt)

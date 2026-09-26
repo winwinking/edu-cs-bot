@@ -2,8 +2,11 @@
 
 mocks/ 目录只打进 mocks 镜像，不在 tools/app 镜像里（两边刻意不共享代码，见 mocks 独立性设计）；
 这个文件在 tools 镜像里跑的时候 import 不到 mocks 包，用 importorskip 优雅跳过，不让整个
-tests/unit 目录在 tools 镜像里跑不起来。真正执行要用 mocks 镜像：
-    docker compose run --rm mock-llm pytest -q tests/unit/test_mock_llm_rules.py
+tests/unit 目录在 tools 镜像里跑不起来。真正执行要用 mocks 镜像里、专门跑测试的一次性容器
+（阶段四 4.2：tests/ 不再 COPY 进任何生产镜像，包括 mocks 镜像，靠 docker-compose.yml 里的
+mocks-tools 服务在运行时把 tests/ 挂进去）：
+    docker compose run --rm mocks-tools pytest -q tests/unit/test_mock_llm_rules.py
+`make test` 会自动跑这一步，不需要手动执行。
 """
 from datetime import datetime
 

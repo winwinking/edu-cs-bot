@@ -25,6 +25,9 @@ _DEFAULT_CONFIG: dict = {
     "latency_ms": int(os.getenv("MOCK_PLATFORM_LATENCY_MS", "50")),
     "mode": os.getenv("MOCK_PLATFORM_MODE", "normal"),
     "agents_online": True,
+    # 排队人数（阶段四 4.1）：原来写死 3，现在可以用 mockctl 调，方便演示/测试不同排队场景
+    "queue_length": 3,
+    "avg_wait_minutes": 5,
 }
 _config: dict = dict(_DEFAULT_CONFIG)
 
@@ -56,6 +59,8 @@ class AdminConfigUpdate(BaseModel):
     latency_ms: Optional[int] = Field(default=None, ge=0)
     mode: Optional[Literal["normal", "timeout", "slow_commit", "error500"]] = None
     agents_online: Optional[bool] = None
+    queue_length: Optional[int] = Field(default=None, ge=0)
+    avg_wait_minutes: Optional[int] = Field(default=None, ge=0)
 
 
 class CommandRequest(BaseModel):
@@ -84,6 +89,10 @@ async def update_config(update: AdminConfigUpdate) -> dict:
         _config["mode"] = update.mode
     if update.agents_online is not None:
         _config["agents_online"] = update.agents_online
+    if update.queue_length is not None:
+        _config["queue_length"] = update.queue_length
+    if update.avg_wait_minutes is not None:
+        _config["avg_wait_minutes"] = update.avg_wait_minutes
     return _config
 
 
@@ -188,7 +197,7 @@ async def list_commands() -> dict:
 async def agents_status() -> dict:
     if not _config["agents_online"]:
         return {"online": False, "queue_length": 0, "avg_wait_minutes": 0}
-    return {"online": True, "queue_length": 3, "avg_wait_minutes": 5}
+    return {"online": True, "queue_length": _config["queue_length"], "avg_wait_minutes": _config["avg_wait_minutes"]}
 
 
 if __name__ == "__main__":

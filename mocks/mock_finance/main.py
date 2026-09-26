@@ -35,49 +35,131 @@ _GUARDIAN_LINKS: dict[tuple[str, str], str] = {
     ("t_b", "u_b_1002"): "u_b_1001",
 }
 
-# 每个账号的财务底稿，key 是 (tenant_id, user_id)；订单/发票/退费都是围绕"上个月一笔课程订单"编的，
-# u_a_1004/u_b_1001 用不同的课程名、金额、邮箱，跟 u_a_1001 区分开；部分记录带手机号/身份证号，
-# 专门用来验证脱敏覆盖到了这些字段
-_ACCOUNTS: dict[tuple[str, str], dict] = {
+# 阶段四 4.1：每个账号从"一笔订单"改成"最近三个月各一笔订单"，覆盖不同发票状态，这样才能测出
+# "查不同月份/不同状态，回复不一样"，而不是每次都是同一条数据。months_ago=1 是上个月，2/3 依次
+# 往前推——跟 _last_month_ym() 用的偏移量算法一致，年份跨界（比如现在是 1 月，3 个月前是去年
+# 10 月）由 _ym_offset() 统一处理，不用在数据里手写年份。
+# 退费和余额不是按月份查的（get_refunds/get_balance 没有 period 参数），所以单独放两张表，
+# 覆盖题目要求的"退费审核中/已退款"和"余额有值/为 0"。部分记录带手机号/身份证号，专门用来验证
+# 脱敏覆盖到了这些字段。
+_ORDERS: dict[tuple[str, str], list[dict]] = {
+    ("t_a", "u_a_1001"): [
+        {
+            "months_ago": 1,
+            "course_name": "春季数学班",
+            "order_suffix": "12-8831",
+            "amount": 2399.0,
+            "invoice_status": "已开具",
+            "invoice_day": 18,
+            "invoice_email": "lin.xiaoyu@example.com",
+        },
+        {
+            "months_ago": 2,
+            "course_name": "口语提高班",
+            "order_suffix": "11-7702",
+            "amount": 1599.0,
+            "invoice_status": "未开具",
+            "invoice_day": None,
+            "invoice_email": None,
+        },
+        {
+            "months_ago": 3,
+            "course_name": "数学思维训练营",
+            "order_suffix": "10-6650",
+            "amount": 1299.0,
+            "invoice_status": "已开具",
+            "invoice_day": 9,
+            "invoice_email": "lin.xiaoyu@example.com",
+        },
+    ],
+    ("t_a", "u_a_1004"): [
+        {
+            "months_ago": 1,
+            "course_name": "暑期英语班",
+            "order_suffix": "05-1122",
+            "amount": 1899.0,
+            "invoice_status": "未开具",
+            "invoice_day": None,
+            "invoice_email": None,
+        },
+        {
+            "months_ago": 2,
+            "course_name": "作文提升班",
+            "order_suffix": "04-3391",
+            "amount": 999.0,
+            "invoice_status": "已开具",
+            "invoice_day": 22,
+            "invoice_email": "wang.xiaohua@example.com",
+        },
+        {
+            "months_ago": 3,
+            "course_name": "阅读理解班",
+            "order_suffix": "03-2280",
+            "amount": 899.0,
+            "invoice_status": "未开具",
+            "invoice_day": None,
+            "invoice_email": None,
+        },
+    ],
+    ("t_b", "u_b_1001"): [
+        {
+            "months_ago": 1,
+            "course_name": "春季英语班",
+            "order_suffix": "20-2233",
+            "amount": 2599.0,
+            "invoice_status": "已开具",
+            "invoice_day": 20,
+            "invoice_email": "li.xiaohong@example.com",
+        },
+        {
+            "months_ago": 2,
+            "course_name": "语法专项班",
+            "order_suffix": "19-1188",
+            "amount": 1399.0,
+            "invoice_status": "已开具",
+            "invoice_day": 15,
+            "invoice_email": "li.xiaohong@example.com",
+        },
+        {
+            "months_ago": 3,
+            "course_name": "听说读写强化班",
+            "order_suffix": "18-0925",
+            "amount": 1799.0,
+            "invoice_status": "未开具",
+            "invoice_day": None,
+            "invoice_email": None,
+        },
+    ],
+}
+
+# 退费：u_a_1001 审核中、u_b_1001 已完成、u_a_1004 无退费记录——覆盖"退费审核中"和"已退款"两种
+# 题目点名的状态
+_REFUNDS: dict[tuple[str, str], dict] = {
     ("t_a", "u_a_1001"): {
-        "course_name": "春季数学班",
-        "order_suffix": "12-8831",
-        "amount": 2399.0,
-        "invoice_status": "已开具",
-        "invoice_day": 18,
-        "invoice_email": "lin.xiaoyu@example.com",
         "refund_status": "审核中",
         "refund_amount": 2399.0,
         "refund_bank_card": "6222021234567890",
-        "balance": 120.0,
         "contact_phone": "13812345678",
     },
     ("t_a", "u_a_1004"): {
-        "course_name": "暑期英语班",
-        "order_suffix": "05-1122",
-        "amount": 1899.0,
-        "invoice_status": "未开具",
-        "invoice_day": None,
-        "invoice_email": None,
         "refund_status": "无退费记录",
         "refund_amount": 0.0,
         "refund_bank_card": None,
-        "balance": 50.0,
         "contact_id_card": "310101199003077890",
     },
     ("t_b", "u_b_1001"): {
-        "course_name": "春季英语班",
-        "order_suffix": "20-2233",
-        "amount": 2599.0,
-        "invoice_status": "已开具",
-        "invoice_day": 20,
-        "invoice_email": "li.xiaohong@example.com",
         "refund_status": "已完成",
         "refund_amount": 300.0,
         "refund_bank_card": "6217001234567890",
-        "balance": 300.0,
         "contact_phone": "13900002001",
     },
+}
+
+# 余额：u_a_1001/u_b_1001 有值，u_a_1004 为 0——覆盖"余额有值和为 0"两种题目点名的状态
+_BALANCES: dict[tuple[str, str], float] = {
+    ("t_a", "u_a_1001"): 120.0,
+    ("t_a", "u_a_1004"): 0.0,
+    ("t_b", "u_b_1001"): 300.0,
 }
 
 
@@ -111,11 +193,15 @@ async def reset_config() -> dict:
     return _config
 
 
-def _last_month_ym() -> tuple[int, int]:
+def _ym_offset(months_ago: int) -> tuple[int, int]:
+    """算"往前推 N 个月"是哪年哪月，统一处理跨年（比如现在是 1 月，3 个月前是去年 10 月）。"""
     today = date.today()
-    if today.month == 1:
-        return today.year - 1, 12
-    return today.year, today.month - 1
+    total = today.year * 12 + (today.month - 1) - months_ago
+    return total // 12, total % 12 + 1
+
+
+def _last_month_ym() -> tuple[int, int]:
+    return _ym_offset(1)
 
 
 def _resolve_ym(period: Optional[str]) -> tuple[int, int]:
@@ -157,11 +243,31 @@ def _check_permission(tenant_id: str, acting_user_id: str, target_user_id: str) 
     raise HTTPException(status_code=403, detail="无权查询该账号的财务信息")
 
 
-def _get_account(tenant_id: str, target_user_id: str) -> dict:
-    account = _ACCOUNTS.get((tenant_id, target_user_id))
-    if account is None:
+def _get_orders(tenant_id: str, target_user_id: str) -> list[dict]:
+    orders = _ORDERS.get((tenant_id, target_user_id))
+    if orders is None:
         raise HTTPException(status_code=404, detail="查不到这个账号的财务底稿")
-    return account
+    return orders
+
+
+def _get_refund(tenant_id: str, target_user_id: str) -> dict:
+    refund = _REFUNDS.get((tenant_id, target_user_id))
+    if refund is None:
+        raise HTTPException(status_code=404, detail="查不到这个账号的财务底稿")
+    return refund
+
+
+def _get_balance(tenant_id: str, target_user_id: str) -> float:
+    if (tenant_id, target_user_id) not in _BALANCES:
+        raise HTTPException(status_code=404, detail="查不到这个账号的财务底稿")
+    return _BALANCES[(tenant_id, target_user_id)]
+
+
+def _find_order_for_period(orders: list[dict], year: int, month: int) -> Optional[dict]:
+    for order in orders:
+        if _ym_offset(order["months_ago"]) == (year, month):
+            return order
+    return None
 
 
 async def _guard(
@@ -183,16 +289,17 @@ async def get_orders(
     x_acting_user_id: str = Header(...),
 ) -> dict:
     await _guard(x_service_token, x_tenant_id, x_acting_user_id, user_id)
-    account = _get_account(x_tenant_id, user_id)
+    orders = _get_orders(x_tenant_id, user_id)
     year, month = _resolve_ym(period)
-    if (year, month) != _last_month_ym():
+    order = _find_order_for_period(orders, year, month)
+    if order is None:
         return {"orders": []}
     return {
         "orders": [
             {
-                "order_no": f"EDU-{year}{month:02d}{account['order_suffix']}",
-                "course_name": account["course_name"],
-                "amount": account["amount"],
+                "order_no": f"EDU-{year}{month:02d}{order['order_suffix']}",
+                "course_name": order["course_name"],
+                "amount": order["amount"],
                 "period": f"{year}-{month:02d}",
             }
         ]
@@ -208,16 +315,17 @@ async def get_bills(
     x_acting_user_id: str = Header(...),
 ) -> dict:
     await _guard(x_service_token, x_tenant_id, x_acting_user_id, user_id)
-    account = _get_account(x_tenant_id, user_id)
+    orders = _get_orders(x_tenant_id, user_id)
     year, month = _resolve_ym(period)
-    if (year, month) != _last_month_ym():
+    order = _find_order_for_period(orders, year, month)
+    if order is None:
         return {"bills": []}
     return {
         "bills": [
             {
-                "order_no": f"EDU-{year}{month:02d}{account['order_suffix']}",
-                "course_name": account["course_name"],
-                "amount": account["amount"],
+                "order_no": f"EDU-{year}{month:02d}{order['order_suffix']}",
+                "course_name": order["course_name"],
+                "amount": order["amount"],
                 "period": f"{year}-{month:02d}",
                 "status": "已支付",
             }
@@ -234,20 +342,21 @@ async def get_invoices(
     x_acting_user_id: str = Header(...),
 ) -> dict:
     await _guard(x_service_token, x_tenant_id, x_acting_user_id, user_id)
-    account = _get_account(x_tenant_id, user_id)
+    orders = _get_orders(x_tenant_id, user_id)
     year, month = _resolve_ym(period)
-    if (year, month) != _last_month_ym():
+    order = _find_order_for_period(orders, year, month)
+    if order is None:
         return {"invoices": []}
     return {
         "invoices": [
             {
-                "order_no": f"EDU-{year}{month:02d}{account['order_suffix']}",
-                "amount": account["amount"],
-                "status": account["invoice_status"],
+                "order_no": f"EDU-{year}{month:02d}{order['order_suffix']}",
+                "amount": order["amount"],
+                "status": order["invoice_status"],
                 "sent_at": (
-                    f"{year}-{month:02d}-{account['invoice_day']:02d}" if account["invoice_day"] else None
+                    f"{year}-{month:02d}-{order['invoice_day']:02d}" if order["invoice_day"] else None
                 ),
-                "email": account["invoice_email"],
+                "email": order["invoice_email"],
             }
         ]
     }
@@ -262,15 +371,15 @@ async def get_refunds(
     x_acting_user_id: str = Header(...),
 ) -> dict:
     await _guard(x_service_token, x_tenant_id, x_acting_user_id, user_id)
-    account = _get_account(x_tenant_id, user_id)
-    if account["refund_bank_card"] is None:
+    refund = _get_refund(x_tenant_id, user_id)
+    if refund["refund_bank_card"] is None:
         return {"refunds": []}
     return {
         "refunds": [
             {
-                "status": account["refund_status"],
-                "amount": account["refund_amount"],
-                "bank_card": account["refund_bank_card"],
+                "status": refund["refund_status"],
+                "amount": refund["refund_amount"],
+                "bank_card": refund["refund_bank_card"],
             }
         ]
     }
@@ -284,8 +393,8 @@ async def get_balance(
     x_acting_user_id: str = Header(...),
 ) -> dict:
     await _guard(x_service_token, x_tenant_id, x_acting_user_id, user_id)
-    account = _get_account(x_tenant_id, user_id)
-    return {"balance": account["balance"]}
+    balance = _get_balance(x_tenant_id, user_id)
+    return {"balance": balance}
 
 
 if __name__ == "__main__":

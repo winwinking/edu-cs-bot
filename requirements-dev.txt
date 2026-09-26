@@ -1,0 +1,16 @@
+# 只给跑测试用的容器装（tools/mocks-tools 两个一次性容器，见 docker/app.Dockerfile、
+# docker/mocks.Dockerfile 的 tools 构建阶段），不装进 gateway/worker/scheduler/mock-* 的
+# 生产镜像——这几个包只是测试框架本身和它自己的依赖，跟业务代码运行毫无关系
+# （阶段四 4.2 审查发现：pytest/pytest-asyncio 从阶段一起就混在 requirements.txt 里，
+# 生产镜像一直带着测试工具，这次拆出来修掉）。
+#
+# 安装顺序：先装 requirements.txt，再装这个文件——这里只列"额外多出来的"包，不重复列
+# requirements.txt 已经有的内容。版本号同样来自 `pip freeze` 的实际安装结果，iniconfig/
+# pluggy/Pygments 是 pytest 自己拉进来的间接依赖，不是我们直接用的库。
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pytest-cov==7.1.0
+coverage==7.16.1
+iniconfig==2.3.0
+pluggy==1.6.0
+Pygments==2.21.0

@@ -1,0 +1,36 @@
+name: CI
+
+# 阶段四 4.2：push 到 main 时自动跑 unit 测试（题目岗位描述要求 CI/CD，这一项成本很低，先接上
+# 覆盖面最窄、跑得最快的一层；integration/e2e 依赖完整 docker compose 起一整套服务，跑起来慢
+# 得多，且需要真实的宿主机资源，不适合放进每次 push 都跑的 CI，仍然用 `make test` 在本地/
+# 演示环境里手动跑）。
+on:
+  push:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # .env.example 里全是示例值，不是真实密钥，直接复制就能满足 Settings() 必填项
+      - name: 准备环境变量
+        run: cp .env.example .env
+
+      - name: 构建 tools 镜像
+        run: docker compose build tools
+
+      # 核心模块（意图路由、权限校验、幂等、脱敏、日程规则、工具参数校验）覆盖率要求见
+      # docs/PHASE4.md 4.2，本地验证方式和这里完全一致
+      - name: 跑单元测试（核心模块覆盖率报告）
+        run: |
+          docker compose run --rm tools pytest tests/unit -q \
+            --cov=app.worker.graph.classify \
+            --cov=app.common.permissions \
+            --cov=app.gateway.message_handler \
+            --cov=app.worker.handler \
+            --cov=app.common.masking \
+            --cov=app.common.reminder_rules \
+            --cov=app.common.tools \
+            --cov-report=term-missing
