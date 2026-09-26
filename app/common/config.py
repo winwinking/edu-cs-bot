@@ -6,7 +6,19 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    # env_ignore_empty=True：环境变量存在但值是空字符串时，当成"没设置"处理，落回代码默认值，
+    # 不会尝试把 "" 解析成 int/float 报错。阶段四审查发现的真实问题：.env.example 里
+    # `DEFAULT_DAILY_TOKEN_BUDGET=`（等号后面留空，说明"不填就是不限额"）在 CI 里被
+    # `cp .env.example .env` 原样复制成正式配置，pydantic 把这个空字符串当成"传了一个值"去
+    # 解析成 Optional[int]，解析失败直接让 Settings() 在模块导入阶段抛异常，19 个单测文件
+    # collection 全部失败；本机也发生过一次一样的事故（把这一项手动删空导致 mock-im/worker
+    # 反复重启），当时靠删掉整行绕过，没有从配置加载层根治。这个选项对本来就用 `= ""` 当默认值
+    # 的字段（比如 REDIS_PASSWORD）没有副作用——"当成没设置"落回的默认值本来就是空字符串，
+    # 结果不变；对必填字符串字段（比如 JWT_SECRET）反而是变严格了：以前留空会静默变成空字符串
+    # 密钥，现在会因为"缺少必填字段"直接报错拒绝启动，不会带着空密钥跑起来。
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore", env_ignore_empty=True
+    )
 
     # ---------- 应用行为 ----------
     app_env: str = "development"

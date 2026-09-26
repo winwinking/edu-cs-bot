@@ -3800,3 +3800,130 @@ tests/e2e/test_e2e_10_knowledge_no_hit.py::test_knowledge_no_hit_does_not_fabric
 ```
 
 ---
+
+## 检查点 E 后续：GitHub Actions 单测失败排查、配置加载层修空字符串
+
+**背景**：接上 CI 之后第一次跑，`unit-tests` job 失败，日志显示 19 个 `tests/unit` 文件在
+collection 阶段全部报 `pydantic_core.ValidationError`（`type=int_parsing`），最后
+"Interrupted: 19 errors during collection"，退出码 2；本机 `make test` 是通过的。
+
+**定位过程（先复现，不猜）**：
+1. 看 `.github/workflows/ci.yml`，CI 提供环境变量的方式是 `cp .env.example .env`，不是用
+   仓库里已经配置好的开发用 `.env`。
+2. 检查本机 `.env`：`grep DEFAULT_DAILY_TOKEN_BUDGET .env` 没有任何输出——这一项在本机的
+   `.env` 里整行都不存在。再看 `.env.example` 第 116 行：`DEFAULT_DAILY_TOKEN_BUDGET=`
+   （等号后面是空的）。两边不一样：本机是"这个 key 压根不存在"，CI 是"这个 key 存在、值是
+   空字符串"，pydantic-settings 对这两种情况的处理不一样——key 不存在会用代码默认值，
+   key 存在但是空字符串会被当成"用户真的传了一个值"去尝试解析。
+3. 备份本机 `.env`（`cp .env /tmp/env_backup_...`），执行 `cp .env.example .env`，用跟 CI
+   完全一样的方式（`docker compose build tools` + `docker compose run --rm tools pytest
+   tests/unit ...`）本机复现，原样输出：
+```
+E   default_daily_token_budget
+E     Input should be a valid integer, unable to parse string as an integer [type=int_parsing, input_value='', input_type=str]
+E       For further information visit https://errors.pydantic.dev/2.13/v/int_parsing
+...
+=========================== short test summary info ============================
+ERROR tests/unit/test_classify_confirm_boundaries.py - pydantic_core._pydanti...
+（省略，共 19 条 ERROR）
+!!!!!!!!!!!!!!!!!!! Interrupted: 19 errors during collection !!!!!!!!!!!!!!!!!!!
+1 skipped, 19 errors in 4.30s
+```
+跟 CI 日志的报错完全一致（同一个字段 `default_daily_token_budget`、同一个错误类型
+`int_parsing`、同样是 19 个 collection 错误）。复现完立刻把 `.env` 恢复成备份。
+
+**结论**：确认原因是"配置项值为空字符串，解析整数失败"，不是别的原因，按 Jo 给的方案修。
+
+**改动**：
+- `app/common/config.py`：`Settings.model_config` 加 `env_ignore_empty=True`（pydantic-settings
+  自带的选项，不是自己写 validator）——环境变量存在但值是空字符串时，当成"没设置"，落回字段的
+  代码默认值。对 `default_daily_token_budget: Optional[int] = None` 这类字段，空字符串会变成
+  `None`，也就是"不限额"；对 `redis_password: str = ""` 这类默认值本来就是空字符串的字段，
+  结果没有变化；对没有默认值的必填字符串字段（`jwt_secret`/`llm_api_key`/
+  `finance_service_token` 等），行为从"静默变成空字符串密钥"变成"缺少必填字段直接报错"，
+  是有意变严格，不是意外副作用。
+- `tests/unit/test_config.py`（新文件）：4 个用例——空字符串数字型配置落回默认值（复现事故
+  本身）、空字符串字符串型配置（默认值本来就是空串）不受影响、正常传值时数字型配置仍然正确
+  解析（回归检查）、必填字符串字段留空会直接报错（确认"变严格"是预期行为，不是漏判）。
+
+**影响哪些服务**：`app/common/config.py` 是全项目唯一的配置入口，所有 import 了
+`app.common.config`（或者 import 了会传递引用它的 `app.common.db`/`app.common.auth`/
+`app.common.redis` 等模块）的服务都受影响：gateway、worker、scheduler、tools、mocks-tools。
+5 个 mock 服务里只有 mock-im 受影响（它是唯一 import `app.common.*` 的 mock，用来生成开发
+token、查真实角色、连数据库）；mock-llm/mock-knowledge/mock-platform/mock-finance 都不 import
+`app.common`（各自读 `os.getenv`，见它们自己文件开头的注释），不受影响。
+
+**验证**：
+
+1）修复后按 CI 方式本机复现（`cp .env.example .env` → `docker compose build tools` →
+`pytest tests/unit`），原样输出：
+```
+Name                             Stmts   Miss  Cover   Missing
+--------------------------------------------------------------
+app/common/masking.py               21      0   100%
+app/common/permissions.py           16      0   100%
+app/common/reminder_rules.py        61      1    98%   96
+app/common/tools.py                117      2    98%   59, 150
+app/gateway/message_handler.py      83      0   100%
+app/worker/graph/classify.py       155     28    82%   159, 189, 206-210, 240-243, 260, 262, 282, 289, 301-305, 309, 328-342
+app/worker/handler.py               85     15    82%   186-234
+--------------------------------------------------------------
+TOTAL                              538     46    91%
+204 passed, 1 skipped in 9.38s
+```
+没有任何 collection 错误，204 passed（比检查点 E 那次多 4 个，就是新增的 `test_config.py`）。
+验证完立刻把 `.env` 恢复成本机备份。
+
+2）本机复现 Jo 昨晚遇到的操作，确认现在不会再触发重启循环：
+```
+$ tail -2 .env
+（空行）
+DEFAULT_DAILY_TOKEN_BUDGET=
+
+$ docker compose up -d --force-recreate
+...
+$ docker compose ps --format "table {{.Name}}\t{{.Status}}"
+NAME                          STATUS
+edu-cs-bot-gateway-1          Up 11 seconds (healthy)
+edu-cs-bot-mock-finance-1     Up 20 seconds (healthy)
+edu-cs-bot-mock-im-1          Up 15 seconds (healthy)
+edu-cs-bot-mock-knowledge-1   Up 20 seconds (healthy)
+edu-cs-bot-mock-llm-1         Up 20 seconds (healthy)
+edu-cs-bot-mock-platform-1    Up 20 seconds (healthy)
+edu-cs-bot-postgres-1         Up 20 seconds (healthy)
+edu-cs-bot-rabbitmq-1         Up 20 seconds (healthy)
+edu-cs-bot-redis-1            Up 20 seconds (healthy)
+edu-cs-bot-scheduler-1        Up 14 seconds (healthy)
+edu-cs-bot-worker-1           Up 11 seconds (healthy)
+```
+没有任何一个服务是 `Restarting`。（这一步验证过程中踩了一个小坑：第一次
+`docker compose up -d --force-recreate` 时没加 `--build`，gateway/worker/scheduler/mock-im
+用的还是修复前的旧镜像，真的复现出了 `Restarting`——这本身也印证了报错原因就是这里，不是别的；
+补跑一次 `docker compose build` 之后镜像才是修复后的版本。）验证完把这一行删掉，再
+`docker compose up -d --force-recreate` 恢复成正常状态（`docker compose ps` 确认全部
+healthy）。
+
+3）`make test` 完整跑一遍（用本机正常的 `.env`）：
+```
+EXIT_CODE=0
+...
+204 passed, 1 skipped in 9.25s      # unit + 覆盖率
+38 passed in 0.35s                  # mock-llm 规则测试
+11 passed（integration，跟检查点 E 时一致）
+10 passed in 14.54s                 # e2e
+```
+
+**人工审查与修复点**：
+【人工审查发现】Jo 在阶段三验证预算降级时，曾把本机 `.env` 里 `DEFAULT_DAILY_TOKEN_BUDGET`
+等号后面的值删空，导致 mock-im 和 worker 反复重启，当时靠 `docker compose ps` 缩小排查范围、
+把这一行整行删掉才恢复，没有查日志确认根本原因。阶段四接入 GitHub Actions 后，同一个问题在
+CI 的 `cp .env.example .env` 这一步被再次触发（`.env.example` 里这一项写的正是"等号后面留空
+表示不限额"），导致 unit-tests job 在 collection 阶段全部报错。本机用跟 CI 相同的方式复现，
+确认原因是"pydantic 把环境变量里的空字符串当成真的传了一个值，尝试解析成 `Optional[int]`
+失败"，不是其它原因。修复：`app/common/config.py` 的 `Settings.model_config` 加
+`env_ignore_empty=True`，把"空字符串"和"没设置"统一处理成落回代码默认值；新增
+`tests/unit/test_config.py` 锁住这个行为。改动文件：`app/common/config.py`、新增
+`tests/unit/test_config.py`，影响 gateway/worker/scheduler/tools/mocks-tools/mock-im
+（唯一 import `app.common` 的 mock 服务），其余 4 个 mock 服务不受影响。
+
+---
