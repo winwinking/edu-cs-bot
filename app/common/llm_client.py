@@ -1,12 +1,22 @@
 """AsyncOpenAI 封装。base_url/api_key/model/timeout 全部来自配置，
 切换 mock-llm 和 DeepSeek 只改 .env 里的 LLM_* 变量，业务代码不用动。
 
-熔断 + 重试（PHASE3.md 第 5 步，设计决定 10、11）：
+熔断 + 重试（PHASE3.md 第 5 步，设计决定 10、11；阶段四故障注入 9 审查修复了超时部分）：
 - `max_retries=0` 关掉 OpenAI SDK 自带的重试——不关掉的话 SDK 自己会重试几次，我们这里又重试
   一次，一次调用变成好几次，退避时间也对不上我们自己配的值。
-- 重试只处理超时和 5xx，只重试 1 次（次数和退避间隔见 Settings），4xx 之类的业务错误重试没用。
+- 超时不重试，直接失败降级：超时本身已经是"等了一次超时的量"，再重试一次等于让用户多等一份
+  一样长的时间，不划算，也是故障注入 9 发现的问题——原来超时会重试 1 次，5 秒延迟的场景下
+  用户实际等了约 14 秒才降级。500 及以上状态码、真正的连接失败（拒绝连接、DNS 解析失败这类
+  "立刻能知道失败"的情况）仍然重试 1 次（次数和退避间隔见 Settings）——这些失败几乎不占等待
+  时间，多试一次成本很低。4xx 之类的业务错误不重试，重试也没用。
+- 非流式调用（分类意图/转人工摘要/历史摘要）和流式调用（生成回复正文）用两个不同的超时值
+  （`settings.llm_nonstream_timeout_seconds`/`llm_stream_timeout_seconds`，见
+  app/common/config.py 的注释），每次请求单独传 `timeout=` 覆盖客户端默认值，不是共用同一个
+  超时——这两类调用对"等多久算太久"的容忍度完全不同，流式调用即使总时长长一点，只要还在
+  持续吐字，用户体验就还好；非流式调用是纯等待，没有中间产出可以安慰用户。
 - 熔断器状态在这个模块里维护成单例：LLM 调用不管走 chat_completion 还是 stream_chat_completion，
-  都是同一个服务、共用同一个熔断状态。
+  都是同一个服务、共用同一个熔断状态；超时虽然不重试，但仍然按"一次调用失败"记入熔断计数
+  （`_breaker.record_failure()` 在"不重试或重试用完"分支里统一调用，不区分超时还是重试用完）。
 """
 import asyncio
 from typing import Any, AsyncIterator, Iterable, Mapping, Optional, Union
@@ -32,7 +42,10 @@ llm_requests_total = Counter("worker_llm_requests_total", "调用 LLM 次数，�
 llm_client = AsyncOpenAI(
     base_url=settings.llm_base_url,
     api_key=settings.llm_api_key,
-    timeout=settings.llm_timeout_seconds,
+    # 这里的 timeout 只是客户端级别的兜底默认值：下面 chat_completion/stream_chat_completion
+    # 每次请求都会用 timeout= 参数按调用类型（非流式/流式）覆盖成各自的超时，实际生效的是
+    # 那两个值，不是这里；给非流式那个更短的值当兜底，比留一个宽松的默认值更安全
+    timeout=settings.llm_nonstream_timeout_seconds,
     max_retries=0,
 )
 
@@ -49,10 +62,15 @@ def llm_circuit_state() -> str:
 
 
 def _is_retryable(exc: BaseException) -> bool:
+    # APITimeoutError 是 APIConnectionError 的子类，必须先单独排除掉，不然会被下面
+    # isinstance(exc, APIConnectionError) 误判成"连接失败"从而重试——故障注入 9 审查修复：
+    # 超时不重试，直接失败降级；500 及以上状态码、真正的连接失败（这个 isinstance 分支剩下的
+    # 那部分）仍然重试 1 次
+    if isinstance(exc, APITimeoutError):
+        return False
     if isinstance(exc, APIStatusError):
         return exc.status_code >= 500
-    # APITimeoutError 是 APIConnectionError 的子类，isinstance 判断顺序不影响结果
-    return isinstance(exc, (APITimeoutError, APIConnectionError))
+    return isinstance(exc, APIConnectionError)
 
 
 def estimate_tokens(messages: Iterable[Mapping[str, str]], completion_text: str) -> tuple[int, int]:
@@ -101,6 +119,11 @@ async def stream_chat_completion(
                 messages=message_list,
                 stream=True,
                 stream_options={"include_usage": True},
+                # httpx 的 read 超时是"距离上一次收到数据过了多久"，不是"总共花了多久"：
+                # 这一个数字天然同时实现了"等第一个数据块最多 N 秒"（还没收到任何数据）和
+                # "相邻数据块间隔最多 N 秒"（已经收到过数据，等下一块）两个要求，不需要另外
+                # 拆出"首块超时"和"块间隔超时"两个参数
+                timeout=settings.llm_stream_timeout_seconds,
             )
         except (APIError, APIConnectionError, APITimeoutError) as exc:
             last_exc = exc
@@ -143,7 +166,12 @@ async def chat_completion(
         llm_requests_total.labels(result="circuit_open").inc()
         raise CircuitBreakerOpenError("llm")
 
-    kwargs: dict[str, Any] = {"model": LLM_MODEL, "messages": list(messages), "stream": False}
+    kwargs: dict[str, Any] = {
+        "model": LLM_MODEL,
+        "messages": list(messages),
+        "stream": False,
+        "timeout": settings.llm_nonstream_timeout_seconds,
+    }
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = tool_choice or "auto"

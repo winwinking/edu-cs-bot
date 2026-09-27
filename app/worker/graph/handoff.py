@@ -259,6 +259,17 @@ async def handoff(state: GraphState, runtime) -> dict[str, Any]:
         )
     )
     await session.commit()
+    # PHASE4.md 4.6 人审发现同一批：只记状态/ID，summary 是脱敏过的摘要也不放进日志——
+    # 摘要脱敏是为了给人工客服看，不代表可以随便出现在别的地方
+    logger.info(
+        "转人工工单创建",
+        conversation_id=conversation_id,
+        user_id=user_id,
+        ticket_id=str(ticket_id),
+        trigger=trigger_value,
+        status=status.value,
+        online=online,
+    )
 
     if online:
         reply = _build_online_reply(agents.get("queue_length", 0), agents.get("avg_wait_minutes", 0))

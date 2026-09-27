@@ -30,6 +30,11 @@ app = FastAPI(title="mock-llm")
 _config: dict = {
     "latency_ms": int(os.getenv("MOCK_LLM_LATENCY_MS", "300")),
     "error_rate": float(os.getenv("MOCK_LLM_ERROR_RATE", "0.0")),
+    # PHASE4.md 4.6 审查修复：原计划用 error_rate 近似"LLM 超时率 20%"，但 error_rate 命中时
+    # 是立刻返回 500，worker 立刻重试/降级，跟真正的超时——worker 一直卡到自己的超时阈值、
+    # 这段时间连接和协程资源被占用——是两种完全不同的压力，压测要的是后者，这里单独加一个
+    # 概率维度，不复用 error_rate
+    "timeout_rate": float(os.getenv("MOCK_LLM_TIMEOUT_RATE", "0.0")),
     "mode": os.getenv("MOCK_LLM_MODE", "normal"),
 }
 # 启动时的快照，/admin/reset 用来把 _config 恢复到这个状态（给 mockctl.py all reset 用）
@@ -59,6 +64,7 @@ class ChatCompletionRequest(BaseModel):
 class AdminConfigUpdate(BaseModel):
     latency_ms: Optional[int] = Field(default=None, ge=0)
     error_rate: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    timeout_rate: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     mode: Optional[Literal["normal", "hallucinate", "invalid_json", "ai_flavor", "error500"]] = None
 
 
@@ -78,6 +84,8 @@ async def update_config(update: AdminConfigUpdate) -> dict:
         _config["latency_ms"] = update.latency_ms
     if update.error_rate is not None:
         _config["error_rate"] = update.error_rate
+    if update.timeout_rate is not None:
+        _config["timeout_rate"] = update.timeout_rate
     if update.mode is not None:
         _config["mode"] = update.mode
     return _config
@@ -87,6 +95,25 @@ async def update_config(update: AdminConfigUpdate) -> dict:
 async def reset_config() -> dict:
     _config.update(_DEFAULT_CONFIG)
     return _config
+
+
+async def _maybe_timeout() -> None:
+    """按概率命中就永远不返回，模拟"LLM 调用真的卡住"（PHASE4.md 4.6 压测场景 4）。
+
+    worker 调 LLM 的超时阈值是 `app/common/config.py` 的 `llm_timeout_seconds`（默认 15 秒，
+    `.env`/`.env.example` 的 `LLM_TIMEOUT_SECONDS=15`），消费方是
+    `app/common/llm_client.py` 里 `AsyncOpenAI(timeout=settings.llm_timeout_seconds)`——
+    这个值是调用方（worker）的配置，mock-llm 这边读不到也不需要读：用 `asyncio.Event().wait()`
+    挂起不返回，天然保证超过*任何*配置的阈值，不用在这里猜一个具体秒数、也不用担心以后
+    `llm_timeout_seconds` 改了这边要跟着改。跟 `mocks/mock_platform/main.py` 里
+    `mode == "timeout"` 用的是同一个思路。
+
+    跟 `error_rate`（命中就立刻返回 500，worker 立刻重试/降级）是两种完全不同的压力：
+    真正的超时会让 worker 那次 LLM 调用一直卡到自己的超时阈值才失败，这段时间里协程、
+    连接池名额都被占用着，这才是压测场景 4 想验证的"超时占用资源"，不是"LLM 立刻报错"。
+    """
+    if random.random() < _config["timeout_rate"]:
+        await asyncio.Event().wait()
 
 
 def _maybe_raise_error() -> None:
@@ -238,6 +265,7 @@ def _usage(messages: List[ChatMessage], completion_text: str) -> dict:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
+    await _maybe_timeout()
     _maybe_raise_error()
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 

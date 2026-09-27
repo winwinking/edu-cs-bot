@@ -127,6 +127,14 @@ async def _handle_create(session, tenant_id: str, user_id: str, conversation_id:
         )
     )
     await session.commit()
+    # PHASE4.md 4.6 人审发现同一批：只记动作、结果和 ID，不记标题/时间这类消息相关内容
+    logger.info(
+        "创建提醒",
+        conversation_id=conversation_id,
+        user_id=user_id,
+        reminder_id=str(reminder_id),
+        status="ok",
+    )
 
     now_local = datetime.now(tz)
     date_label = _format_date_label_cn(event_at_local, now_local)
@@ -194,7 +202,7 @@ async def _resolve_target_reminder(
 
 
 async def _handle_update_or_cancel(
-    session, tenant_id: str, user_id: str, tenant_timezone: str, action: str, args: dict
+    session, tenant_id: str, user_id: str, conversation_id: str, tenant_timezone: str, action: str, args: dict
 ) -> dict[str, Any]:
     active_reminders = await load_active_reminders(session, tenant_id, user_id)
     target, early = await _resolve_target_reminder(
@@ -207,6 +215,9 @@ async def _handle_update_or_cancel(
     if action == "cancel":
         target.status = ReminderStatus.cancelled
         await session.commit()
+        logger.info(
+            "取消提醒", conversation_id=conversation_id, user_id=user_id, reminder_id=str(target.id), status="ok"
+        )
         return {
             "reply_plan": {"mode": "template", "text": f"已取消“{target.title}”的提醒。"},
             "tools_meta": [{"name": "manage_reminder", "status": "ok"}],
@@ -234,6 +245,9 @@ async def _handle_update_or_cancel(
         return _rule_error_reply(exc)
 
     await session.commit()
+    logger.info(
+        "修改提醒", conversation_id=conversation_id, user_id=user_id, reminder_id=str(target.id), status="ok"
+    )
     tz = resolve_timezone(tenant_timezone)
     local = target.event_at.astimezone(tz)
     reply = f"已把“{target.title}”的提醒改到 {local:%m 月 %d 日 %H:%M}，提前 {target.advance_minutes} 分钟通知你。"
@@ -266,7 +280,9 @@ async def reminder(state: GraphState, runtime) -> dict[str, Any]:
     if action == "view":
         return await _handle_view(session, tenant_id, user_id, tenant_timezone)
     if action in ("update", "cancel"):
-        return await _handle_update_or_cancel(session, tenant_id, user_id, tenant_timezone, action, args)
+        return await _handle_update_or_cancel(
+            session, tenant_id, user_id, state["conversation_id"], tenant_timezone, action, args
+        )
 
     logger.warning("manage_reminder 收到未知 action", action=action)
     return {

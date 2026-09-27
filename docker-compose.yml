@@ -59,6 +59,9 @@ services:
       # 测试代码不进镜像（app.Dockerfile 的 tools 阶段也不 COPY tests/），靠挂载在运行时
       # 拿到测试代码，只读即可
       - ./tests:/app/tests:ro
+      # 阶段四 4.6：loadtest/gen_users.py 要写 loadtest/tokens.json（压测用户 token，
+      # 见 .gitignore），跟 tests/ 一样不 COPY 进镜像，但这个要能写回宿主机，不能是只读挂载
+      - ./loadtest:/app/loadtest
     depends_on:
       postgres:
         condition: service_healthy
@@ -249,6 +252,22 @@ services:
       MOCK_FINANCE_MODE: ${MOCK_FINANCE_MODE}
     ports:
       - "${MOCK_FINANCE_HOST_PORT}:8000"
+
+  # 阶段四 4.6，关键设计决定 6：压测用官方 k6 镜像，单独一个 profile（"loadtest"），不带
+  # profiles 的 `make up`/`docker compose up` 不会启动它；`docker compose run --rm k6 run
+  # xxx.js` 才会临时起一个容器跑完就退出，跟 tools/mocks-tools 是同一个"一次性容器"套路。
+  # k6 直接用 docker 网络内部地址连 gateway/RabbitMQ 管理接口，不需要额外开端口给宿主机。
+  k6:
+    image: grafana/k6:latest
+    profiles: ["loadtest"]
+    working_dir: /loadtest
+    volumes:
+      - ./loadtest:/loadtest
+    environment:
+      GATEWAY_WS_URL: ws://gateway:8000/ws
+      RABBITMQ_MGMT_URL: http://rabbitmq:15672
+      RABBITMQ_USER: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
 
 volumes:
   postgres_data:

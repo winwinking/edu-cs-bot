@@ -14,3 +14,7 @@ __pycache__/
 .DS_Store
 
 *.log
+
+# 压测用户 token（PHASE4.md 4.6 关键设计决定 6）：明文 JWT，绝不能进 git
+loadtest/tokens.json
+loadtest/output/

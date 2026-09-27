@@ -272,9 +272,27 @@ async def respond(tenant_id: str, user_id: str, reply_to: str, state: GraphState
         # 知识问答专用兜底（2.8 第 5 点）：LLM 生成的句子全被出处检查拦下了（或者干脆没生成出
         # 任何有效内容），guard 手上一句都没成功发出去——用排名第一的检索结果原文垫底，
         # 保证"依据……"这个出处开头后面一定跟着真实存在的内容，不会孤零零地漏发
-        if plan.get("lead_in") and not guard.emitted_any and plan.get("fallback_text"):
+        fallback_used = bool(plan.get("lead_in") and not guard.emitted_any and plan.get("fallback_text"))
+        if fallback_used:
             await emit(guard.feed(plan["fallback_text"]))
             await emit(guard.flush())
+
+        # PHASE4.md 4.6 人审发现的同一处补充：只有知识问答的 reply_plan 才会带非空的
+        # allowed_citations（chitchat 的 reply_plan 也带了这个字段，但值是空列表，不是
+        # None——这里必须用真值判断，不能用"is not None"，不然会把 chitchat 也误判成知识问答
+        # 记一条同名日志，见 AGENT_LOG 本步骤的记录），这里把 OutputGuard 真正核对出处的结果
+        # 落一条结构化日志——删了几句、被删句子引用的是哪些编造出处、有没有触发上面这条
+        # "输出第一条条款原文"兜底，只记编号和数量，不记生成的句子原文（脱敏规则管不到"业务上
+        # 正常但不该被记录"的整段回复内容）
+        if plan.get("allowed_citations"):
+            logger.info(
+                "知识问答 OutputGuard 核对完成",
+                conversation_id=state.get("conversation_id"),
+                dropped_sentences=guard.dropped_sentences,
+                dropped_citations=[list(c) for c in guard.dropped_citations],
+                banned_phrases_removed=guard.banned_phrases_removed,
+                fallback_used=fallback_used,
+            )
 
         # 只有真的成功调用了 LLM（没被熔断拦下、没有中途报错）才记账——被熔断拦下/调用失败的
         # 这次请求，mock-llm/真实 LLM 根本没收到或者没处理完，没有真实成本可记

@@ -5,7 +5,9 @@
 `_classify_with_llm` 本身只负责把 fallback_reason 定成哪个值，具体话术由 app/worker/graph/
 nodes.py 的 `fallback()` 节点选，这里两段分别测。
 """
+import httpx
 import pytest
+from openai import APITimeoutError
 
 from app.common.circuit_breaker import CircuitBreakerOpenError
 from app.worker.graph import classify as classify_module
@@ -61,6 +63,27 @@ async def test_circuit_open_and_no_keyword_match_keeps_llm_unavailable_reason(mo
     assert result["fallback_reason"] == "llm_unavailable"
     assert result["circuit_breaker"] == ["llm"]
     assert "budget_exceeded" not in result
+
+
+@pytest.mark.asyncio
+async def test_llm_timeout_falls_back_to_keyword_rules(monkeypatch):
+    # 阶段四故障注入 9 审查修复：超时（跟熔断打开不是一回事，这里没有触发熔断，是单次调用
+    # 自己超时）也要走同一条"降级为关键词规则"路径，不能因为改成"超时不重试"就漏掉降级
+    async def fake_is_budget_exceeded(tenant_id, tenant_timezone, budget):
+        return False
+
+    async def fake_chat_completion(**kwargs):
+        raise APITimeoutError(httpx.Request("POST", "http://mock-llm:8000/v1/chat/completions"))
+
+    monkeypatch.setattr(classify_module, "get_daily_budget", lambda session, tenant_id: _async_none())
+    monkeypatch.setattr(classify_module, "is_budget_exceeded", fake_is_budget_exceeded)
+    monkeypatch.setattr(classify_module, "chat_completion", fake_chat_completion)
+
+    result = await classify_module._classify_with_llm(_state(), session=None)
+
+    assert result["intent"] == "fallback"
+    assert result["fallback_reason"] == "llm_unavailable"
+    assert "circuit_breaker" not in result  # 没有熔断打开，跟上面那条用例的路径要能区分开
 
 
 async def _async_none():

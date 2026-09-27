@@ -18,6 +18,7 @@ import httpx
 import pytest
 from openai import APITimeoutError
 from sqlalchemy.dialects import postgresql
+from structlog.testing import capture_logs
 
 from app.worker.graph import handoff as handoff_module
 from app.worker.graph.handoff import (
@@ -198,11 +199,23 @@ async def test_handoff_reports_left_message_when_agents_status_unavailable(monke
     session = _FakeSession()
     runtime = SimpleNamespace(context=SimpleNamespace(session=session))
 
-    result = await handoff(_handoff_state(), runtime)
+    with capture_logs() as logs:
+        result = await handoff(_handoff_state(), runtime)
 
     assert "人工客服现在不在线" in result["reply_plan"]["text"]
     assert len(session.added) == 1
     assert session.added[0].status == HandoffStatus.left_message
+
+    # PHASE4.md 4.6 人审确认第 1 条：转人工工单创建要有结构化日志，只记状态/ID，不记摘要原文
+    entries = [e for e in logs if e.get("event") == "转人工工单创建"]
+    assert len(entries) == 1
+    assert entries[0]["conversation_id"] == _handoff_state()["conversation_id"]
+    assert entries[0]["user_id"] == "u_a_1001"
+    assert entries[0]["ticket_id"] == result["handoff_ticket_id"]
+    assert entries[0]["trigger"] == "keyword"
+    assert entries[0]["status"] == "left_message"
+    assert entries[0]["online"] is False
+    assert "摘要" not in str(entries[0])
 
 
 class _CapturingSession:

@@ -60,6 +60,20 @@ def test_sentence_with_disallowed_citation_is_dropped():
     assert guard.dropped_sentences == 1
 
 
+def test_dropped_sentence_records_disallowed_citation_number_only():
+    # PHASE4.md 4.6 人审发现：只有 dropped_sentences 计数排查不出具体是哪条编造的出处被拦下，
+    # 补记编号，但不能把整句原文也记下来
+    guard = OutputGuard(allowed_citations=[("课程服务协议", "4.2")])
+    guard.feed("根据《课程服务协议》第 9.9 条，所有课程都可以随时全额退款。")
+    assert guard.dropped_citations == [("课程服务协议", "9.9")]
+
+
+def test_dropped_sentence_with_multiple_citations_records_only_disallowed_ones():
+    guard = OutputGuard(allowed_citations=[("课程服务协议", "4.2")])
+    guard.feed("参见《课程服务协议》第 4.2 条和《退费政策》第 9.9 条，随时可退款。")
+    assert guard.dropped_citations == [("退费政策", "9.9")]
+
+
 def test_citation_without_book_title_brackets_is_not_checked():
     # "本协议第 5.2 条"没有书名号，不是我们要核对的出处格式，不应该被误伤
     guard = OutputGuard(allowed_citations=[("课程服务协议", "4.2")])

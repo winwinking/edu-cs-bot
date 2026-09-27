@@ -9,6 +9,7 @@ import uuid
 from sqlalchemy import select
 
 from app.common.llm_usage import get_daily_budget, is_budget_exceeded
+from app.common.logging import get_logger
 from app.common.models import Tenant, User
 from app.worker.graph.context_summary import append_summary_block, load_history_summary
 from app.worker.graph.reminder import format_reminder_list_block, load_active_reminders
@@ -21,6 +22,8 @@ from app.worker.graph.style import (
     SENSITIVE_REPLY,
     STYLE_SYSTEM_PROMPT,
 )
+
+logger = get_logger(__name__)
 
 
 async def load_context(state: GraphState, runtime) -> dict:
@@ -75,6 +78,14 @@ async def chitchat(state: GraphState, runtime) -> dict:
 
 
 async def sensitive(state: GraphState, runtime) -> dict:
+    # PHASE4.md 4.6 人审发现同一批：敏感操作拒绝原来只有 meta.risk_flags 传给客户端，服务端
+    # 完全没留痕，只记谁在哪个会话触发了拒绝，不记消息原文
+    logger.info(
+        "敏感操作拒绝",
+        conversation_id=state.get("conversation_id"),
+        user_id=state.get("user_id"),
+        risk_flags=state.get("risk_flags", []),
+    )
     return {"reply_plan": {"mode": "template", "text": SENSITIVE_REPLY}}
 
 

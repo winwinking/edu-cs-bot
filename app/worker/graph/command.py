@@ -217,6 +217,15 @@ async def command(state: GraphState, runtime) -> dict[str, Any]:
         trace_id=state.get("trace_id"),
         conversation_id=state.get("conversation_id"),
     )
+    # PHASE4.md 4.6 人审发现同一批：只记动作、结果和 ID，不记参数/回复原文（参数可能带课程名
+    # 这类业务数据，不算敏感信息，但日志只用来排查"这次指令执行成功没有"，不需要）
+    logger.info(
+        "平台指令执行结果",
+        conversation_id=state.get("conversation_id"),
+        user_id=user_id,
+        action=action,
+        status="ok" if success else "upstream_error",
+    )
 
     reply = _LOW_RISK_REPLY.get(action, "已经处理好了。") if success else PLATFORM_LOW_RISK_ERROR_REPLY
     return {
@@ -326,6 +335,13 @@ async def request_confirmation(state: GraphState, runtime) -> dict[str, Any]:
         )
     )
     await session.commit()
+    logger.info(
+        "高风险指令发起二次确认",
+        conversation_id=conversation_id,
+        user_id=user_id,
+        action=action,
+        pending_action_id=str(pending_id),
+    )
 
     return {
         "reply_plan": {"mode": "template", "text": confirm_text},
@@ -337,10 +353,18 @@ async def request_confirmation(state: GraphState, runtime) -> dict[str, Any]:
 async def confirm_action(state: GraphState, runtime) -> dict[str, Any]:
     session = runtime.context.session
     tenant_id = state["tenant_id"]
+    user_id = state["user_id"]
     conversation_id = state["conversation_id"]
 
     target = await _find_target_pending_action(session, tenant_id, conversation_id)
     if target is None:
+        logger.info(
+            "用户确认高风险指令",
+            conversation_id=conversation_id,
+            user_id=user_id,
+            pending_action_id=None,
+            outcome="no_pending",
+        )
         return {"reply_plan": {"mode": "template", "text": PLATFORM_ALREADY_PROCESSED_REPLY}}
 
     # 原子抢占：只有 status 还是 pending 且没过期才能抢到，抢到的同时把状态改成 executing，
@@ -369,8 +393,30 @@ async def confirm_action(state: GraphState, runtime) -> dict[str, Any]:
                 .values(status=PendingActionStatus.expired)
             )
             await session.commit()
+            logger.info(
+                "用户确认高风险指令",
+                conversation_id=conversation_id,
+                user_id=user_id,
+                pending_action_id=str(target.id),
+                outcome="expired",
+            )
             return {"reply_plan": {"mode": "template", "text": PLATFORM_CONFIRM_TIMEOUT_REPLY}}
+        logger.info(
+            "用户确认高风险指令",
+            conversation_id=conversation_id,
+            user_id=user_id,
+            pending_action_id=str(target.id),
+            outcome="already_processed",
+        )
         return {"reply_plan": {"mode": "template", "text": PLATFORM_ALREADY_PROCESSED_REPLY}}
+
+    logger.info(
+        "用户确认高风险指令",
+        conversation_id=conversation_id,
+        user_id=user_id,
+        pending_action_id=str(acquired.id),
+        outcome="acquired",
+    )
 
     action = acquired.args["action"]
     params = {k: v for k, v in acquired.args.items() if k != "action" and v is not None}
@@ -404,6 +450,13 @@ async def confirm_action(state: GraphState, runtime) -> dict[str, Any]:
         trace_id=state.get("trace_id"),
         conversation_id=conversation_id,
     )
+    logger.info(
+        "平台指令执行结果",
+        conversation_id=conversation_id,
+        user_id=user_id,
+        action=action,
+        status="ok" if success else "upstream_error",
+    )
 
     reply = _build_success_reply(action, acquired.args) if success else _build_failure_reply(action)
     return {
@@ -415,8 +468,17 @@ async def confirm_action(state: GraphState, runtime) -> dict[str, Any]:
 
 async def cancel_action(state: GraphState, runtime) -> dict[str, Any]:
     session = runtime.context.session
-    target = await _find_target_pending_action(session, state["tenant_id"], state["conversation_id"])
+    conversation_id = state["conversation_id"]
+    user_id = state["user_id"]
+    target = await _find_target_pending_action(session, state["tenant_id"], conversation_id)
     if target is None:
+        logger.info(
+            "用户取消高风险指令",
+            conversation_id=conversation_id,
+            user_id=user_id,
+            pending_action_id=None,
+            outcome="no_pending",
+        )
         return {"reply_plan": {"mode": "template", "text": PLATFORM_ALREADY_PROCESSED_REPLY}}
 
     cancel_stmt = (
@@ -429,8 +491,22 @@ async def cancel_action(state: GraphState, runtime) -> dict[str, Any]:
     await session.commit()
 
     if cancelled is None:
+        logger.info(
+            "用户取消高风险指令",
+            conversation_id=conversation_id,
+            user_id=user_id,
+            pending_action_id=str(target.id),
+            outcome="already_processed",
+        )
         return {"reply_plan": {"mode": "template", "text": PLATFORM_ALREADY_PROCESSED_REPLY}}
 
+    logger.info(
+        "用户取消高风险指令",
+        conversation_id=conversation_id,
+        user_id=user_id,
+        pending_action_id=str(cancelled.id),
+        outcome="cancelled",
+    )
     state_text = _cancel_state_text(cancelled.args["action"], cancelled.args)
     return {
         "reply_plan": {"mode": "template", "text": f"好的，已取消。{state_text}。"},

@@ -60,14 +60,37 @@ async def knowledge(state: GraphState, runtime) -> dict:
         tool_status = "ok"
     except httpx.TimeoutException:
         # 只有 MockKnowledgeRetriever 会走到这条（调用 mock-knowledge，带 2 秒超时）
-        logger.warning("知识检索超时，按无命中处理")
+        logger.warning("知识检索超时，按无命中处理", conversation_id=state.get("conversation_id"), query=query)
         results, tool_status = [], "timeout"
     except Exception as exc:  # noqa: BLE001 —— 检索失败不能让整条流水线崩掉，降级成"没查到"
-        logger.warning("知识检索失败，按无命中处理", error=str(exc))
+        logger.warning(
+            "知识检索失败，按无命中处理", conversation_id=state.get("conversation_id"), query=query, error=str(exc)
+        )
         results, tool_status = [], "upstream_error"
 
     # 阈值是检索器自己的属性，不是全局配置——pgvector 和 mock_knowledge 打分尺度不一样（见 2.3）
     qualifying = [r for r in results if r.score >= retriever.min_score]
+
+    # PHASE4.md 4.6 人审发现：故障注入时靠 trace_id 在 worker 日志里搜不到知识问答路径的任何
+    # 一行结构化日志，没法确认这次检索用的是什么 query、命中了哪些条款、有没有低于阈值。这里
+    # 只记条款编号和分数，不记条款原文/回复原文——日志脱敏规则不认识"知识条款内容"这个字段名，
+    # 记全文有把知识库内容原样堆进日志的风险，而条款编号本身就足够排查检索结果对不对
+    logger.info(
+        "知识检索完成",
+        conversation_id=state.get("conversation_id"),
+        query=query,
+        min_score=retriever.min_score,
+        tool_status=tool_status,
+        results=[
+            {
+                "doc_title": r.doc_title,
+                "clause_no": r.clause_no,
+                "score": round(r.score, 4),
+                "below_threshold": r.score < retriever.min_score,
+            }
+            for r in results
+        ],
+    )
 
     if not qualifying:
         return {

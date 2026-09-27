@@ -43,6 +43,10 @@ class OutputGuard:
         self._buffer = ""
         self.banned_phrases_removed = 0
         self.dropped_sentences = 0
+        # 被丢掉的句子里引用过的出处（书名, 条款号），只记编号不记整句原文——供知识问答路径的
+        # 结构化日志用（PHASE4.md 4.6 人审发现：故障注入时靠 trace_id 查不到 OutputGuard 有没有
+        # 生效，只有 dropped_sentences 计数不够排查，得知道具体是哪条编造的出处被拦下）
+        self.dropped_citations: List[Tuple[str, str]] = []
         self._allowed_citations = {tuple(c) for c in allowed_citations} if allowed_citations is not None else None
         self._lead_in = lead_in
         # 有没有成功发出过至少一句——知识问答场景下，respond() 靠这个字段判断要不要拼兜底话术
@@ -80,19 +84,23 @@ class OutputGuard:
         cleaned = self._clean(raw_sentence)
         if not cleaned:
             return ""
-        if self._allowed_citations is not None and self._has_disallowed_citation(cleaned):
-            self.dropped_sentences += 1
-            return ""
+        if self._allowed_citations is not None:
+            disallowed = self._find_disallowed_citations(cleaned)
+            if disallowed:
+                self.dropped_sentences += 1
+                self.dropped_citations.extend(disallowed)
+                return ""
         if self._lead_in and not self.emitted_any:
             cleaned = self._lead_in + cleaned
         self.emitted_any = True
         return cleaned
 
-    def _has_disallowed_citation(self, sentence: str) -> bool:
-        for match in _CITATION_RE.finditer(sentence):
-            if (match.group(1), match.group(2)) not in self._allowed_citations:
-                return True
-        return False
+    def _find_disallowed_citations(self, sentence: str) -> List[Tuple[str, str]]:
+        return [
+            (match.group(1), match.group(2))
+            for match in _CITATION_RE.finditer(sentence)
+            if (match.group(1), match.group(2)) not in self._allowed_citations
+        ]
 
     def _clean(self, sentence: str) -> str:
         cleaned = sentence
