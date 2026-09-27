@@ -322,6 +322,21 @@
   csv=/loadtest/output/steady_worker3.csv ...`（没走 Makefile 目标）时忘了加
   `MSYS_NO_PATHCONV=1`，同样的路径转换问题导致第一次尝试在发消息之前就报错退出（0% 进度，
   没有产生任何压测数据，不影响后续结果），加前缀重跑一次成功。
+- 步骤 5.1：PHASE5.1 原文注意事项写"compose 的项目名按目录名区分，新目录的数据卷不会和原
+  环境混用"，agent 一开始信了这个假设，直接在 `E:\ailearning\edu-cs-bot-fresh` 目录
+  `make up` 后跑完 `make test`（四层全过），复核 `docker volume ls` 才发现只有一份
+  `edu-cs-bot_postgres_data`——`docker-compose.yml` 顶层写死了 `name: edu-cs-bot`，这个
+  字段优先级高于目录名，新目录的 `make up` 实际复用了原环境已经迁移、已经种子过的同一套
+  容器/网络/数据卷，那一轮"全新克隆"结果是假的。没有让这版结果进过给 Jo 的检查点 H 汇报，
+  已改用 `COMPOSE_PROJECT_NAME=edu-cs-bot-fresh` 隔离项目名重新验证一遍再汇报（见"步骤
+  5.1：全新克隆验证一键启动"）。
+- 步骤 5.1：修复 `scripts/seed.py` 让 tenants 改成 `ON CONFLICT DO NOTHING` 后，第一次
+  验证"连续 `make up` 两次、手动改过的 `daily_token_budget` 是否保留"时发现改动没生效
+  （`t_b` 的预算又被冲回了种子默认值 500000）；排查发现 `tools` 服务不在 `make up` 启动的
+  服务集合里（`profiles` 挡住了），`docker compose up -d --build` 不会重新构建它，而
+  `docker compose run --rm tools ...` 默认只在镜像不存在时才现场构建，用的是改代码之前的
+  旧镜像；给 `up` 目标里两处 `docker compose run --rm tools ...` 都加上 `--build` 后重新
+  验证，两次 `make up` 后 `daily_token_budget` 都保持 999999 不变。
 
 ---
 
@@ -5349,3 +5364,97 @@ worker=3` 又 `--scale worker=1` 是压测期间的临时操作，跑完已经�
 **未做的事（按 Jo 指示）**：没有 `git commit`/`git push`；没有恢复 t_a 的 token 预算、没有
 清空 Redis 键（Jo 说这两件事由她自己做）；`docker compose up -d --scale worker=1` 已执行
 并确认 healthy。
+
+---
+
+## 步骤 5.1：全新克隆验证一键启动
+
+**日期**：2026-09-27
+
+**做什么**：按 PHASE5.1，`make down`（不加 `-v`）后把仓库克隆一份到
+`E:\ailearning\edu-cs-bot-fresh`，只做评委会做的事（复制 `.env.example` 为 `.env`，跑
+`make up`/`make test`/`make demo`），Jo 中途追加要求再验证 `make loadtest`（重点看
+`loadtest/tokens.json` 缺失时能不能自动生成）。验证中发现三个问题，Jo 审查后逐一定了处理
+方式，本节记录这三个问题、处理方式和修复后的复验结果。
+
+**问题 1：`docker-compose.yml` 的 `name: edu-cs-bot` 让"全新克隆"验证方法论本身失效**——
+详见上面索引"agent 自查修复"第一条。Jo 的处理决定：不删 `name:` 字段（检查过
+`docker exec`/`docker network`/`docker volume` 这类直接依赖固定容器名/网络名/卷名的用法，
+只在 `AGENT_LOG.md` 里出现过几条历史上手动排查 RabbitMQ 队列的一次性命令，`scripts/`、
+`Makefile`、`.github/workflows/ci.yml`、`tests/` 里没有任何地方依赖这个固定项目名；真正
+写死的是镜像名 `edu-cs-bot/app:latest`/`edu-cs-bot/mocks:latest` 等几个，这些和 Compose
+项目名是两回事，删不删 `name:` 都不影响它们），改为在 README 新增"同一台机器同时跑两份
+代码"一节，说明需要时用 `COMPOSE_PROJECT_NAME` 环境变量隔离；同时把 PHASE5.md 5.1"注意"
+里那句错误的假设改成了正确说法，并把"做什么"里的命令顺序按问题 2/3 修复后的实际情况更新。
+
+**问题 2：`make up` 不会自动迁移+种子数据，PHASE5.1 原文命令顺序（`make up`/`make test`/
+`make demo`）跑不通**——全新的数据库上直接 `make test` 报
+`relation "conversations" does not exist`，README 实际的"启动步骤"一节本来就有
+`make migrate`/`make seed` 两步，只是 PHASE5.1 摘要漏写了。Jo 的处理决定：把 `make up`
+改成真正一键启动，容器全部 healthy 后自动跑 `alembic upgrade head` + `seed.py` +
+`reindex.py`，硬性要求种子数据可重复执行、不产生重复数据、不覆盖已修改字段。改动：
+- `Makefile` 的 `up` 目标：`docker compose up -d --build` 之后加 `docker compose up -d
+  --wait`（确认全部 healthy 再往下走）、`docker compose run --rm --build tools alembic
+  upgrade head`、`docker compose run --rm --build tools sh -c "python scripts/seed.py &&
+  python scripts/reindex.py"`。`--wait` 单独调用一次遇到失败会重试一次（`sleep 10` 后
+  再试）——这是验证时发现的另一个真实但无关的抖动：RabbitMQ 健康检查（`rabbitmq-diagnostics
+  ping`）通过的那一刻 AMQP 端口不一定已经能接受新连接，worker 偶尔第一次连接失败退出，
+  `restart: unless-stopped` 几秒内自己重连成功，这是已有的自愈机制，只是以前 `make up`
+  从不等 healthy 状态，没人注意到这个窗口；两次全新克隆验证都各遇到了一次，重试后都成功，
+  没有真正卡住过。
+- `scripts/seed.py`：tenants 的写法从 `ON CONFLICT DO UPDATE`（覆盖成种子里的最新配置）
+  改成 `ON CONFLICT DO NOTHING`（跟 users/guardian_links 一样，只在首次创建时写入），
+  否则压测/演示期间手动改过的 `daily_token_budget` 等字段会被每次 `make up` 冲回默认值。
+  这是有意的行为变更，偏离了原来的设计意图（原来是想让老环境的机构配置能跟着代码里的种子
+  默认值更新），Jo 已确认接受这个取舍：以后如果需要批量更新已有机构的配置，应该用一次性的
+  运维脚本，不能让常驻的 `make up` 顺手做。
+- README：启动步骤去掉手动 `make migrate`/`make seed` 两行，Makefile 目标表 `make up`
+  一行加说明；新增"同一台机器同时跑两份代码"一节（问题 1）。
+
+**问题 3：`make loadtest` 缺 `loadtest/tokens.json` 时直接抛 k6 原始堆栈，评委不知道要先
+跑 `loadtest-users`**——`loadtest/tokens.json` 被 `.gitignore` 挡掉不进 git，`loadtest`
+目标原来不依赖 `loadtest-users`，报错是 `GoError: stat /loadtest/tokens.json: no such
+file or directory`。Jo 的处理决定：四个场景目标（`loadtest-steady`/`loadtest-burst`/
+`loadtest-finance`/`loadtest-llm-timeout`）都改成依赖 `loadtest-users`，评委敲任何一个
+目标（包括聚合的 `make loadtest`）都会自动先备好 token。选择"每次都重新生成"而不是"只在
+文件不存在时生成"：`gen_users.py` 对用户本身是幂等的（`ON CONFLICT DO NOTHING`，1600 个
+用户批量 upsert 一两秒），但 token 有 6 小时有效期，只在文件缺失时生成的话，环境跑了一整天
+后再压测会拿到一批已过期的 token，报出来的是一堆认证失败，容易被误判成系统故障而不是
+"token 过期"这种配置问题；`loadtest-users` 是 phony 目标，`make loadtest` 依次跑四个场景
+时只会在第一次用到时真正执行一遍，不会跑四次。
+
+**修复后的复验（原目录）**：
+- 连续两次 `make up`（先手动把 `tenants.id='t_b'` 的 `daily_token_budget` 改成 999999
+  模拟"已修改过的预算"）：两次之后 `tenants`（id/daily_token_budget）、`users`、
+  `guardian_links`、`knowledge_documents`、`knowledge_chunks` 的行数和内容完全一致
+  （`t_a`=2000000、`t_b`=999999 不变，2/1607/2/14/117 行数不变），`docker compose ps`
+  全部 healthy。
+
+**修复后的复验（隔离的全新克隆，`COMPOSE_PROJECT_NAME=edu-cs-bot-fresh`）**：因为 Jo 明确
+说本阶段"汇报后停下，不要提交"，`git clone` 只能拿到已提交的历史，验证用的 `Makefile`/
+`README.md`/`scripts/seed.py` 是克隆后手动从原目录覆盖过去的三个未提交改动文件（`docs/
+PHASE5.md` 本来就是未跟踪文件，跟之前一样不会进克隆）。只执行 `make up`→`make test`→
+`make demo`→`make loadtest`，中间没有插入任何其它命令：
+- `make up`：`--wait` 第一次遇到上面提到的 RabbitMQ/worker 抖动，重试一次后全部 healthy。
+- `make test`：不需要手动 migrate/seed，四层全过（238 passed 2 skipped / 42 passed /
+  11 passed / 10 passed）。
+- `make demo`：三步全部按预期输出（ACK/首 token/完整回复三个耗时、重发 duplicate）。
+- `make loadtest`：`loadtest/tokens.json` 确认不存在，命令自动跑了
+  `loadtest/gen_users.py`（不需要手动跑 `loadtest-users`），随后场景 1 以全量规模（500
+  VUs）正常发起连接、开始发消息，85 秒内完成 18 轮迭代、无错误，确认链路通畅后手动终止
+  （这是冒烟验证，不需要跑满 5 分钟）。
+- 清理：隔离项目 `docker compose down -v`（容器/网络/`edu-cs-bot-fresh_*` 三个卷全部
+  删除）、删除 `edu-cs-bot-fresh` 目录、原目录 `make up`、`docker compose ps` 确认全部
+  healthy。
+
+**改动文件**：`Makefile`（`up` 目标自动迁移+种子数据、四个 loadtest 场景目标依赖
+`loadtest-users`）、`scripts/seed.py`（tenants 改 `ON CONFLICT DO NOTHING`）、
+`README.md`（启动步骤、Makefile 目标表、新增"同一台机器同时跑两份代码"一节）、
+`docs/PHASE5.md`（5.1 的错误假设改正、命令顺序更新、补 loadtest 验证要求）。
+
+**影响哪些服务**：`Makefile`/`README.md` 是共用文档/脚本，不影响任何服务的运行时代码；
+`scripts/seed.py` 只影响一次性种子数据脚本的写入语义（`make up`/`make seed` 会调用到），
+不影响 gateway/worker/scheduler/mocks 的业务逻辑。`docker-compose.yml` 本身这次没有改动
+（问题 1 的处理决定是保留 `name:` 字段，不动这个文件）。
+
+**未做的事（按 Jo 指示）**：没有 `git commit`；`docs/PHASE5.md` 5.3~5.7 尚未开始。

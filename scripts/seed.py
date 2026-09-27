@@ -94,18 +94,16 @@ GUARDIAN_LINKS = [
 
 async def main() -> None:
     async with AsyncSessionLocal() as session:
-        # tenants 用 ON CONFLICT DO UPDATE：机构配置（预算、服务时间等）以这份种子数据为准，
-        # 重新跑 seed 要能把老环境里已经存在、但字段还是旧值（比如 daily_token_budget 还是 NULL）
-        # 的机构更新到最新配置，不是插不进去就算了
+        # tenants 改成 ON CONFLICT DO NOTHING（5.1 全新克隆审查后改的：make up 现在会自动跑
+        # seed，机构配置必须"只在首次创建时写入，之后不再覆盖"，否则压测/演示期间手动改过的
+        # daily_token_budget 等字段会被每次 make up 悄悄冲回种子默认值。这跟"改代码里的种子
+        # 默认值想推给老环境"是两回事——后面这种需求如果出现，应该用一次性的迁移或运维脚本去改
+        # 已有机构的配置，不应该让常驻的 make up 顺手做这件事。
         for tenant in TENANTS:
-            stmt = pg_insert(Tenant).values(**tenant)
-            stmt = stmt.on_conflict_do_update(
-                index_elements=["id"],
-                set_={k: stmt.excluded[k] for k in tenant if k != "id"},
-            )
+            stmt = pg_insert(Tenant).values(**tenant).on_conflict_do_nothing(index_elements=["id"])
             await session.execute(stmt)
-        # users/guardian_links 保持 ON CONFLICT DO NOTHING：种子脚本要能重复跑，不能因为已经
-        # 种过就报唯一约束冲突，但这两类不是"配置"，不需要每次都覆盖成种子里的值
+        # users/guardian_links 同样用 ON CONFLICT DO NOTHING：种子脚本要能重复跑，不能因为已经
+        # 种过就报唯一约束冲突，也不需要每次都覆盖成种子里的值
         for user in USERS:
             stmt = pg_insert(User).values(**user).on_conflict_do_nothing(index_elements=["id"])
             await session.execute(stmt)

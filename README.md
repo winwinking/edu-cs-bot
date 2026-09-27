@@ -96,17 +96,34 @@ worker 收到一条消息后，先过 `app/worker/graph/classify.py` 判出意�
 
 ```bash
 cp .env.example .env    # 按需修改，尤其是密码类变量
-make up                 # 起基础设施 + gateway/worker/scheduler + 5 个 mock 服务
-make migrate             # 建表
-make seed                # 种两个租户、七个用户 + 建知识库索引（等价于 seed.py + reindex.py）
+make up                  # 起基础设施 + gateway/worker/scheduler + 5 个 mock 服务，等全部 healthy
+                         # 后自动跑数据库迁移 + 种子数据（两个租户、七个用户）+ 建知识库索引，
+                         # 一条命令到位，不用再手动跑 migrate/seed
 make demo                # 生成 token -> 发消息看三个耗时 -> 同 message_id 重发看 duplicate
 ```
 
-改了 `data/knowledge/` 下的文档之后单独重建索引（不用重新 seed）：
+`make up` 里的迁移和种子数据都是幂等的：重复执行不会产生重复数据，也不会覆盖已经改过的机构配置
+（比如压测/演示中调整过的 `daily_token_budget`）。`make migrate`/`make seed` 仍然保留成独立目标，
+只是不需要在启动步骤里手动敲了；改了 `data/knowledge/` 下的文档之后单独重建索引用这个（不用重新
+seed，也不用整个重新 `make up`）：
 
 ```bash
 make reindex             # 等价于 docker compose run --rm tools python scripts/reindex.py
 ```
+
+### 同一台机器同时跑两份代码
+
+`docker-compose.yml` 顶层写死了 `name: edu-cs-bot`，这个字段的优先级高于目录名——同一台机器上
+如果有两份 checkout（比如再 clone 一份到别的目录做对比测试），直接在两边分别 `make up` 会共用
+同一套容器名、网络、数据卷，互相覆盖而不会报错。需要同时跑两份时，给其中一份设置
+`COMPOSE_PROJECT_NAME` 环境变量隔离：
+
+```bash
+COMPOSE_PROJECT_NAME=edu-cs-bot-fresh make up
+```
+
+这样这一份用的容器名、网络名、数据卷名都会带 `edu-cs-bot-fresh` 前缀，跟另一份互不干扰；`make
+down`/`make test`/`make demo` 等其它目标也要带着同样的环境变量才会操作到对应的那一份。
 
 跑起来之后可以：
 - 浏览器打开 `http://localhost:8080`（演示控制台），顶部下拉框选一个身份直接连（token 由控制台后端现场签发，不用再手工跑 `gen_token.py` 粘贴），左下角点 10 个 E2E 场景按钮快捷发送，右边看每次回复的透视面板
@@ -220,7 +237,7 @@ docs/          # REQUIREMENTS.md（需求原文）、PHASE*.md（各阶段任务
 
 | 目标 | 作用 |
 |---|---|
-| `make up` | 启动基础设施 + gateway/worker/scheduler + 5 个 mock 服务（不含 `tools`，见下） |
+| `make up` | 启动基础设施 + gateway/worker/scheduler + 5 个 mock 服务（不含 `tools`，见下），等全部 healthy 后自动跑 `migrate` + `seed`，幂等，可重复执行 |
 | `make down` | 停止所有服务 |
 | `make logs` | 跟着看所有服务日志 |
 | `make ps` | 看各服务状态 |
@@ -229,7 +246,7 @@ docs/          # REQUIREMENTS.md（需求原文）、PHASE*.md（各阶段任务
 | `make reindex` | 只重建知识库索引，不重新种子数据 |
 | `make demo` | 见上面"启动步骤" |
 | `make test` | 单测（`tools` 镜像）+ mock-llm 专属单测（`mocks-tools` 镜像，见下）+ 集成 + e2e，共四层 |
-| `make loadtest-users` | 生成压测用户 + token（t_a 下 1600 个，写进不进 git 的 `loadtest/tokens.json`） |
+| `make loadtest-users` | 生成压测用户 + token（t_a 下 1600 个，写进不进 git 的 `loadtest/tokens.json`）。下面四个场景目标都会自动依赖这个目标，不需要手动单独跑；每次都会重新生成（用户是幂等的，token 6 小时过期，重新生成保证不会拿到过期 token） |
 | `make loadtest-steady` | 压测场景 1：稳定（500 连接，200 msg/s，5 分钟） |
 | `make loadtest-burst` | 压测场景 2：突发（≥1000 VU，1000 msg/s，30 秒，另跑 3 分钟观察队列消化） |
 | `make loadtest-finance` | 压测场景 3：财务查询（100 QPS，2 分钟） |
