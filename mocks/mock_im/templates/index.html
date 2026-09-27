@@ -32,7 +32,7 @@
 
   #main { display: flex; gap: 16px; align-items: flex-start; }
   #left { flex: 3; min-width: 0; }
-  #right { flex: 2; min-width: 300px; }
+  #right { flex: 2; min-width: 300px; position: relative; }
 
   .card { background: #fff; border: 1px solid var(--border); border-radius: 4px; padding: var(--gap); margin-bottom: var(--gap); }
 
@@ -87,6 +87,25 @@
      不显示"无异常" */
   #flow-anomaly-banner { display: none; background: var(--warn-bg); border: 1px solid var(--danger); color: var(--danger); font-size: 12px; padding: 6px 10px; border-radius: 4px; margin-bottom: 8px; }
   .panel-val.anomaly { color: var(--danger); }
+
+  /* 架构路线图（阶段五新增，纯前端，只改 mocks/mock_im）：覆盖整个右侧面板的弹层，节点/连线
+     照搬需求原文列出的固定拓扑，不是内部 StateGraph 节点图，跟 #flow-diagram-wrap 那张图
+     是两回事、互不影响。复用 .flow-node-g/.flow-edge/.visited/.warn 这几个已有样式类，
+     只新增"排队等待"（橙）和"重复拦截"（黄）两种颜色状态。 */
+  #arch-overlay { display: none; position: absolute; inset: 0; background: #fff; border: 1px solid var(--border); border-radius: 4px; padding: var(--gap); overflow: auto; z-index: 20; flex-direction: column; }
+  #arch-overlay.open { display: flex; }
+  #arch-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+  #arch-diagram-wrap svg { overflow: visible; }
+  #arch-diagram-wrap { margin: 8px 0; }
+  .flow-node-g.queue rect, .flow-node-g.queue circle { fill: #fdf3e0; stroke: #b8860b; stroke-width: 1.4; }
+  .flow-node-g.queue text { fill: #8a6100; }
+  .flow-node-g.dup rect, .flow-node-g.dup circle { fill: #fdfbe0; stroke: #b8a400; stroke-width: 1.4; }
+  .flow-node-g.dup text { fill: #7a6a00; }
+  .flow-node-g.downstream rect { stroke-dasharray: 2,2; }
+  #arch-dot { fill: var(--primary-dark); opacity: 0; }
+  #arch-caption { font-size: 12px; color: #444; margin-top: 6px; }
+  #arch-timing { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  #arch-btn { font-size: 12px; padding: 4px 10px; }
 
   .panel-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px dashed var(--border); font-size: 12px; }
   .panel-row:last-child { border-bottom: none; }
@@ -154,9 +173,24 @@
     <div id="right">
       <div class="card">
         <div id="flow-anomaly-banner"></div>
-        <h3>处理流程回放（点击左侧任意一条机器人回复重新播放；这是"回放"，不是实时画面）</h3>
+        <div style="display:flex; align-items:center; justify-content:space-between;">
+          <h3 style="margin:0;">处理流程回放（点击左侧任意一条机器人回复重新播放；这是"回放"，不是实时画面）</h3>
+          <button id="arch-btn">架构路线</button>
+        </div>
         <div id="flow-caption">图里的节点/连线跟 app/worker/graph/graph.py 的 StateGraph 一一对应；respond() 是虚线框——它不是图里的节点，是图跑完之后才执行的普通函数。</div>
         <div id="flow-diagram-wrap"></div>
+
+        <div id="arch-overlay">
+          <div id="arch-header">
+            <h3 style="margin:0;">架构路线（点击"worker 业务流程"框关闭，回到处理流程回放）</h3>
+            <button id="arch-close-btn">关闭</button>
+          </div>
+          <div id="arch-caption">还没有回复</div>
+          <div id="arch-diagram-wrap"></div>
+          <div id="arch-timing"></div>
+          <h3 style="margin-top:12px;">节点耗时 / 工具 / 知识来源（跟处理流程回放面板内容一致，直接复用同一份渲染结果）</h3>
+          <div id="arch-summary"><div id="panel-empty">还没有回复</div></div>
+        </div>
         <div id="flow-details"><div id="panel-empty">还没有回复</div></div>
         <div id="flow-trace"></div>
         <h3 style="margin-top:16px;">记忆区块</h3>
@@ -252,6 +286,11 @@
     // 复用同一个值，worker 那边的会话历史/摘要/不满意计数才能接得上，不是每次都当新会话
     const conversationIdByIdentity = {};
     let lastMessage = null; // { messageId, content }
+    // 架构路线图（阶段五新增）用到的两个状态：isGatewayDegraded 由 refreshStatus() 每 5 秒更新，
+    // hasEverOpened 标这次连接有没有成功握手过，onclose 时用来区分"从没连上"（规则 1：连接被拒）
+    // 和"连上后正常/异常断开"（跟这个功能无关，不动现有行为）
+    let isGatewayDegraded = false;
+    let hasEverOpened = false;
     const bubblesByMessageId = {}; // 用户消息气泡，切到 ack 之后补一行"已送达 · Xms"
     const bubblesByReplyTo = {}; // 机器人消息气泡，流式分片往这里追加
     const pending = {}; // messageId -> 发送/ack/首片/结束的时间戳，用于算耗时
@@ -544,6 +583,7 @@
       resetFlowStyles();
       renderAnomalyBanner({}); // 没有 meta，不显示异常横条
       flowDetailsEl.innerHTML = `<div class="detail-sub">${escapeHtml(kind)}</div>`;
+      syncArchSummary();
       flowTraceEl.innerHTML = traceId
         ? `<div class="trace-row"><span class="panel-key">trace_id</span><code>${escapeHtml(traceId)}</code></div>`
         : "";
@@ -605,6 +645,7 @@
         riskHit
       );
       flowDetailsEl.innerHTML = html;
+      syncArchSummary();
       renderAnomalyBanner(meta);
 
       const traceId = entry.traceId || "-";
@@ -631,7 +672,327 @@
       renderFlowDetails(entry);
       animateFlow(entry);
       renderMemory(entry.meta || {}, entry.conversationId);
+      currentArchEntry = Object.assign({ kind: "reply" }, entry);
+      archRenderCurrent();
     }
+
+    // ---------- 架构路线图（阶段五新增，纯前端）----------
+    // 节点/连线固定拓扑，照抄需求原文的"二、图上的内容"，不是内部 StateGraph 节点图（那张图是
+    // 上面的 #flow-diagram-wrap，两者独立、互不影响）。坐标只是够用的简单布局，不追求美观。
+    const ARCH_NODES = [
+      { id: "browser", label: "浏览器", x: 40, y: 20 },
+      { id: "gw_auth", label: "gateway 鉴权", x: 130, y: 20 },
+      { id: "redis_limit", label: "Redis 限流", x: 220, y: 20 },
+      { id: "redis_dedup", label: "Redis 去重", x: 310, y: 20 },
+      { id: "mq_publish", label: "RabbitMQ 投递", x: 400, y: 20 },
+      { id: "ack_back", label: "回 ACK", x: 400, y: 65 },
+      { id: "mq_queue", label: "RabbitMQ 队列", x: 400, y: 105 },
+      { id: "worker_fetch", label: "worker 取消息", x: 320, y: 105 },
+      { id: "db_dedup", label: "数据库去重", x: 240, y: 105 },
+      { id: "worker_biz", label: "worker 业务流程", x: 150, y: 105, isBiz: true },
+      { id: "db_write", label: "回复写入数据库", x: 60, y: 105 },
+      { id: "llm_node", label: "mock-llm", x: 90, y: 150, isDownstream: true },
+      { id: "finance_node", label: "mock-finance", x: 150, y: 165, isDownstream: true },
+      { id: "platform_node", label: "mock-platform", x: 210, y: 150, isDownstream: true },
+      { id: "kb_node", label: "知识库(pgvector)", x: 150, y: 130, isDownstream: true },
+      { id: "redis_push", label: "Redis 推送", x: 60, y: 210 },
+      { id: "gw_back", label: "gateway", x: 150, y: 210 },
+      { id: "scheduler", label: "scheduler", x: 400, y: 210 },
+    ];
+    const ARCH_NODE_BY_ID = Object.fromEntries(ARCH_NODES.map((n) => [n.id, n]));
+    const ARCH_EDGES = [
+      { from: "browser", to: "gw_auth" },
+      { from: "gw_auth", to: "redis_limit" },
+      { from: "redis_limit", to: "redis_dedup" },
+      { from: "redis_dedup", to: "mq_publish" },
+      { from: "mq_publish", to: "ack_back" },
+      { from: "ack_back", to: "mq_queue" },
+      { from: "mq_queue", to: "worker_fetch" },
+      { from: "worker_fetch", to: "db_dedup" },
+      { from: "db_dedup", to: "worker_biz" },
+      { from: "worker_biz", to: "llm_node", dashed: true },
+      { from: "worker_biz", to: "finance_node", dashed: true },
+      { from: "worker_biz", to: "platform_node", dashed: true },
+      { from: "worker_biz", to: "kb_node", dashed: true },
+      { from: "worker_biz", to: "db_write" },
+      { from: "db_write", to: "redis_push" },
+      { from: "redis_push", to: "gw_back" },
+      { from: "gw_back", to: "browser" },
+      { from: "scheduler", to: "redis_push", dashed: true },
+    ];
+
+    // 正常完整路线（respond()、图内部节点省略，"worker业务流程"是一个整体框）；拆成"到
+    // worker_biz为止"和"worker_biz之后"两段，中间插下游点亮 + 停顿，不是拼接错误
+    const ARCH_PATH_TO_BIZ = ["browser", "gw_auth", "redis_limit", "redis_dedup", "mq_publish", "ack_back",
+      "mq_queue", "worker_fetch", "db_dedup", "worker_biz"];
+    const ARCH_PATH_FROM_BIZ = ["worker_biz", "db_write", "redis_push", "gw_back", "browser"];
+    const ARCH_OUTBOUND_PATH = ["browser", "gw_auth", "redis_limit", "redis_dedup", "mq_publish", "ack_back", "mq_queue"];
+    const ARCH_REMINDER_PATH = ["scheduler", "redis_push", "gw_back", "browser"];
+    // 固定节奏播放（Jo 确认：不按真实耗时缩放，图上只标 ACK 耗时/业务流程耗时/LLM 耗时/
+    // 完整回复耗时这四个真实数字，动画本身走固定节拍），worker_biz 多停一拍方便看下游点亮
+    const ARCH_HOP_MS = 200;
+    const ARCH_BIZ_PAUSE_MS = 300;
+
+    function buildArchSvgMarkup() {
+      const NODE_W = 78, NODE_H = 22, DS_W = 66, DS_H = 18;
+      const edgesSvg = ARCH_EDGES.map((e) => {
+        const a = ARCH_NODE_BY_ID[e.from], b = ARCH_NODE_BY_ID[e.to];
+        return `<line id="ae-${e.from}__${e.to}" class="flow-edge${e.dashed ? " dashed" : ""}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" />`;
+      }).join("");
+      const nodesSvg = ARCH_NODES.map((n) => {
+        const w = n.isDownstream ? DS_W : NODE_W, h = n.isDownstream ? DS_H : NODE_H;
+        const cls = n.isDownstream ? " downstream" : "";
+        return `<g id="an-${n.id}" class="flow-node-g${cls}">` +
+          `<rect x="${n.x - w / 2}" y="${n.y - h / 2}" width="${w}" height="${h}" rx="4"></rect>` +
+          `<text x="${n.x}" y="${n.y}">${escapeHtml(n.label)}</text></g>`;
+      }).join("");
+      const maxY = Math.max(...ARCH_NODES.map((n) => n.y)) + 20;
+      return `<svg viewBox="0 0 460 ${maxY}" width="100%">` +
+        `<g>${edgesSvg}</g><g>${nodesSvg}</g>` +
+        `<circle id="arch-dot" r="4.5"></circle></svg>`;
+    }
+
+    $("arch-diagram-wrap").innerHTML = buildArchSvgMarkup();
+    const archDotEl = $("arch-dot");
+
+    // Jo 反馈新增：路线图弹层下方的摘要直接复制现有"处理流程回放"面板（#flow-details）刚渲染
+    // 出来的 HTML，不重新算一遍——两处保证完全一致，回放旧回复时 renderFlowDetails()/
+    // renderFlowForNonReply() 一更新 #flow-details，这里跟着同步，不用额外接线到 selectReply()
+    function syncArchSummary() {
+      const el = $("arch-summary");
+      if (el) el.innerHTML = flowDetailsEl.innerHTML;
+    }
+
+    function resetArchStyles() {
+      if (archQueueWarnTimer) { clearTimeout(archQueueWarnTimer); archQueueWarnTimer = null; }
+      ARCH_NODES.forEach((n) => {
+        const el = $(`an-${n.id}`);
+        if (el) el.classList.remove("visited", "warn", "queue", "dup");
+      });
+      ARCH_EDGES.forEach((e) => {
+        const el = $(`ae-${e.from}__${e.to}`);
+        if (el) el.classList.remove("visited");
+      });
+      archDotEl.style.opacity = "0";
+    }
+
+    function markArchNode(id, cls) {
+      const el = $(`an-${id}`);
+      if (el) el.classList.add(cls);
+    }
+
+    function markArchEdge(from, to) {
+      const el = $(`ae-${from}__${to}`);
+      if (el) el.classList.add("visited");
+    }
+
+    function positionArchDotAt(id) {
+      const n = ARCH_NODE_BY_ID[id];
+      archDotEl.style.transform = `translate(${n.x}px, ${n.y}px)`;
+      archDotEl.style.opacity = "1";
+    }
+
+    function moveArchDot(fromId, toId, durationMs) {
+      const a = ARCH_NODE_BY_ID[fromId], b = ARCH_NODE_BY_ID[toId];
+      const anim = archDotEl.animate(
+        [{ transform: `translate(${a.x}px, ${a.y}px)` }, { transform: `translate(${b.x}px, ${b.y}px)` }],
+        { duration: Math.max(durationMs, 1), easing: "linear", fill: "forwards" }
+      );
+      return anim.finished.catch(() => {});
+    }
+
+    async function walkArchPath(path, token) {
+      positionArchDotAt(path[0]);
+      markArchNode(path[0], "visited");
+      for (let i = 0; i < path.length - 1; i++) {
+        if (token !== archAnimToken) return false;
+        markArchEdge(path[i], path[i + 1]);
+        await moveArchDot(path[i], path[i + 1], ARCH_HOP_MS);
+        if (token !== archAnimToken) return false;
+        markArchNode(path[i + 1], "visited");
+      }
+      return true;
+    }
+
+    // 工具名 -> 新图下游图标（跟旧图 TOOL_NAME_TO_NODE 同理，只映射到这张图实际画出来的
+    // 三个有 HTTP 调用的下游：mock-finance/mock-platform/mock-knowledge；manage_reminder
+    // 不对应任何下游图标，提醒管理是纯数据库操作，见 app/worker/graph/reminder.py）
+    const TOOL_NAME_TO_ARCH_DOWNSTREAM = {
+      query_finance: "finance_node",
+      platform_command: "platform_node",
+      search_knowledge: "kb_node",
+      transfer_to_human: "platform_node",
+    };
+
+    // 下游"用没用到"点亮（蓝色，Jo 确认：handoff 也算 mock-platform，因为它真的调用了
+    // get_agents_status 查坐席在线状态，见 app/worker/graph/handoff.py）
+    function lightArchDownstream(meta) {
+      const path = meta.path || [];
+      if ((meta.llm_ms || 0) > 0) markArchNode("llm_node", "visited");
+      if (path.includes("finance")) markArchNode("finance_node", "visited");
+      if (path.some((n) => ["command", "request_confirmation", "confirm_action", "handoff"].includes(n))) {
+        markArchNode("platform_node", "visited");
+      }
+      if (path.includes("knowledge")) markArchNode("kb_node", "visited");
+    }
+
+    // "worker业务流程"框 + 相关下游标红（复用旧图 computeAnomalies() 同一套判定，只是标在
+    // 新图的位置上，不新增判定逻辑）
+    function applyArchAnomalies(meta) {
+      let bizWarn = false;
+      const cb = meta.circuit_breaker || [];
+      if (cb.includes("llm")) { markArchNode("llm_node", "warn"); bizWarn = true; }
+      if (cb.includes("finance")) { markArchNode("finance_node", "warn"); bizWarn = true; }
+      (meta.tools || []).forEach((t) => {
+        if (t.status === "ok") return;
+        const node = TOOL_NAME_TO_ARCH_DOWNSTREAM[t.name];
+        if (node) markArchNode(node, "warn");
+        bizWarn = true;
+      });
+      if (meta.intent === "fallback") bizWarn = true;
+      if (meta.intent === "knowledge_qa" && (meta.citations || []).length === 0) {
+        markArchNode("kb_node", "warn");
+        bizWarn = true;
+      }
+      if ((meta.risk_flags || []).length > 0 || meta.budget_exceeded) bizWarn = true;
+      if (bizWarn) markArchNode("worker_biz", "warn");
+    }
+
+    // Redis degraded 标记（Jo 确认：用发消息那一刻记录的状态，不是回放时现查的状态；
+    // entry.degradedAtSend 在 sendMessage()/reply_end 分支里写入，没有记录就不标红）
+    function applyArchDegraded(degradedAtSend) {
+      if (!degradedAtSend) return;
+      markArchNode("redis_limit", "warn");
+      markArchNode("redis_dedup", "warn");
+      markArchNode("redis_push", "warn");
+    }
+
+    function archTimingLine(entry) {
+      const meta = entry.meta || {};
+      const bizMs = Object.values(meta.timings || {}).reduce((s, v) => s + (v || 0), 0);
+      const parts = [
+        `ACK 耗时 ${entry.ackMs ?? "-"} ms`,
+        `业务流程耗时 ${Math.round(bizMs * 10) / 10} ms`,
+        `LLM 耗时 ${meta.llm_ms ?? 0} ms`,
+        `完整回复耗时 ${entry.totalMs ?? "-"} ms`,
+      ];
+      return parts.join(" ｜ ");
+    }
+
+    let archAnimToken = 0;
+    let currentArchEntry = null; // 最近一次该展示的内容：{ kind: "reply"|"transient"|"reminder"|"waiting", ... }
+
+    // 完整回放（新回复到达，或点击历史回复）：从头走到尾，固定节拍，中途在 worker_biz 停一拍
+    // 让下游点亮看得清楚；耗时数字只展示真实测得的四个，不显示任何倒推/估算值（Jo 确认）
+    async function archPlayFull(entry) {
+      const token = ++archAnimToken;
+      resetArchStyles();
+      $("arch-caption").textContent = "完整路线回放";
+      let ok = await walkArchPath(ARCH_PATH_TO_BIZ, token);
+      if (!ok) return;
+      // 停在 worker_biz 这一拍点亮下游 + 标异常，肉眼能看清"这条消息真正碰过哪些下游"，
+      // 不是走完全程才一次性补上去
+      lightArchDownstream(entry.meta || {});
+      applyArchAnomalies(entry.meta || {});
+      await sleep(ARCH_BIZ_PAUSE_MS);
+      if (token !== archAnimToken) return;
+      ok = await walkArchPath(ARCH_PATH_FROM_BIZ, token);
+      if (!ok) return;
+      applyArchDegraded(entry.degradedAtSend);
+      $("arch-timing").textContent = archTimingLine(entry);
+    }
+
+    // 实时"排队等待 worker"：ack accepted 之后立即播，走完去程停在队列（橙色），
+    // reply_end 到达时会被 archPlayFull() 整个重播一遍覆盖掉，不需要从这里续播
+    // Jo 反馈：正常消息（多数几百毫秒内就有回复）也会闪一下橙色"排队等待"，容易被误解成
+    // 出了问题。改成两段：ack 之后先是中性的"处理中"（不特殊上色，跟其它已走过的节点一样是
+    // 蓝色 visited）；真等超过这个常量还没收到回复，才标橙"排队等待 worker"。
+    const ARCH_QUEUE_WARN_MS = 8000;
+    let archQueueWarnTimer = null;
+
+    async function archShowWaiting(pendingEntry) {
+      const token = ++archAnimToken;
+      resetArchStyles();
+      const degradedNote = pendingEntry.degradedAtSend ? "；发送时 Redis 处于 degraded 状态" : "";
+      $("arch-caption").textContent = "已发出，等待 worker 处理" + degradedNote;
+      const ok = await walkArchPath(ARCH_OUTBOUND_PATH, token);
+      if (!ok) return;
+      if (pendingEntry.degradedAtSend) markArchNode("redis_push", "warn"); // 这条不受 8 秒限制，是记录事实不是"等太久"的判断
+      $("arch-caption").textContent = "处理中" + degradedNote;
+      $("arch-timing").textContent = `ACK 耗时 ${pendingEntry.ackMs ?? "-"} ms`;
+      archQueueWarnTimer = setTimeout(() => {
+        if (token !== archAnimToken) return; // 已经被新事件（回复到达/发了新消息）取代，不用再标
+        markArchNode("mq_queue", "queue");
+        $("arch-caption").textContent = "排队等待 worker，处理时间较长" + degradedNote;
+      }, ARCH_QUEUE_WARN_MS);
+    }
+
+    // 限流/重复/投递失败/连接被拒：只在发生当下播一次，不进回放列表（Jo 确认沿用现有做法）
+    async function archShowTruncated(kind, extra) {
+      currentArchEntry = null; // 限流/重复/投递失败/连接被拒不进回放列表（Jo 确认沿用现有做法）
+      if (!archOverlayOpen) return; // 弹层关着就不播，跟下面 archRenderCurrent() 的规则一致
+      const token = ++archAnimToken;
+      resetArchStyles();
+      let path, endCls, caption;
+      if (kind === "rate_limited") {
+        path = ["browser", "gw_auth", "redis_limit"]; endCls = "warn";
+        caption = "被限流：" + (extra || "");
+      } else if (kind === "duplicate") {
+        path = ["browser", "gw_auth", "redis_limit", "redis_dedup"]; endCls = "dup";
+        caption = "重复，已拦截";
+      } else if (kind === "mq_failed") {
+        path = ["browser", "gw_auth", "redis_limit", "redis_dedup", "mq_publish"]; endCls = "warn";
+        caption = "投递失败：" + (extra || "") + "（未收到 ACK）";
+      } else if (kind === "rejected") {
+        path = ["browser", "gw_auth"]; endCls = "warn";
+        caption = extra === 4401 ? "连接被拒：token 无效" : `连接被拒：gateway 不可用（关闭码 ${extra}）`;
+      } else {
+        return;
+      }
+      $("arch-caption").textContent = caption;
+      const ok = await walkArchPath(path, token);
+      if (!ok) return;
+      markArchNode(path[path.length - 1], endCls);
+      $("arch-timing").textContent = "";
+    }
+
+    async function archShowReminder() {
+      const token = ++archAnimToken;
+      resetArchStyles();
+      $("arch-caption").textContent = "提醒推送";
+      await walkArchPath(ARCH_REMINDER_PATH, token);
+      $("arch-timing").textContent = "";
+    }
+
+    let archOverlayOpen = false;
+
+    function archRenderCurrent() {
+      if (!archOverlayOpen) return;
+      if (!currentArchEntry) {
+        resetArchStyles();
+        $("arch-caption").textContent = "还没有回复";
+        $("arch-timing").textContent = "";
+        return;
+      }
+      if (currentArchEntry.kind === "reply") archPlayFull(currentArchEntry);
+      else if (currentArchEntry.kind === "waiting") archShowWaiting(currentArchEntry);
+      else if (currentArchEntry.kind === "reminder") archShowReminder();
+    }
+
+    $("arch-btn").addEventListener("click", () => {
+      archOverlayOpen = true;
+      $("arch-overlay").classList.add("open");
+      archRenderCurrent();
+    });
+    $("arch-close-btn").addEventListener("click", () => {
+      archOverlayOpen = false;
+      $("arch-overlay").classList.remove("open");
+    });
+    // 点击"worker 业务流程"框关闭路线图、回到现有的处理流程回放（需求原文明确要求）
+    document.getElementById("arch-diagram-wrap").addEventListener("click", (ev) => {
+      const g = ev.target.closest("#an-worker_biz");
+      if (g) $("arch-close-btn").click();
+    });
 
     // ---------- 记忆区块（阶段三 3.8 第 3 点） ----------
     // history_messages/has_summary 直接来自 reply_end.meta；摘要内容和"覆盖到哪"meta 里没有，
@@ -679,6 +1040,7 @@
       resetFlowStyles();
       renderAnomalyBanner({});
       flowDetailsEl.innerHTML = '<div id="panel-empty">还没有回复</div>';
+      syncArchSummary();
       flowTraceEl.innerHTML = "";
       flowRawMetaEl.textContent = "（还没有回复）";
       memoryEl.innerHTML = '<div id="memory-empty" style="color:var(--muted);font-size:13px;">还没有回复</div>';
@@ -689,6 +1051,11 @@
       for (const key in bubblesByReplyTo) delete bubblesByReplyTo[key];
       for (const key in pending) delete pending[key];
       for (const key in allReplies) delete allReplies[key];
+      currentArchEntry = null;
+      hasEverOpened = false;
+      resetArchStyles();
+      $("arch-caption").textContent = "还没有回复";
+      $("arch-timing").textContent = "";
     }
 
     // ---------- 坐席工作台（阶段三 3.8 第 6、10 点） ----------
@@ -772,6 +1139,9 @@
         if (!resp.ok) throw new Error(data.detail || resp.statusText);
         gatewayChipEl.textContent = `gateway: ${data.gateway}`;
         gatewayChipEl.className = "status-chip " + (data.gateway === "ok" ? "ok" : "warn");
+        // 架构路线图规则 6 用：只认真正查到的 "degraded"，查询本身失败（下面 catch 分支）
+        // 不改变这个值——那是 mock-im 自己查不到，不代表 gateway/Redis 真的有问题
+        isGatewayDegraded = data.gateway === "degraded";
         const budget = data.budget || {};
         const limitText = budget.limit == null ? "不限额" : budget.limit;
         const usedText = budget.used == null ? "?" : budget.used;
@@ -824,7 +1194,9 @@
       const url = `ws://${host}:${GATEWAY_HOST_PORT}/ws?token=${encodeURIComponent(tokenResp.token)}`;
       ws = new WebSocket(url);
 
+      hasEverOpened = false;
       ws.onopen = () => {
+        hasEverOpened = true;
         setWsStatus(`已连接：${identity.label}（${tokenResp.role}）`, "connected");
         if (currentRole !== "agent") {
           contentEl.disabled = false;
@@ -837,6 +1209,12 @@
         setWsStatus("连接已关闭（code: " + ev.code + "）", "error");
         contentEl.disabled = true;
         sendBtn.disabled = true;
+        // 架构路线图规则 1：只有"从没连上就被关掉"才算连接被拒（token 无效/gateway 不可用）；
+        // 连上之后再断开是正常/异常断线，跟这条规则无关，不触发
+        if (!hasEverOpened) {
+          currentArchEntry = null;
+          archShowTruncated("rejected", ev.code);
+        }
       };
 
       ws.onerror = () => {
@@ -861,12 +1239,21 @@
               if (b) b.caption.textContent = "被限流：" + msg.detail;
               addSystemLine(`发送过快被限流：${msg.detail}`, true);
               renderFlowForNonReply("被限流（未生成回复）", msg.trace_id);
+              archShowTruncated("rate_limited", msg.detail);
             } else if (msg.status === "duplicate") {
               if (b) b.caption.textContent = "重复消息（不会有新回复）";
               renderFlowForNonReply("重复消息（未生成新回复）", msg.trace_id);
+              archShowTruncated("duplicate");
             } else {
               const ms = p ? Math.round(p.ackAt - p.sentAt) : null;
               if (b) b.caption.textContent = "已送达" + (ms != null ? ` · ${ms} ms` : "");
+              // ack accepted：架构路线图进入"排队等待 worker"状态（现有内部流程图不用等 ack，
+              // 只在 reply_end 才更新，这是两张图唯一不同步的地方，因为新图要展示"排队等待"
+              // 这个 ack 和 reply_end 之间的中间态）
+              if (p) {
+                currentArchEntry = { kind: "waiting", ackMs: ms, degradedAtSend: p.degradedAtSend };
+                archRenderCurrent();
+              }
             }
             break;
           }
@@ -890,6 +1277,9 @@
               firstChunkMs: p && p.firstChunkAt != null ? Math.round(p.firstChunkAt - p.sentAt) : null,
               totalMs: p ? Math.round(now - p.sentAt) : null,
               conversationId: conversationId,
+              // 发消息那一刻记录的 Redis 状态（架构路线图规则 6，Jo 确认：回放用记录值，
+              // 不用回放时现查的状态；没有记录（p 为空）就当没有，不标红）
+              degradedAtSend: p ? p.degradedAtSend : false,
             };
             allReplies[msg.reply_to] = entry;
             if (b) {
@@ -904,9 +1294,17 @@
           }
           case "reminder":
             addReminderBubble(msg.title, msg.text);
+            currentArchEntry = { kind: "reminder" };
+            archRenderCurrent();
             break;
           case "error":
             addSystemLine(`出错：${msg.detail}`, true);
+            if (msg.code === "mq_publish_failed") {
+              // 投递失败：gateway 根本没发过 ack（accepted 都没有），这条消息在 pending 里
+              // 永远等不到 ack/reply_end，这里顺手清掉，避免残留一条永远不会完成的记录
+              if (msg.message_id && pending[msg.message_id]) delete pending[msg.message_id];
+              archShowTruncated("mq_failed", msg.detail);
+            }
             break;
           default:
             addSystemLine("未知消息类型: " + JSON.stringify(msg), true);
@@ -985,7 +1383,11 @@
         conversation_id: conversationId,
         content: content,
       };
-      pending[messageId] = { sentAt: performance.now(), ackAt: null, firstChunkAt: null, ackStatus: null, traceId: null };
+      pending[messageId] = {
+        sentAt: performance.now(), ackAt: null, firstChunkAt: null, ackStatus: null, traceId: null,
+        // 架构路线图规则 6：记发送这一刻的 Redis 状态，回放时用这个记录值，不用回放时现查的状态
+        degradedAtSend: isGatewayDegraded,
+      };
       ws.send(JSON.stringify(payload));
       addUserBubble(messageId, content, !!reuseMessageId);
       lastMessage = { messageId, content };

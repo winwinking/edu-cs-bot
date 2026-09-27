@@ -5458,3 +5458,93 @@ PHASE5.md` 本来就是未跟踪文件，跟之前一样不会进克隆）。只
 （问题 1 的处理决定是保留 `name:` 字段，不动这个文件）。
 
 **未做的事（按 Jo 指示）**：没有 `git commit`；`docs/PHASE5.md` 5.3~5.7 尚未开始。
+
+---
+
+## 新增功能：演示控制台"架构路线图"
+
+**日期**：2026-09-27
+
+**做什么**：Jo 提出的新增需求（不在任何 PHASE 文档里），纯前端，只改
+`mocks/mock_im/templates/index.html` 一个文件。右侧流程图区域加一个"架构路线"按钮，点开
+一张覆盖整个右侧面板的静态拓扑图（浏览器→gateway 鉴权→Redis 限流→Redis 去重→RabbitMQ
+投递→回 ACK→RabbitMQ 队列→worker 取消息→数据库去重→worker 业务流程→回复写入数据库→
+Redis 推送→gateway→浏览器，另有 worker 业务流程下面 4 个下游图标 mock-llm/mock-finance/
+mock-platform/知识库，以及 scheduler→Redis 推送→gateway→浏览器 的提醒推送线），每条回复
+结束后回放一次，点击历史回复也能重放，用一个圆点沿真实路径固定节拍走一遍，出问题的地方停下
+标红/标黄。跟已有的内部流程图（`#flow-diagram-wrap`，画的是 StateGraph 节点）是两张独立的图，
+互不影响，也没有改动任何现有功能。
+
+**需求要点**（完整需求原文由 Jo 给出，这里只记落地时的关键取舍）：
+1. 先做字段映射分析、不写代码，逐条列出"三、动画和颜色"每条规则用哪个现成字段、产生位置，
+   5 处做不到/需要裁决的地方明确列出来，等 Jo 审过再写代码——这一步没有新增/修改任何数据，
+   纯粹是读 `app/worker/graph/graph.py`（`_build_meta`/`_timed`）、
+   `app/gateway/message_handler.py`、`app/gateway/main.py`、`app/common/schemas.py`、
+   `mocks/mock_im/main.py` 现有代码确认字段来源。
+2. Jo 对 5 处裁决：① `path` 含 `handoff` 也点亮 mock-platform（它真的调
+   `get_agents_status` 查坐席状态，见 `app/worker/graph/handoff.py:29,239`）；②"业务流程
+   耗时"＝`meta.timings` 之和，取消息/数据库去重/写库三步没有埋点，用固定时长过渡，不冒充
+   真实数字；③动画走**固定节拍**（每跳 200ms，`worker_biz` 多停 300ms 方便看下游点亮），
+   不按真实耗时缩放，图上只标四个真实数字（ACK 耗时、业务流程耗时、LLM 耗时、完整回复
+   耗时），倒推/估算的数字一律不显示；④`error` 消息 `code=mq_publish_failed` 时圆点停在
+   "RabbitMQ 投递"标红、不经过"回 ACK"（这种情况下 gateway 确实没发过 ack，见
+   `message_handler.py:146`）；⑤Redis degraded 状态在**发消息那一刻**记进这条消息的前端
+   记录（`pending[messageId].degradedAtSend`），回放时用记录值，不用回放时现查的实时状态，
+   没有记录就不标红；限流/重复/投递失败/连接被拒这四种不进回放列表，只在发生当下播一次
+   （沿用现有内部流程图 `renderFlowForNonReply()` 的做法）。
+3. 只做一轮实现，不写测试代码（纯前端演示工具，题目/CLAUDE.md 的测试覆盖率要求不覆盖这个）。
+
+**关键实现点**：
+- 弹层覆盖 `#right`（新增 `position: relative`），点击"架构路线"打开、点击"关闭"或点击图里
+  "worker 业务流程"框都会关闭（关闭方式是需求原文明确要求的两种之一）。
+- 新增前端状态：`isGatewayDegraded`（`refreshStatus()` 每 5 秒更新，只认真正查到的
+  `"degraded"`，查询失败不改变这个值）、`hasEverOpened`（区分"从没连上"和"连上后断开"，
+  只有前者才算"连接被拒"）、`pending[messageId].degradedAtSend`（发消息那一刻记的状态）。
+- 动画只在弹层打开时播放（`archOverlayOpen` 挡住），弹层关着时被动更新
+  `currentArchEntry`、不跑动画——`display:none` 的 SVG 子树上跑 Web Animations API 效果
+  没有意义，等真正打开弹层时才会用 `currentArchEntry` 整个重播一遍，不是"续播"。
+- 下游点亮/异常标红复用旧图已有的判定字段和分类（`circuit_breaker`/`budget_exceeded`/
+  `risk_flags`/`tools`/`intent`/`citations`），只是重新映射到新图的位置，没有新写判定逻辑。
+
+**验证**：
+- `node --check` 对提取出来的 `<script>` 内容做语法检查，通过。
+- `docker compose build mock-im && docker compose up -d mock-im` 重新构建（mocks 镜像
+  在构建时把 `templates/index.html` 打进镜像，不是运行时挂载，改完文件必须重新构建这一个
+  服务才会生效，其余 4 个 mock 服务不用动）。
+- `curl http://localhost:8080/` 确认新按钮（`架构路线`）和弹层骨架元素
+  （`arch-overlay`/`arch-btn`/`arch-diagram-wrap` 等）正常被 FastAPI 渲染出来；SVG 节点
+  本身是 JS 运行时生成的，`curl` 看不到，用同样方法验证过旧的内部流程图节点
+  （`fn-*`）在 `curl` 下也是 0 个匹配，确认这是"curl 不跑 JS"的正常现象，不是新代码的问题。
+- **这次没有做到的**：这个环境里没有可用的浏览器自动化工具，没能自己在浏览器里实际点一遍
+  验证动画效果，只做了语法检查和静态渲染检查。真正的交互验证需要 Jo 在浏览器里做，验证步骤
+  见汇报里给 Jo 的清单。
+
+**改动文件**：仅 `mocks/mock_im/templates/index.html`。
+
+**影响哪些服务**：只影响 `mock-im` 这一个演示/教学用途的服务，不改 gateway/worker/
+scheduler/其余 4 个 mock 服务的任何代码，不影响任何自动化测试、压测、评测。
+
+**未做的事（按 Jo 指示）**：没有 `git commit`。
+
+**Jo 验证后反馈的两处小改动**（同一个文件，同一天）：
+1. 正常消息 ack 之后到收到回复之间，`RabbitMQ 队列`原来立即标橙"排队等待 worker"，正常
+   处理（大多几百毫秒）也会闪一下橙色，容易被误解成出问题。改成两段：ack 后先是中性的
+   "处理中"（不特殊上色，跟其它已走过的节点一样是蓝色 `visited`）；真等超过 8 秒
+   （`ARCH_QUEUE_WARN_MS` 常量）还没收到回复，才标橙"排队等待 worker"。用
+   `setTimeout`+`archAnimToken` 判断实现："等太久"这个计时器如果在 8 秒内被新事件
+   （回复到达/发了新消息）取代，回调里发现 token 已经不是自己的就直接跳过，不会真的标橙。
+   Redis degraded 那条红标记（规则 6）不受这个 8 秒限制，因为它标的是"发送时的既成事实"，
+   不是"等太久"的判断，两者是不同性质的信号。
+2. 弹层下方新增一块摘要，跟现有"处理流程回放"面板（`#flow-details`）内容保持完全一致：
+   不重新算一遍判断逻辑，而是在 `renderFlowDetails()`/`renderFlowForNonReply()`
+   两处生成完 `#flow-details` 的 HTML 之后，直接把这段 HTML 复制一份塞进新的
+   `#arch-summary`（`syncArchSummary()`）。回放旧回复时这两个函数本来就会重新执行一遍，
+   摘要跟着自动切换，没有另外接线到 `selectReply()`。
+
+**改完重新验证**：`node --check` 语法检查通过；`docker compose build mock-im &&
+docker compose up -d mock-im` 重新构建生效；`curl http://localhost:8080/` 确认
+`arch-summary` 元素和 `ARCH_QUEUE_WARN_MS = 8000` 常量都在页面里。交互效果（8 秒后才变橙、
+摘要内容是否真的跟面板一致）仍然需要 Jo 在浏览器里验证，见下面更新的验证步骤。
+
+**另外确认**：`b958926`（5.1 修复）是 Jo 审查后自己提交的，不是本次 agent 操作产生，agent
+这次会话全程没有执行过 `git commit`。
