@@ -228,8 +228,13 @@ docs/          # REQUIREMENTS.md（需求原文）、PHASE*.md（各阶段任务
 | `make seed` | 种子数据（可重复跑）+ 建知识库索引 |
 | `make reindex` | 只重建知识库索引，不重新种子数据 |
 | `make demo` | 见上面"启动步骤" |
-| `make test` | 待实现（单测直接用 `docker compose run --rm tools pytest -q tests/unit`） |
-| `make loadtest` | 待实现（阶段四压测再做） |
+| `make test` | 单测（`tools` 镜像）+ mock-llm 专属单测（`mocks-tools` 镜像，见下）+ 集成 + e2e，共四层 |
+| `make loadtest-users` | 生成压测用户 + token（t_a 下 1600 个，写进不进 git 的 `loadtest/tokens.json`） |
+| `make loadtest-steady` | 压测场景 1：稳定（500 连接，200 msg/s，5 分钟） |
+| `make loadtest-burst` | 压测场景 2：突发（≥1000 VU，1000 msg/s，30 秒，另跑 3 分钟观察队列消化） |
+| `make loadtest-finance` | 压测场景 3：财务查询（100 QPS，2 分钟） |
+| `make loadtest-llm-timeout` | 压测场景 4：LLM 超时率 20%（内部用 `mockctl.py` 设置/重置，`trap` 保证不管成败都会重置） |
+| `make loadtest` | 依次跑完上面四个场景 |
 
 `migrate`/`seed`/`reindex`/`demo` 实际上跑在一个叫 `tools` 的一次性容器里（跟 gateway/worker 共用
 同一个镜像），`docker-compose.yml` 里给它设了 `profiles: ["tools"]`，所以 `make up` 不会把它一起
@@ -268,3 +273,20 @@ docs/          # REQUIREMENTS.md（需求原文）、PHASE*.md（各阶段任务
 | `LLM_MAX_RETRIES` / `FINANCE_MAX_RETRIES` / `PLATFORM_MAX_RETRIES` | `1` / `1` / `2` | 各自的重试次数上限（重试之间的退避间隔另有单独的配置项，见 `.env.example`） |
 | `DLQ_MAX_RETRIES` | `3` | 消息处理时出现意外异常，重新入队几次还失败就进 `inbound.dead` |
 | `DEFAULT_DAILY_TOKEN_BUDGET` | 空（不限额） | 机构没在 `tenants.daily_token_budget` 单独设置时用这个值 |
+
+## 新增的环境变量（阶段四）
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `LLM_NONSTREAM_TIMEOUT_SECONDS` | `3` | classify 这类非流式 LLM 调用的超时，超时不重试（阶段四故障注入把原来的 `LLM_TIMEOUT_SECONDS=15` 拆成非流式/流式两个更短的值，重试也从"超时重试一次"改成"超时不重试"） |
+| `LLM_STREAM_TIMEOUT_SECONDS` | `4` | respond 阶段流式生成的超时，超时不重试；比非流式多给 1 秒是因为流式要先等首字节，理由见 `loadtest/llm_timeout.js` 顶部注释 |
+
+## 压测（阶段四 4.6）
+
+四个场景（稳定/突发/财务查询/LLM 超时率 20%）的脚本在 `loadtest/`，跑法见上面 Makefile
+目标表。压测跑了两轮：第一轮的 k6 脚本是"每条消息各自建一次连接"的短连接模型，且跑的时候
+t_a 机构的每日 LLM token 预算被打满，两个问题都让结果测不到题目原本要测的路径，已作废；
+第二轮把 `loadtest/lib/ws_client.js` 改成长连接模型（每个 VU 建一条连接、持续发消息，
+`message_id`/`reply_to` 匹配每条在途消息），解除了预算限制，是当前有效结果，其中场景 1 额外
+对比了 1 个 worker 和 3 个 worker 的差异。详细数字、方法、单 worker 吞吐上限的原因分析、
+下一个瓶颈（Postgres）都写在 [`docs/LOADTEST.md`](docs/LOADTEST.md)，不在这里重复。

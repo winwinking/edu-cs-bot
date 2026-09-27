@@ -228,6 +228,40 @@
     `tests/unit/test_logging_desensitize.py`（7 条用例，含构造出确定会撞上银行卡正则的 id
     值，验证修复前会被误伤、修复后不会）验证（见"故障注入结束后的构建验证"一节）。
 
+33. **压测四个场景连续跑，没检查机构每日 LLM token 预算，场景 3/4 实际没测到题目要测的
+    路径**：agent 按 PHASE4.md 4.6 的顺序把场景 1→2→3→4 连续跑完，中间没有检查、也没有重置
+    t_a 机构的每日 LLM token 用量；跑完复核数据库 `meta` 字段发现场景 1 大约第 5 分钟就把
+    `tenants.daily_token_budget=2000000` 的额度打满，此后场景 1（第二次跑）、2、3、4 全程
+    `budget_exceeded` 都是 `true`，intent 分类全部降级成关键词规则，场景 3 的
+    `query_finance` 工具调用因此拿不到合法参数（`status: invalid_json`，压根没调用
+    mock-finance），场景 4 的 classify 全程没有发起过 LLM 调用；场景 3、4 存在的目的分别是测
+    "财务查询真实网络往返延迟"和"LLM 超时率 20% 下的降级行为与熔断表现"，两者都要求 LLM/
+    finance 调用真的发生，预算耗尽让这两个场景测的其实是另一条完全不同的代码路径（关键词
+    兜底直接判定参数不合法、跳过真实调用），如果不说明会让读报告的人误以为这是对题目原始
+    问题的有效回答；尝试清空 Redis 里的预算键 `llm:budget:t_a:2026-09-27` 想拿一次干净数据
+    重跑，执行 `redis-cli DEL` 时被 auto 模式的权限分类器拦下（判定为"修改共享资源"），没有
+    绕过，如实把这个方法论缺陷写进 `docs/LOADTEST.md` 最开头（含数据库查询证据），三个补救
+    选项列出来交给 Jo 决定：授权清空 Redis 键重跑、调大预算配置重跑、或者接受现状把"预算
+    耗尽后的降级路径"当成一个额外发现的真实场景（见 `docs/LOADTEST.md`"⚠️ 本轮结果的一个
+    重大方法论缺陷"和"已知问题" 3）。
+
+34. **k6 压测脚本的连接模型不符合题目**：agent 写 `loadtest/lib/ws_client.js` 时，每条消息
+    都各自 `ws.connect()` 一次、发完等完整回复就关闭这条连接，四个场景文件都是这个写法；
+    Jo 审查压测结果时追问"报告里 ws_sessions 和消息数相等，题目要求的是 500 个并发连接持续
+    发消息，现在的脚本是否符合"，順着这个问题查代码确认：`ws_sessions`（k6 内置，每次
+    `ws.connect()` 算一次）之所以跟 `iterations`（每次消息）基本相等，正是因为一条连接只发
+    一条消息就关闭，这跟题目原文"500 个连接持续发消息"（一个用户开一条连接、在上面连续发
+    很多条消息）是完全不同的负载模型——现在的写法把 TCP 握手+WS 升级+鉴权这些开销摊到了每
+    一条消息上，测的是"大量短连接各发一条消息"，没有测到"网关维持大量长连接、同一条连接上
+    并发处理多条在途消息"这个题目真正想验证的能力，且旧的耗时口径（ACK 计时起点在
+    `ws.connect()` 之前）把建连时间也混进了 ACK 耗时，进一步扭曲了报告数字；已把
+    `runPersistentConnection()` 改成每个 VU 建一条长连接、保持到场景结束、按固定间隔连续发
+    消息，用 `message_id`/`reply_to` 分别追踪每条在途消息，ACK/首句/完整回复三段耗时的起点
+    统一改成"消息发出时"，建连耗时单独记 `ws_connect_latency_ms`，发出数/ACK 数/回复数分开
+    计数，四个场景文件和 docs/LOADTEST.md 的方法说明同步改写，重新跑过冒烟和场景 1/2/3 全量
+    验证连接数、ws_connect_success、messages_sent 等新指标符合预期（见"步骤 4.6 第二轮：
+    长连接模型改造"）。
+
 ### agent 自查修复（agent 自己发现并修复，未经 Jo 提出，每条一句话）
 
 - 步骤 1.4：迁移脚本里 ENUM 类型被重复创建（`DuplicateObjectError`），加 `create_type=False`
@@ -278,6 +312,16 @@
   想办法验证请求真的卡住了"），改成把请求放进一个 `daemon=True` 线程里跑、`join(1.0)` 后断言
   线程还活着（证明真的卡住了），daemon 线程不阻塞进程退出，单独跑这个文件确认 4 条用例
   2 秒内全部通过。
+- 步骤 4.6（压测场景 1 第一次正式跑）：通过自动化后台工具调用 `loadtest/collect_docker_stats.
+  ps1` 采集不到任何数据（脚本设计给人工开交互式窗口用，后台调用下 `docker stats --no-stream`
+  一直不返回），改用等价的 Bash 循环重新采集场景 2/3/4，场景 1 的 CPU/内存峰值如实标记缺失。
+- 步骤 4.6（压测场景 4 第一次正式跑）：Windows Git Bash 把 `--out csv=/loadtest/output/
+  llm_timeout.csv` 自动转换成 `C:/Program Files/Git/...` 路径导致 k6 报错退出（`trap` 已经
+  正常把 mock-llm 配置重置了），加 `MSYS_NO_PATHCONV=1` 前缀重跑一次成功修复。
+- 步骤 4.6（第二轮，3 worker 对比场景 1）：直接用 `docker compose run --rm k6 run --out
+  csv=/loadtest/output/steady_worker3.csv ...`（没走 Makefile 目标）时忘了加
+  `MSYS_NO_PATHCONV=1`，同样的路径转换问题导致第一次尝试在发消息之前就报错退出（0% 进度，
+  没有产生任何压测数据，不影响后续结果），加前缀重跑一次成功。
 
 ---
 
@@ -5183,3 +5227,125 @@ trace_id 脱敏修复对三者都生效；`test_mock_llm_timeout.py` 只在 mock
 
 **未做的事（按 Jo 指示）**：没有跑压测（`make loadtest*`），没有 `git commit`/`git push`。
 Jo 重做故障 9、11 的结果已经拿到，本节汇报后不需要再等 Jo 验证，等 Jo 提交。
+
+---
+
+## 步骤 4.6：实际跑压测四场景
+
+故障注入结束、上一节的构建验证通过之后，本节按 PHASE4.md 4.6 实际跑了四个压测场景（先小
+规模冒烟确认协议理解没错，再跑完整规模），完成 `docs/LOADTEST.md`、更新 README 的 Makefile
+目标表和"压测"一节。详细数字、方法、每个场景的备注全部写在 `docs/LOADTEST.md`，这里只记
+关键决策和审查发现。
+
+**结果概要**（详细表格见 `docs/LOADTEST.md`）：
+- 场景 1（稳定，200 msg/s/5min）：实际约 36.4/s，完整回复 P95 4.3s，不达标；worker CPU
+  峰值稳定在 100~110%（单核打满），rabbitmq CPU 峰值 340~390%（相当于跑满近 4 个核）。
+- 场景 2（突发，1000 msg/s/30s）：30 秒窗口内约 18.8/s，不达标；**不丢消息达标**（k6 实际
+  建立的 1722 个 WebSocket 会话，数据库里最终 replied 的消息数也是 1722，完全相等）；队列
+  积压峰值 1362，30 秒内消化完。
+- 场景 3（财务查询，100 QPS）：实际约 30.4/s，完整回复 P95 3.9s，不达标，且**测量本身失效**
+  （见下面"重大方法论缺陷"）。
+- 场景 4（LLM 超时率 20%）：**系统没有崩溃**（跑完 `/health` 全部正常），但**故障本身基本
+  没被真正触发**（同上）。
+
+**改进方向**：worker 只有 1 个副本、单进程，CPU 稳定卡在 100~110%（相当于用满 1 个核），
+而宿主机 Docker 分配了 16 个核，明显没用满，是这轮四个场景吞吐量都上不去的主因；架构上
+`worker` 本来就设计成可以水平扩展多实例，这轮没有实际验证多副本部署，是下一步验证的方向。
+
+【agent 做错】**重大方法论缺陷（本节最主要的发现，见索引第 33 条）**：四个场景连续跑，没
+检查 t_a 机构的每日 LLM token 预算（`tenants.daily_token_budget=2000000`），场景 1 大约
+跑到第 5 分钟就把预算打满，此后场景 1（第二次跑）、2、3、4 **全部**（不是只有 3、4）全程
+`meta.budget_exceeded` 都是 `true`，intent 分类全部降级成关键词规则：场景 3 的
+`query_finance` 工具调用因此拿不到合法参数（`tools[0].status: invalid_json`，
+`timings.finance` 恒为 0），根本没有真的调用 mock-finance；场景 4 的 classify 全程没有
+发起过 LLM 调用，注入的 `timeout_rate=0.2` 基本没被命中过；场景 1、2 本身虽然没有专门验证
+LLM 故障，但同样是在关键词兜底状态下测的，不代表"LLM 正常可用"这个前提下的真实链路耗时
+（Jo 事后追问验证时才把这一点摆到台面上，之前的汇报里低估了范围，只强调了 3、4）。尝试执行
+`docker compose exec redis redis-cli DEL "llm:budget:t_a:2026-09-27"`
+清空预算键、想拿一次干净数据重跑，被 auto 模式的权限分类器拦下（判定为"修改共享资源"），
+没有绕过，如实记录在 `docs/LOADTEST.md` 最开头，列出三个补救选项交给 Jo 决定（授权清空
+重跑 / 调大预算配置重跑 / 接受现状）。系统层面的结论（有没有崩溃、丢不丢消息、队列积压/
+消化、CPU 瓶颈在哪）不受这个问题影响，仍然可信；"财务查询真实延迟"和"LLM 超时下的降级
+行为"这两条不能当作对题目原意的有效验证。
+
+**agent 自查修复的两个小问题**（各一句话已记进上面"agent 自查修复"列表）：
+1. 场景 1 第一次正式跑忘记同步用 `loadtest/collect_docker_stats.ps1` 采集 CPU/内存——
+   排查发现是脚本设计给人工开交互式窗口用，通过自动化后台工具调用时 `docker stats
+   --no-stream` 一直不返回、没有任何输出也没有报错；改用等价的 Bash 循环重新采集了场景
+   2/3/4，三次都拿到完整数据，确认可用；场景 1 的 CPU/内存峰值因此如实缺失，没有拿场景
+   2/3/4 的数字去顶替或估算。
+2. 场景 4 第一次正式跑因为 Windows Git Bash 把 `/loadtest/output/llm_timeout.csv` 自动
+   转换成 `C:/Program Files/Git/...` 路径，k6 报错退出（`trap` 已经把 mock-llm 配置正常
+   重置，没留下 `timeout_rate=0.2` 的脏状态）；加 `MSYS_NO_PATHCONV=1` 前缀重跑一次成功。
+
+**改动文件**：新增 `docs/LOADTEST.md` 全部内容（原来只是骨架）；`README.md`（Makefile
+目标表补齐 `loadtest-*` 系列、新增"阶段四环境变量"和"压测"两节）；`loadtest/output/` 下的
+`steady.csv`/`burst.csv`/`finance.csv`/`llm_timeout.csv`/`burst_docker_stats.csv`/
+`finance_docker_stats.csv`/`llm_timeout_docker_stats.csv`（压测产物，`.gitignore` 里
+`loadtest/output/` 已排除，不会被提交）；`loadtest/tokens.json`（压测用户 token，同样被
+`.gitignore` 排除）；`AGENT_LOG.md` 本身（新增索引第 33 条、两条自查修复、本节）。
+
+**影响哪些服务**：本节没有改动任何 `app/`/`mocks/` 下的业务代码，只跑了压测脚本、写了报告
+文档，gateway/worker/scheduler/mock-* 五个服务和三个 Dockerfile 都没有变化。压测期间往
+`messages`/`conversations`/`users` 等表写入了大量压测数据（`loadtest_t_a_*` 前缀的用户），
+Redis 里 `llm:budget:t_a:2026-09-27` 键的值也被压测流量真实推高到超过预算——这些都是压测
+本身产生的真实数据变化，不是代码改动。
+
+**未做的事（按 Jo 指示）**：没有 `git commit`/`git push`；没有清空/调整 t_a 的 token 预算
+（被权限拦下，等 Jo 决定）；场景 3、4 的"有效数据"版本没有补跑，等 Jo 决定怎么处理预算问题
+之后再补。
+
+---
+
+## 步骤 4.6 第二轮：长连接模型改造 + 解除预算 + 完整重跑四场景
+
+Jo 亲手执行 `UPDATE tenants SET daily_token_budget=NULL WHERE id='t_a'` 解除预算限制之后，
+本节：(1) 把 `loadtest/lib/ws_client.js` 和四个场景文件改成长连接模型（索引第 34 条，
+【人工审查发现】）；(2) 重新跑场景 1 时发现单 worker 真实吞吐上限只有约 10/s、远低于
+200/s 目标，Jo 授权后手动清空了积压的 47170+32 条测试消息（数据库未删任何数据）；(3) 按
+Jo 的决定把场景 2/3/4 改成 3 个 worker 跑，场景 4 的速率从题目默认"跑场景 1 负载"（200/s）
+改成 30/s；(4) 全部跑完后 `docker compose up -d --scale worker=1` 恢复单 worker；
+(5) 完整重写 `docs/LOADTEST.md`（旧结果挪到"第一轮（已作废）"一节，不删除）和 README 压测
+一节。详细数字见 `docs/LOADTEST.md`，这里只记两个决定的原因和关键发现。
+
+**决定 1：为什么场景 2/3/4 改用 3 个 worker，不是继续用 1 个 worker**——场景 1 用 1 worker
+跑完整规模后，实测稳态消化速率只有 10.0 条/秒（92 秒窗口内 54211→53291 条，干净测量，无新
+消息进入），跟题目任何一个场景的目标速率（100~1000/s）比都差一到两个数量级；如果场景 2/3/4
+继续用 1 worker 跑，可以预见的结果是"又堆出几万条积压、又要清一次队列"，不会带来新信息
+（结论已经很清楚：worker 单核 CPU 是瓶颈）。改用 3 worker 跑，一是场景 1 的 1v3 对比已经
+证明扩容确实有效（≈3.7 倍，接近线性），继续用 3 worker 能看到"扩容之后系统其它环节（尤其
+Postgres）撑不撑得住"这个更有信息量的问题；二是 3 worker 下场景 2（突发）、场景 4（LLM
+超时，改速率后）都能在合理时间内（分钟级而不是小时级）跑完并自然消化掉积压，不需要每次都
+手动清队列。
+
+**决定 2：为什么场景 4 把速率从题目默认的 200/s 改成 30/s**——题目本身没有规定这个场景一定
+要用 200/s，"跑场景 1 的负载"只是压测准备阶段自己定的默认值，不是题目原文；场景 4 真正要
+验证的是"LLM 超时率 20% 时系统的降级行为对不对（会不会正确降级、会不会触发熔断、会不会
+崩溃、会不会有消息卡住或进死信）"，不是再测一次吞吐量上限——吞吐量上限场景 1 已经测过了。
+如果继续用 200/s，3 worker 处理能力（约 37/s）跟不上，会迅速堆出几万条积压，压力测试和
+故障注入两件事搅在一起，反而看不清"降级行为本身对不对"这个真正要验证的问题；改成 30/s
+（在 3 worker 处理能力之内、接近但不超过）之后，系统能一边处理超时故障一边跟上发送速率，
+干净地观察到了：降级比例 43.6%（高于注入的 20%，原因是熔断器打开期间所有请求都被拒绝降级，
+不止命中超时的那部分，是熔断设计上的正常级联放大，不是 bug）、熔断正确打开又能在故障解除后
+自愈（用探测消息验证）、零消息丢失/卡住/死信、系统全程不崩溃。
+
+**关键发现（除了上面两个决定之外，本节还确认了两件事）**：
+1. `meta.timings.respond` 其实没有漏计流式生成时间——同一个会话里 `respond_ms` 从几毫秒到
+   4000+ 毫秒都有，取决于 mock-llm 这次生成的回复长短（按约 50 字/秒吐字），之前报告里贴的
+   "respond 只有 11.9ms" 只是抽到了短回复的样本。
+2. 回复发完之后同步生成历史摘要（`maybe_update_summary`）的耗时不计入 `meta.timings` 任何
+   字段——这是一个真实的可观测性缺口，记入 `docs/LOADTEST.md`"已知问题"，本轮未改代码。
+
+**改动文件**：`loadtest/lib/ws_client.js`（长连接改造）、`loadtest/steady.js`/`burst.js`/
+`finance.js`/`llm_timeout.js`（改用 `runPersistentConnection`，环境变量改成
+`*_CONNECTIONS`/`*_DURATION_SECONDS`）；重写 `docs/LOADTEST.md`；`README.md`（压测一节
+措辞更新）；新增 `loadtest/output/*_w3*.csv`、`*_worker3*.csv` 等压测产物（`.gitignore` 已
+排除）；`AGENT_LOG.md` 本身（索引第 34 条、本节）。
+
+**影响哪些服务**：没有改动任何 `app/`/`mocks/` 业务代码；`docker compose up -d --scale
+worker=3` 又 `--scale worker=1` 是压测期间的临时操作，跑完已经恢复成 1 个 worker，
+`docker-compose.yml` 本身没有改（副本数不是配置文件里写死的，是命令行参数）。
+
+**未做的事（按 Jo 指示）**：没有 `git commit`/`git push`；没有恢复 t_a 的 token 预算、没有
+清空 Redis 键（Jo 说这两件事由她自己做）；`docker compose up -d --scale worker=1` 已执行
+并确认 healthy。

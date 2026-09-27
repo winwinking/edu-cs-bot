@@ -8,15 +8,21 @@
  * 报告里把"完整回复的 P95"和"meta.timings.finance 的 P95"分开写，就是要看清楚这多出来的一段
  * 网络往返占了多大比例。
  *
+ * Jo 审查后改成长连接模型，连接数和每条连接的发送速率配套算出来：
+ *   目标 100 条/秒 ÷ 200 条连接 = 每条连接 0.5 条/秒 = 每 10 秒 5 条
+ * 5 条/10秒远低于网关限流 20 条/10秒，留了 4 倍余量。t_a 下 1600 个压测用户，200 条连接
+ * 够用。
+ *
  * 持续时长 PHASE4.md/REQUIREMENTS.md 都没写死，默认给 2 分钟，够攒出稳定的 P95，可以用
- * FINANCE_DURATION 环境变量改；跟其它三个场景的持续时长（题目写死的 5 分钟/30 秒）不是同一个
- * 性质，这个默认值是本轮准备阶段自己定的，写进了 docs/LOADTEST.md 的设计说明里，不是题目原文。
+ * FINANCE_DURATION_SECONDS 环境变量改；跟其它三个场景的持续时长（题目写死的 5 分钟/30 秒）
+ * 不是同一个性质，这个默认值是本轮准备阶段自己定的，写进了 docs/LOADTEST.md 的设计说明里，
+ * 不是题目原文。
  *
  * 用法：
  *   docker compose run --rm k6 run finance.js
  *   docker compose run --rm k6 run --out csv=/loadtest/output/finance.csv finance.js
  */
-import { sendOneMessage } from './lib/ws_client.js';
+import { runPersistentConnection } from './lib/ws_client.js';
 import { tokenForVU } from './lib/tokens.js';
 import { pollQueueBacklog } from './lib/rabbitmq.js';
 import { GATEWAY_WS_URL, conversationIdFor } from './lib/config.js';
@@ -31,24 +37,27 @@ const CONTENTS = [
   '我最近的订单状态是什么',
 ];
 
-const DURATION = __ENV.FINANCE_DURATION || '2m';
+export const DURATION_SECONDS = Number(__ENV.FINANCE_DURATION_SECONDS || 120);
+export const RATE = Number(__ENV.FINANCE_RATE || 100);
+export const CONNECTIONS = Number(__ENV.FINANCE_CONNECTIONS || 200);
+export const SEND_INTERVAL_MS = Math.round((1000 * CONNECTIONS) / RATE);
+
+const TOTAL_DURATION_MS = DURATION_SECONDS * 1000;
 
 export const options = {
   scenarios: {
     finance_load: {
-      executor: 'constant-arrival-rate',
-      rate: Number(__ENV.FINANCE_RATE || 100),
-      timeUnit: '1s',
-      duration: DURATION,
-      preAllocatedVUs: Number(__ENV.FINANCE_VUS || 300),
-      maxVUs: Number(__ENV.FINANCE_MAX_VUS || 400),
-      exec: 'sendMessage',
+      executor: 'per-vu-iterations',
+      vus: CONNECTIONS,
+      iterations: 1,
+      maxDuration: `${DURATION_SECONDS + 60}s`,
+      exec: 'openConnection',
     },
     queue_backlog_collector: {
       executor: 'constant-arrival-rate',
       rate: 1,
       timeUnit: '5s',
-      duration: DURATION,
+      duration: `${DURATION_SECONDS}s`,
       preAllocatedVUs: 1,
       maxVUs: 1,
       exec: 'collectBacklog',
@@ -56,12 +65,18 @@ export const options = {
   },
 };
 
-export function sendMessage() {
+export function openConnection() {
   const { token } = tokenForVU(__VU);
   const conversationId = conversationIdFor(SCENARIO_DIGIT, __VU);
-  const messageId = `finance-${__VU}-${__ITER}-${Date.now()}`;
-  const content = CONTENTS[__ITER % CONTENTS.length];
-  sendOneMessage(GATEWAY_WS_URL, token, conversationId, messageId, content);
+  runPersistentConnection({
+    gatewayWsUrl: GATEWAY_WS_URL,
+    token,
+    conversationId,
+    messageIdPrefix: `finance-${__VU}`,
+    sendIntervalMs: SEND_INTERVAL_MS,
+    totalDurationMs: TOTAL_DURATION_MS,
+    contentForSeq: (seq) => CONTENTS[seq % CONTENTS.length],
+  });
 }
 
 export function collectBacklog() {
