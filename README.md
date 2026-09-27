@@ -1,20 +1,23 @@
 # edu-cs-bot
 
-多租户教育平台 AI 客服机器人后端系统。完整需求见 `docs/REQUIREMENTS.md`，各阶段任务拆解见 `docs/PHASE1.md`/`docs/PHASE2.md`。
+## 项目简介
 
-阶段一（骨架与消息全链路）已完成：客户端 WebSocket 发消息 → gateway 鉴权/校验/去重 → 投递 RabbitMQ →
-收到队列确认后 ACK 客户端 → worker 消费 → 调用 mock-llm（流式）→ 回复分片经 Redis 推回 gateway → 推送给客户端。
+多租户教育平台 AI 客服机器人后端系统：学员/家长通过 WebSocket 接入，机器人识别意图后路由到
+知识问答（RAG）、财务查询、平台指令执行、日程提醒、转人工五类能力，全链路异步解耦（网关只管
+接入、worker 异步消费队列），具备限流、熔断、降级、幂等、审计、多租户隔离等生产级工程能力。
+完整需求见 `docs/REQUIREMENTS.md`，各阶段任务拆解见 `docs/PHASE1.md`~`docs/PHASE5.md`，已知
+问题和后续规划见 [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md)。
 
-阶段二（业务能力）已完成：在阶段一的骨架上用 LangGraph 编排出意图识别 + 七类业务节点（知识问答、
-财务查询、平台指令二次确认、转人工等），细节见下面"意图路由"一节和 `docs/PHASE2.md`。
+**运行环境**：开发和测试机器为 i7-12650H（10 核 16 线程）、16GB 内存、512GB NVMe 固态硬盘，
+满足题目硬件建议；系统是 Windows 11 + Docker Desktop，本仓库只在这个组合上实测过，Linux/macOS
+理论上兼容（Compose 文件和脚本都没有 Windows 专属写法）但未实测；Docker Desktop 默认分给
+容器的资源约 16 CPU / 7.6GB 内存，压测报告（见下）是在这个资源上限下跑出来的；项目不使用 GPU。
 
-阶段三（提醒、上下文、保护、成本、演示）已完成：独立的 `scheduler` 服务扫描到期提醒并推送；
-超过最近 N 条的历史对话压成摘要；gateway 加了限流和 Redis 故障降级，worker 加了熔断、有上限的
-重试和死信队列；每次 LLM 调用记 token 用量、机构按天限额、Prometheus 暴露成本和运行指标；
-`mock-im` 从简单聊天页面升级成带身份切换、10 个 E2E 场景快捷键和 `reply_end.meta` 透视面板的
-演示控制台。细节见 `docs/PHASE3.md` 和下面各节。
+## 架构概要
 
-## 架构图
+完整的架构说明、消息完整路线（去程+回程逐服务逐文件）、关键设计取舍（每条做了什么/为什么/
+代价，附代码位置）见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)（`docs/PHASE5.md` 5.5，
+本文档写这段时还没开始）。这里先放整体架构图：
 
 ```mermaid
 graph LR
@@ -47,7 +50,7 @@ token 应该由平台自己的登录系统签发，gateway 只负责验签（`ap
 密钥、连数据库查用户角色，是因为它在演示环境里临时扮演的是"签发方"这个角色，仅限这一个用途；
 接真实平台之后，`/api/token` 这个接口和 mock-im 这一层都可以整个去掉，gateway 的验签逻辑不用动。
 
-## 意图路由（阶段二）
+## 意图路由
 
 worker 收到一条消息后，先过 `app/worker/graph/classify.py` 判出意图，再由
 `app/worker/graph/graph.py` 路由到对应的业务节点。判定顺序是"规则先行，LLM 兜底"——前面的规则
@@ -92,7 +95,7 @@ worker 收到一条消息后，先过 `app/worker/graph/classify.py` 判出意�
 | mock-platform | 8102 | `MOCK_PLATFORM_HOST_PORT` | `/commands`（幂等）、`/users/{id}/subscriptions`、`/admin/commands`、`/agents/status` + `/admin/config` |
 | mock-finance | 8103 | `MOCK_FINANCE_HOST_PORT` | `/orders` `/bills` `/invoices` `/refunds` `/balance` + `/admin/config` |
 
-## 启动步骤
+## 快速开始
 
 ```bash
 cp .env.example .env    # 按需修改，尤其是密码类变量
@@ -126,13 +129,58 @@ COMPOSE_PROJECT_NAME=edu-cs-bot-fresh make up
 down`/`make test`/`make demo` 等其它目标也要带着同样的环境变量才会操作到对应的那一份。
 
 跑起来之后可以：
-- 浏览器打开 `http://localhost:8080`（演示控制台），顶部下拉框选一个身份直接连（token 由控制台后端现场签发，不用再手工跑 `gen_token.py` 粘贴），左下角点 10 个 E2E 场景按钮快捷发送，右边看每次回复的透视面板
 - 浏览器打开 `http://localhost:15672`（RabbitMQ 管理界面），看 `inbound.messages`/`inbound.dead` 两个队列
 - `make logs` 看所有服务的结构化 JSON 日志
 - `docker compose stop mock-llm` 之后再发消息，验证 worker 会推送降级回复且不崩
 - `docker compose run --rm tools python scripts/phase2_smoke.py` 把阶段二的 9 个 E2E 场景串起来跑一遍，打印 PASS/FAIL
 - `docker compose run --rm tools python scripts/phase3_smoke.py` 把阶段三的场景（提醒推送/修改/取消、上下文摘要、限流、熔断、预算降级）串起来跑一遍
 - 浏览器打开 `http://localhost:8011/metrics`（端口以 `docker compose port worker 8001` 实际输出为准）看 worker 的 Prometheus 指标
+
+## 演示控制台（`http://localhost:8080`，mock-im）
+
+- **身份切换**：顶部下拉框选一个身份直接连，token 由控制台后端现场签发（`app.common.auth.
+  create_access_token`，`role` 现查数据库，不是前端猜的），不用再手工跑 `gen_token.py` 粘贴。
+  切身份会断开旧连接、清空聊天窗口和右侧面板，同一个身份再切回来复用同一个 `conversation_id`
+  （历史/摘要/不满意计数接得上）。
+- **快捷按钮**：左下角按当前身份分组显示，点一下按顺序发送场景原句，跟 `scripts/
+  phase2_smoke.py`/`phase3_smoke.py` 的断言用的是同一批原句。**带 `*` 的按钮**（比如"场景7
+  财务超时"、"场景8 LLM非法JSON"）只是发送原句，触发对应降级效果之前要先用 `scripts/
+  mockctl.py` 把对应 mock 服务切到故障模式（比如 `mockctl.py finance mode=timeout`），点完
+  验证完记得 `mockctl.py <服务> reset` 恢复，否则会影响后面其它场景/压测。**"跨机构政策
+  对比"类按钮**（t_a/t_b 各一个，问同一句"退费政策是什么"）需要手动切到另一机构的身份再问
+  一次同一句话，才能看出两家机构条款隔离、答案不同——控制台不会自动帮你切身份问第二遍。
+- **透视面板**（右侧"处理流程回放"）：点左侧任意一条机器人回复重新播放，展示这条消息实际
+  经过的 `app/worker/graph/graph.py` StateGraph 节点、各节点耗时、LLM 耗时、意图/判定来源、
+  工具名和结果、知识来源和分数、`worker_id`、熔断/预算/风险标记，字段来源见下面"`reply_end`
+  的 `meta` 字段"一节。命中异常判定时顶部会出现红色横条，没有异常不显示。
+- **架构路线图**（右侧"处理流程回放"区右上角"架构路线"按钮，阶段五新增，纯前端，只在
+  `mocks/mock_im/templates/index.html`）：点开一张覆盖右侧面板的弹层，画的是"浏览器→gateway
+  鉴权→Redis限流→Redis去重→RabbitMQ投递→回ACK→RabbitMQ队列→worker取消息→数据库去重→
+  worker业务流程→回复写入数据库→Redis推送→gateway→浏览器"这条完整链路（外加 worker 业务
+  流程下面 mock-llm/mock-finance/mock-platform/知识库 四个下游图标，以及 scheduler 的提醒
+  推送线），跟内部流程图是两张独立的图。每条回复结束后回放一次，圆点固定节拍走一遍真实路径，
+  出问题的地方停下标红/标黄（限流/重复/投递失败/连接被拒/Redis degraded 各有专门的判定，
+  弹层下方还有一块跟内部流程图完全一致的耗时/工具/知识来源摘要）。点弹层里的"worker 业务
+  流程"框或右上角"关闭"都能退出，回到内部流程图。局限见 `docs/KNOWN_ISSUES.md`。
+- **记忆区块**：右侧透视面板下方，展示这条会话当前带入的历史原文条数、有没有摘要、摘要内容
+  （现查 `conversation_summaries` 表，是"当前最新状态"，不是这条回复发生那一刻的历史快照）。
+- **坐席工作台**：切到坐席身份（`u_a_1003`/`u_b_1003`）会顶替聊天窗口，显示本机构的转接
+  工单列表和审计日志（财务查询/指令执行），跨机构、非坐席角色一律 403。
+
+## 水平扩展演示
+
+```bash
+docker compose up -d --scale worker=3   # 水平扩展 3 个 worker 副本
+```
+
+worker 无状态（业务状态全在 PostgreSQL/Redis/RabbitMQ 里），扩容不需要额外配置；每个副本会
+分到 `WORKER_HEALTH_HOST_PORT` 起始的一个不同宿主机端口（见上面"端口"一节），`docker compose
+ps` 能看到 3 个 `worker` 容器都 `healthy`。验证消息被分派到不同副本：发几条消息后看
+`reply_end.meta.worker_id`（取的是容器 hostname），应该会看到不同的值轮流出现。验证完恢复：
+
+```bash
+docker compose up -d --scale worker=1
+```
 
 ## 命令行工具（`scripts/`）
 
@@ -228,9 +276,14 @@ docker/
                    # 其余 4 个 mock 服务不引用这些模块
 migrations/    # Alembic 迁移
 scripts/       # 命令行工具，见上面"命令行工具"一节
+loadtest/      # k6 压测脚本 + lib/（长连接客户端、token 加载）
+eval/          # LLM 质量评测（阶段五 5.3/5.4）：cases.jsonl（50 条测试集）、SCORING.md（打分口径）、
+               # scoring.py（纯规则打分函数）、db_checks.py（数据库/mock-platform 验证）、
+               # run_eval.py（评测脚本）、output/（每题明细，.gitignore 排除）
 tests/unit/    # 纯函数和轻量假对象单测（pytest + pytest-asyncio），不连真实数据库；
                # 涉及数据库/mock 服务的验证走 docker compose 起真实服务手工/脚本验证，见各步骤文档
-docs/          # REQUIREMENTS.md（需求原文）、PHASE*.md（各阶段任务拆解）、phase2_threshold.md（检索阈值标定）
+docs/          # REQUIREMENTS.md（需求原文）、PHASE*.md（各阶段任务拆解）、phase2_threshold.md（检索阈值标定）、
+               # LOADTEST.md/FAULT_INJECTION.md/KNOWN_ISSUES.md（阶段四/五产出的报告类文档）
 ```
 
 ## Makefile 目标
@@ -252,13 +305,14 @@ docs/          # REQUIREMENTS.md（需求原文）、PHASE*.md（各阶段任务
 | `make loadtest-finance` | 压测场景 3：财务查询（100 QPS，2 分钟） |
 | `make loadtest-llm-timeout` | 压测场景 4：LLM 超时率 20%（内部用 `mockctl.py` 设置/重置，`trap` 保证不管成败都会重置） |
 | `make loadtest` | 依次跑完上面四个场景 |
+| `make eval` | 先跑打分函数单测（`tests/unit/test_eval_scoring.py`），再跑 `eval/run_eval.py`（50 道题走真实 WebSocket，前提是已经 `make up` 且两家机构今日 LLM token 预算没用完），明细写到 `eval/output/`（不进 git），报告见 `docs/EVAL_REPORT.md` |
 
 `migrate`/`seed`/`reindex`/`demo` 实际上跑在一个叫 `tools` 的一次性容器里（跟 gateway/worker 共用
 同一个镜像），`docker-compose.yml` 里给它设了 `profiles: ["tools"]`，所以 `make up` 不会把它一起
 启动，只有 `docker compose run --rm tools ...` 显式点名才会临时起一个，干完活自动退出，不会一直占
 资源；上面"命令行工具"一节列的脚本都是这样跑的。
 
-## 新增的环境变量（阶段二）
+## 新增的环境变量（知识检索与工具调用）
 
 完整列表和注释见 `.env.example`，这里只列阶段二新增、且不是"密码/密钥"类的关键项：
 
@@ -274,7 +328,7 @@ docs/          # REQUIREMENTS.md（需求原文）、PHASE*.md（各阶段任务
 | `MOCK_PLATFORM_MODE` | `normal` | mock-platform 故障模式：`normal`/`timeout`（永久挂起，验证重试耗尽）/`slow_commit`（延迟后成功，验证幂等键找回结果）/`error500` |
 | `PENDING_ACTION_TTL_SECONDS` | `300` | 高风险指令待确认操作的有效期，超过还没确认就按超时处理 |
 
-## 新增的环境变量（阶段三）
+## 新增的环境变量（提醒、限流与熔断）
 
 同样只列关键项、不是"密码/密钥"类的，完整列表见 `.env.example`：
 
@@ -291,19 +345,90 @@ docs/          # REQUIREMENTS.md（需求原文）、PHASE*.md（各阶段任务
 | `DLQ_MAX_RETRIES` | `3` | 消息处理时出现意外异常，重新入队几次还失败就进 `inbound.dead` |
 | `DEFAULT_DAILY_TOKEN_BUDGET` | 空（不限额） | 机构没在 `tenants.daily_token_budget` 单独设置时用这个值 |
 
-## 新增的环境变量（阶段四）
+## 新增的环境变量（LLM 超时拆分）
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `LLM_NONSTREAM_TIMEOUT_SECONDS` | `3` | classify 这类非流式 LLM 调用的超时，超时不重试（阶段四故障注入把原来的 `LLM_TIMEOUT_SECONDS=15` 拆成非流式/流式两个更短的值，重试也从"超时重试一次"改成"超时不重试"） |
 | `LLM_STREAM_TIMEOUT_SECONDS` | `4` | respond 阶段流式生成的超时，超时不重试；比非流式多给 1 秒是因为流式要先等首字节，理由见 `loadtest/llm_timeout.js` 顶部注释 |
 
-## 压测（阶段四 4.6）
+## 测试结果摘要
+
+`make test` 四层（前提：已经 `make up`），数字取自 2026-09-27 全新克隆复验（详见
+`AGENT_LOG.md`"步骤 5.1"）：
+- 单元测试：238 passed，2 skipped（核心模块覆盖率 92%，见 `make test` 输出的 `--cov-report`）
+- mock-llm 专属单测：42 passed
+- 集成测试：11 passed
+- E2E（题目 6.3 十个场景）：10 passed
+
+CI（`.github/workflows/ci.yml`）在 push 到 `main` 时自动跑单元测试这一层；integration/e2e
+依赖完整 Docker Compose 环境，本地/演示环境手动跑 `make test`。
+
+## 压测结果摘要
 
 四个场景（稳定/突发/财务查询/LLM 超时率 20%）的脚本在 `loadtest/`，跑法见上面 Makefile
 目标表。压测跑了两轮：第一轮的 k6 脚本是"每条消息各自建一次连接"的短连接模型，且跑的时候
 t_a 机构的每日 LLM token 预算被打满，两个问题都让结果测不到题目原本要测的路径，已作废；
 第二轮把 `loadtest/lib/ws_client.js` 改成长连接模型（每个 VU 建一条连接、持续发消息，
 `message_id`/`reply_to` 匹配每条在途消息），解除了预算限制，是当前有效结果，其中场景 1 额外
-对比了 1 个 worker 和 3 个 worker 的差异。详细数字、方法、单 worker 吞吐上限的原因分析、
-下一个瓶颈（Postgres）都写在 [`docs/LOADTEST.md`](docs/LOADTEST.md)，不在这里重复。
+对比了 1 个 worker 和 3 个 worker 的差异。
+
+跟题目指标逐条对比（第二轮，最终结果，数字取自 `docs/LOADTEST.md`"和题目指标逐条对比"一节）：
+- 稳定（500 连接/200msg/s/5 分钟）：不达标，1 worker 约 10/s、3 worker 约 37/s——worker 单核
+  CPU 是瓶颈，水平扩展基本线性有效，Postgres 是下一个瓶颈
+- 突发（≥1000 VU/1000msg/s/30 秒）：部分达标，并发数和发送速率达标、**零丢失**，但积压要
+  12~13 分钟才能消化完
+- 财务查询（100 QPS/P95<500ms）：不达标，`mock-finance` 本身 P95 只要 286ms（达标），瓶颈是
+  排队等 worker，不是财务接口慢
+- LLM 超时率 20%（降级且不崩溃）：**达标**，不崩溃、降级正确、熔断正确触发并自愈、无丢失
+
+详细数字、方法、单 worker 吞吐上限的原因分析、下一个瓶颈（Postgres）都写在
+[`docs/LOADTEST.md`](docs/LOADTEST.md)，不在这里重复。
+
+## 评测结果摘要（阶段五 5.4）
+
+LLM 质量评测（`eval/cases.jsonl` 50 条，走真实 WebSocket 链路，用 mock-llm）跑了两遍，
+两遍的五个指标分子分母完全一致（可复现）：
+- 事实准确率 28/33（84.8%）
+- 引用命中率 7/12（58.3%）
+- 越权拒绝率 5/5（100.0%），合法查询误拒 0/6
+- 无依据拒答率 3/5（60.0%）
+- 少 AI 味评分：平均 95.8 分，80 分以上占 86.0%（43/50）
+- 转人工准确率 50/50（100.0%），误转/漏转均为 0
+
+失败的 9 道题全部归因"系统问题"（主要是 `EMBEDDING_PROVIDER=hash` 的检索排序/假阳性问题，
+外加一处敏感关键词不支持词序变化）或"mock 局限"（mock-llm 已知的关键词碰撞），没有"题目
+预期有误"的情况。详细的每题证据、归因、评测过程中改过的题目（改前/改后/原因）见
+[`docs/EVAL_REPORT.md`](docs/EVAL_REPORT.md)。
+
+## 已知问题
+
+见 [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md)：每条写现象、影响、为什么没做、后续怎么做，
+来源包括 `AGENT_LOG.md` 里记录的已知问题、各阶段文档里砍掉/简化的内容、架构上已知的局限。
+
+## 文档索引
+
+| 文档 | 内容 |
+|---|---|
+| `docs/REQUIREMENTS.md` | 题目原文 |
+| `docs/PHASE1.md` ~ `docs/PHASE5.md` | 各阶段任务拆解，coding agent 按这些文档小步实施 |
+| `docs/phase2_threshold.md` | 知识检索阈值（`KNOWLEDGE_MIN_SCORE`/`MOCK_KNOWLEDGE_MIN_SCORE`）标定过程 |
+| `docs/LOADTEST.md` | 压测报告（方法、四场景结果、跟题目指标逐条对比、已知问题） |
+| `docs/FAULT_INJECTION.md` | 故障注入命令与验证记录（阶段四 4.5） |
+| `docs/KNOWN_ISSUES.md` | 已知问题与后续规划 |
+| `docs/ARCHITECTURE.md` | 架构图、消息完整路线、关键设计取舍（5.5，待创建） |
+| `docs/API.md` | WebSocket/HTTP 接口文档（5.5，待创建） |
+| `docs/CHECKLIST.md` | 题目要求逐条对照（5.5，待创建） |
+| `docs/EVAL_REPORT.md` | LLM 质量评测报告（5.4：五个指标、每道失败题的证据和归因、评测过程中改过的题目） |
+| `eval/SCORING.md` | 评测五个指标的打分口径 |
+| `AGENT_LOG.md` | coding agent 使用记录，见下一节 |
+
+## coding agent 使用说明
+
+这个项目由 coding agent（Claude Code）按 `docs/PHASE1.md`~`docs/PHASE5.md` 小步实施，每步
+完成后停下等人工审查、确认后再继续，不自行扩大范围。完整记录见 [`AGENT_LOG.md`](AGENT_LOG.md)：
+- 文件开头"总览"：关键 prompt、agent 生成/修改的模块（按阶段）、人工审查与修复点、agent 做错
+  或需要重写的部分（阶段五收尾时补齐，见 `docs/PHASE5.md` 5.6）
+- "审查故事索引"：全部【人工审查发现】【agent 做错】【agent 自查修复】条目，每条固定写"agent
+  做了什么、发现了什么问题、为什么是问题、怎么修改/怎么验证"
+- 正文按步骤记录改了哪些模块、关键设计决策

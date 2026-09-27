@@ -18,3 +18,6 @@ __pycache__/
 # 压测用户 token（PHASE4.md 4.6 关键设计决定 6）：明文 JWT，绝不能进 git
 loadtest/tokens.json
 loadtest/output/
+
+# 评测每题明细（PHASE5.md 5.4）：跑一次生成一份，不是需要版本管理的源文件
+eval/output/

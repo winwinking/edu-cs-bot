@@ -1,4 +1,4 @@
-.PHONY: up down logs ps migrate seed reindex demo test loadtest loadtest-users loadtest-steady loadtest-burst loadtest-finance loadtest-llm-timeout
+.PHONY: up down logs ps migrate seed reindex demo test loadtest loadtest-users loadtest-steady loadtest-burst loadtest-finance loadtest-llm-timeout eval
 
 # 一键启动：等全部容器 healthy 后自动跑迁移 + 种子数据，评委不需要再手动敲 make migrate/
 # make seed 就能直接 make test/make demo。migrate 和 seed 都是幂等的（alembic 本身幂等；
@@ -108,3 +108,12 @@ loadtest-llm-timeout: loadtest-users
 
 # 四个场景挨个跑，也能用上面单独的目标只跑一个（PHASE4.md 4.6 原文要求）
 loadtest: loadtest-steady loadtest-burst loadtest-finance loadtest-llm-timeout
+
+# 阶段五 5.4。前提：已经 make up，且两家机构今日 LLM token 预算没有用完（eval/run_eval.py
+# 自己会在开跑前检查一遍，不满足会直接停止并提示，不会跑到一半才发现）。先跑打分函数的单测
+# （不连数据库，纯规则），再跑真正的评测（真实连 gateway，50 道题挨个发一遍）。评测代码不进
+# gateway/worker 的生产镜像，跟 4.2 处理测试代码是同一个思路：eval/ 只挂载进 tools 容器。
+eval:
+	mkdir -p eval/output
+	docker compose run --rm tools pytest tests/unit/test_eval_scoring.py -q
+	docker compose run --rm tools python eval/run_eval.py

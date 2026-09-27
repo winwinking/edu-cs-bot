@@ -12,8 +12,10 @@ LLM token 预算在场景 1 期间就被打满）测出来的连接模型和预�
 
 ## 环境与方法
 
-- **硬件**：Docker Desktop 分给容器的资源是 16 CPU / 7.6GiB 内存（`docker info`），宿主机
-  物理内存约 16GB。
+- **硬件**：开发和测试电脑为 i7-12650H（10 核 16 线程）、16GB 内存、512GB NVMe 固态硬盘，
+  满足题目硬件建议；系统是 Windows + Docker Desktop，Linux/macOS 未实测；不使用 GPU。
+  Docker Desktop 默认分给容器的资源是 16 CPU / 7.6GiB 内存（`docker info` 查证，CPU 数
+  对应 16 线程），压测在这个条件下完成。
 - **worker 副本数**：场景 1 分别用 1 个和 3 个 worker 各跑一次完整规模做对比；场景 2/3/4
   （突发、财务查询、LLM 超时）统一用 3 个 worker 跑——原因见 AGENT_LOG"步骤 4.6 第二轮"里
   记录的决定：场景 1 的 1 worker 结果已经证明单 worker 吞吐量（约 10/s）远低于任何一个后续

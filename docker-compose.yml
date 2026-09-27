@@ -62,6 +62,9 @@ services:
       # 阶段四 4.6：loadtest/gen_users.py 要写 loadtest/tokens.json（压测用户 token，
       # 见 .gitignore），跟 tests/ 一样不 COPY 进镜像，但这个要能写回宿主机，不能是只读挂载
       - ./loadtest:/app/loadtest
+      # 阶段五 5.4：eval/run_eval.py 要把每题明细写到 eval/output/（见 .gitignore，不进
+      # git），同样不 COPY 进镜像、挂载读写，改 cases.jsonl/SCORING.md 不需要重新 build tools
+      - ./eval:/app/eval
     depends_on:
       postgres:
         condition: service_healthy
