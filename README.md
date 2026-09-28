@@ -16,8 +16,7 @@
 ## 架构概要
 
 完整的架构说明、消息完整路线（去程+回程逐服务逐文件）、关键设计取舍（每条做了什么/为什么/
-代价，附代码位置）见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)（`docs/PHASE5.md` 5.5，
-本文档写这段时还没开始）。这里先放整体架构图：
+代价，附代码位置）见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。这里先放整体架构图：
 
 ```mermaid
 graph LR
@@ -416,9 +415,9 @@ LLM 质量评测（`eval/cases.jsonl` 50 条，走真实 WebSocket 链路，用 
 | `docs/LOADTEST.md` | 压测报告（方法、四场景结果、跟题目指标逐条对比、已知问题） |
 | `docs/FAULT_INJECTION.md` | 故障注入命令与验证记录（阶段四 4.5） |
 | `docs/KNOWN_ISSUES.md` | 已知问题与后续规划 |
-| `docs/ARCHITECTURE.md` | 架构图、消息完整路线、关键设计取舍（5.5，待创建） |
-| `docs/API.md` | WebSocket/HTTP 接口文档（5.5，待创建） |
-| `docs/CHECKLIST.md` | 题目要求逐条对照（5.5，待创建） |
+| `docs/ARCHITECTURE.md` | 架构图、消息完整路线（跟演示控制台"架构路线图"一致）、18 条关键设计取舍（做了什么/为什么/代价，附代码位置） |
+| `docs/API.md` | 各服务 FastAPI 文档地址、WebSocket 协议（连接/消息类型/`meta` 字段/关闭码/重连多端同步）、HTTP 接口与鉴权 |
+| `docs/CHECKLIST.md` | 题目 FR/NFR/测试/负面清单/交付物逐条对照，标完成/部分完成/未做，部分完成和未做的链接到 `KNOWN_ISSUES.md` |
 | `docs/EVAL_REPORT.md` | LLM 质量评测报告（5.4：五个指标、每道失败题的证据和归因、评测过程中改过的题目） |
 | `eval/SCORING.md` | 评测五个指标的打分口径 |
 | `AGENT_LOG.md` | coding agent 使用记录，见下一节 |

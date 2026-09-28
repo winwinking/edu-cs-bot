@@ -7,6 +7,67 @@
 
 ---
 
+## 总览（对应交付物第 10 条）
+
+### 1. 关键 prompt
+
+每个阶段最主要的任务说明是对应的 `docs/PHASE1.md`~`docs/PHASE5.md`（Jo 写给 agent 的完整
+需求拆解，仓库里原样保留，不是复述）。除此之外，"返工指令"这一类临场追加的指令，本文档正文
+和索引里记录的是 agent 自己整理的复述（Jo 的判断和决定，不是逐字转写），本次（5.6）整理时
+没有找到更早阶段的原始对话记录可以逐字还原——这是一个真实的局限，如实写在这里，不去凑字数
+编几条"典型返工指令"出来。本次会话（阶段五 5.5/5.6）里能拿到的是原文，摘两条作为返工指令
+原文的实际样例：
+
+> 进入 docs/PHASE5.md 的 5.5。开始前先读 CLAUDE.md、REQUIREMENTS.md、docs/PHASE5.md，以及
+> AGENT_LOG.md 最前面的审查故事索引。按 PHASE5.md 5.5 写 docs/ARCHITECTURE.md、docs/API.md、
+> docs/CHECKLIST.md。要求：只写已经实现并验证过的内容……
+
+> 5.5 完成后不要停，接着按 docs/PHASE5.md 做 5.6：AGENT_LOG 定稿。补齐开头总览四项……步骤
+> 4.1 mock-llm 速度问题当时没改代码，补记【agent 做错】；检查审查故事索引编号连续、正文里
+> 每条都能找到对应段落。
+
+### 2. agent 生成/修改的模块（按阶段）
+
+- **阶段一**：`app/common`（config/db/redis/mq/auth/schemas/logging/masking 等公共模块）、
+  `app/gateway`（WebSocket 接入、去重、投递、ACK）、`app/worker`（消费者、幂等 status 字段）、
+  `mocks/`（mock-im/mock-llm/mock-knowledge/mock-platform/mock-finance 五个服务的最小骨架）、
+  `migrations/`、`scripts/`（migrate/seed/gen_token 等）、`docker-compose.yml`、
+  `docker/app.Dockerfile`/`mocks.Dockerfile`、`Makefile`、README 初版。
+- **阶段二**：知识库解析与检索（`app/common/knowledge_parser.py`/`retrieval.py`/
+  `embedding.py`）、工具调用与权限（`app/common/tools.py`/`permissions.py`）、
+  `app/worker/graph/`（LangGraph 编排：`graph.py`/`classify.py`/`knowledge.py`/`finance.py`/
+  `command.py`/`handoff.py`/`guard.py`）、`mocks/mock_llm/rules.py` 规则扩展、
+  `mocks/mock_platform`/`mock_finance` 幂等与越权校验。
+- **阶段三**：`app/scheduler/`（提醒调度）、`app/worker/graph/reminder.py`/
+  `context_summary.py`、`app/common/reminder_rules.py`/`rate_limit.py`/
+  `circuit_breaker.py`/`llm_usage.py`、gateway 限流与 Redis 降级、演示控制台增强
+  （`mocks/mock_im`：身份切换、场景快捷键、`meta` 透视面板、坐席工作台）。
+- **阶段四**：`tests/unit`/`tests/integration`/`tests/e2e`、`requirements-dev.txt` +
+  Dockerfile 两段构建（base/tools）、`.github/workflows/ci.yml`、`docs/FAULT_INJECTION.md`、
+  `loadtest/`（k6 脚本 + `lib/ws_client.js` 长连接模型）、mock-llm 新增 `timeout_rate`、
+  日志补 trace_id 结构化埋点、`app/common/logging.py` 的 `_ID_FIELD_RE` 修复。
+- **阶段五**：`docs/KNOWN_ISSUES.md`/`ARCHITECTURE.md`/`API.md`/`EVAL_REPORT.md`（
+  `docs/CHECKLIST.md` 同批产出，见本文档后续记录）、`eval/`（`cases.jsonl`/`scoring.py`/
+  `db_checks.py`/`run_eval.py`）、`Makefile` 的 `up`/`loadtest-*`/`eval` 目标修复、
+  `scripts/seed.py` 幂等语义调整、README 收尾、演示控制台"架构路线图"
+  （`mocks/mock_im/templates/index.html`）。
+
+### 3. 人工审查与修复点
+
+见下面"审查故事索引"——41 条【人工审查发现】/【agent 做错】，加上"agent 自查修复"小节里
+agent 自己发现并修复、未经 Jo 提出的条目，覆盖阶段一到阶段五全程。
+
+### 4. agent 做错或需要重写的部分
+
+索引里明确带【agent 做错】标签（不是 Jo 主动发现别的问题，是 agent 自己的判断/操作错误）
+的条目：第 33 条（压测四场景连读，没检查每日 token 预算）、第 41 条（mock-llm 逐字速度没
+按 PHASE4.md 决定 7 修改，4.1/4.6/多轮人工审查都没发现）。另外两条更早的【agent 做错】记录
+（步骤 1.4"验证时没有真的跑 make migrate/make seed"、步骤 1.7"验证幂等修复时没有真的杀掉
+worker"）写在正文里，但早于"审查故事索引"这个编号体系建立，没有被回填进索引——这是本次
+5.6 核对时发现的一个真实缺口，是否要给这两条也补上索引编号，由 Jo 决定。
+
+---
+
 ## 审查故事索引
 
 汇总全文所有【人工审查发现】【agent 做错】条目（含历史上用词不完全一致的【人审拦截】——
@@ -351,6 +412,19 @@
     这个更严重的后果；已改为在 `eval/run_eval.py` 里加 `reset_eval_state()`/
     `reset_platform_subscriptions()`，每次评测开始前、以及每道"平台指令"/"提醒"题开始前都
     把可变状态恢复到固定起点，两道题目本身都没有改（见"步骤 5.4"）。
+41. **mock-llm 逐字输出速度从未按 PHASE4.md 决定 7 的设计修改，4.1/4.6/人工审查都没有发现**：
+    agent 在 PHASE4.md 定下"流式生成之后每秒约 50 个字"这个设计后，4.1（丰富 mock 数据）
+    只改了 mock-finance/mock-platform/seed.py，4.6（压测准备与执行）也没有碰过这一行，
+    `mocks/mock_llm/main.py:200` 的逐字间隔从阶段一起一直是固定的 `asyncio.sleep(0.03)`
+    （每字 30 毫秒，约每秒 33 字），这条设计从头到尾没有被实现过；这不是"改错了"，是"设计
+    定了但没人真正去改代码"，中间经过 4.1、4.6 两次密集接触这块代码、以及此前多轮人工审查，
+    都没有人发现这个偏差，说明"关键设计决定"写进 PHASE 文档之后没有配套的验收检查——压测
+    报告、`make demo`、评测报告里凡是涉及"逐字输出耗时"的数字，隐含的速度前提其实一直是
+    错的（数字本身是真实测出来的，没有造假，只是跟设计文档预期的速度不一致）；本阶段（五）
+    5.6 整理索引时用 `grep`/`git log -p mocks/mock_llm/main.py` 顺着代码历史查证，确认这
+    一行从最早的提交到现在没有改过，才发现这个偏差；已在 `docs/PHASE4.md` 决定 7 后面加
+    更正说明（保留原文）、`docs/KNOWN_ISSUES.md` 新增第 26 条，按 `docs/PHASE5.md` 决定 7
+    本阶段不改代码——改了要重跑全部压测（见"步骤 5.6：AGENT_LOG 定稿"）。
 
 ### agent 自查修复（agent 自己发现并修复，未经 Jo 提出，每条一句话）
 
@@ -6022,3 +6096,67 @@ test_eval_scoring.py`、`docker-compose.yml`、`.gitignore`、`Makefile`、
 一致（逐题比对了两遍全部 50 道题的 `overall_ok`/`final_reply`/`text_checks`/
 `db_check.ok`/`ai_flavor.score`，0 处不一致）。两遍的原样输出、每道失败题的证据和归因、
 评测过程中改过的题目清单，见 `docs/EVAL_REPORT.md`。
+
+---
+
+## 步骤 5.5：架构与设计说明、API 文档、要求对照清单
+
+**日期**：2026-09-28
+
+**做什么**：新建 `docs/ARCHITECTURE.md`（架构图、消息完整路线、18 条关键设计取舍）、
+`docs/API.md`（各服务 FastAPI 文档地址、WebSocket 协议、HTTP 接口与鉴权）、
+`docs/CHECKLIST.md`（按 `docs/REQUIREMENTS.md` 逐条对照）；README 里指向这三份文档的占位
+同步替换；顺带把 `docs/EVAL_REPORT.md` 运行环境的 commit 改成刚推送的那次
+（`ad8ec836ae472b4f2eeaf6e4c6b1d1fb87126f7f`）。
+
+**关键设计点**：
+1. 消息路线跟演示控制台"架构路线图"对齐：直接读 `mocks/mock_im/templates/index.html`
+   `ARCH_NODES`/`ARCH_EDGES`（第 682~730 行）拿节点命名和顺序，`docs/ARCHITECTURE.md`
+   的路线表用同一套节点名，不是另起一套命名。
+2. 18 条设计取舍每条都先用 `grep`/`sed` 核对实际代码行，再写"做了什么/为什么/代价"——
+   核对时发现几处需要修正：`docs/CHECKLIST.md` 里 FR-7 的触发关键词引用了
+   `classify.py:39`（实际是 `SENSITIVE_KEYWORDS`），已改成 `classify.py:42`
+   （`DISSATISFIED_KEYWORDS` 真正所在行）；"36 个单元测试文件"实际数出来是 34 个（含 2 个
+   mock-llm 专属、1 个评测打分单测），已改正数字并写清楚这三类分别怎么跑。
+3. CHECKLIST 的"部分完成"："FR-4 知识问答"（多轮澄清目前只有"追问改写"，没有主动提问式
+   澄清）、"NFR-1 高并发"（架构机制全部完成，但压测四场景里"稳定"和"财务查询"两个场景的
+   吞吐指标不达标，是压测**结果**如实记录，不是没做）、"6.4 压测要求"、"6.5 故障注入"（19 种
+   里 8 种题目点名的亲手验证过，3 种由 E2E 自动覆盖，其余 8 种只写了命令没有亲手跑）；其余
+   FR/NFR/负面清单条目均为"完成"。
+4. 交付物第 11 条"演示视频"标"未做"但注明"不属于本清单核对范围"——`docs/PHASE5.md` 关键
+   设计决定 9 明确演示视频由 Jo 负责，CC 不参与，不是遗漏。
+
+**验证**：`docs/ARCHITECTURE.md` 抽查的多条设计取舍（工具调用三关校验 `app/common/
+tools.py:241-259`、高风险原子抢占 `app/worker/graph/command.py:353-393`、Redis 故障降级
+`app/common/redis.py:35`、日志两层脱敏 `app/common/masking.py:32,41`）跟代码原文逐字比对
+一致；`docs/API.md` 的 `reply_end.meta` 字段跟 `eval/output/chat01.json` 一次真实回复的
+`meta` 逐个字段对上，16 个字段一一对应，没有多也没有少；`docs/CHECKLIST.md` 里引用的测试
+文件名（`tests/unit/`/`tests/integration/`/`tests/e2e/` 共约 20 个具体文件名）逐一用 `ls`/
+`test -f` 确认存在。
+
+## 步骤 5.6：AGENT_LOG 定稿
+
+**日期**：2026-09-28
+
+**做什么**：
+1. 索引新增第 41 条【agent 做错】：mock-llm 逐字输出速度从阶段一起一直是 30 毫秒/字
+   （`mocks/mock_llm/main.py:200`），`docs/PHASE4.md` 关键设计决定 7"之后每秒约 50 个字"
+   从未落实到代码，4.1（丰富 mock 数据）、4.6（压测准备与执行）都没有改过这一行，此前多轮
+   人工审查也没有发现，是本步骤用 `grep`/`git log -p` 顺着代码历史查证才发现的。
+2. `docs/PHASE4.md` 决定 7 后面加更正说明（保留原文），`docs/KNOWN_ISSUES.md` 新增第 26
+   条，按 `docs/PHASE5.md` 决定 7 本阶段不改代码。
+3. 文件最前面（索引之前）补"总览"一节，对应交付物第 10 条四项：关键 prompt（PHASE 文档为
+   主，附本次会话两条返工指令原文，同时如实写明更早阶段的原始对话没有逐字保存，只有 agent
+   自己整理的复述这一局限）、按阶段列的生成/修改模块、指向索引的人工审查与修复点、索引里
+   明确标【agent 做错】的条目清单（第 33、41 条）。
+4. 核对索引编号：1~41 连续无缺号（`grep` 确认）；正文里"见"引用的章节标题逐一用 `grep`
+   确认对应的 `##`/`###` 标题存在。
+
+**中途发现但本阶段不处理的缺口**（记入总览第 4 项，请 Jo 决定）：步骤 1.4、1.7 正文里各有
+一条更早的【agent 做错】记录（"验证时没有真的走 make migrate/make seed""验证幂等修复时
+没有真的杀掉 worker"），写在"审查故事索引"这个编号体系建立之前，从未被回填成带编号的索引
+条目。本次只如实记录这个缺口，没有自行决定要不要补编号（CLAUDE.md 要求索引变更需要同步，
+但这两条严格说是"历史遗留、体系建立前"的记录，不是本阶段新增的标签，是否补号请 Jo 定）。
+
+**验证**：贴总览全文（见文件开头）；索引最后一条是第 41 条，编号连续；
+`docs/PHASE4.md` 决定 7 那一行后面能看到新加的更正说明。

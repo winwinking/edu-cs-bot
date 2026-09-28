@@ -4,7 +4,9 @@
 
 ## 运行环境
 
-- commit：`90e636d3567b7477902ed7d41003a0700a267796`
+- commit：`ad8ec836ae472b4f2eeaf6e4c6b1d1fb87126f7f`（评测代码 `eval/` 和题目
+  `eval/cases.jsonl` 以这次提交为准；这个 commit 之后如果再改了 `eval/` 或系统代码，需要
+  重新走一遍 5.4 复现两遍一致的验证再更新这里）
 - 日期：2026-09-27
 - 用的是 `mock-llm`（`LLM_BASE_URL=http://mock-llm:8000/v1`），不是真实大模型；测的是系统
   链路（意图路由、检索、拒答、模板、脱敏、越权、OutputGuard），测不到真实大模型的生成质量，
