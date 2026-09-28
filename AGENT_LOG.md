@@ -54,7 +54,7 @@
 
 ### 3. 人工审查与修复点
 
-见下面"审查故事索引"——44 条【人工审查发现】/【agent 做错】，加上"agent 自查修复"小节里
+见下面"审查故事索引"——45 条【人工审查发现】/【agent 做错】，加上"agent 自查修复"小节里
 agent 自己发现并修复、未经 Jo 提出的条目，覆盖阶段一到阶段五全程。
 
 ### 4. agent 做错或需要重写的部分
@@ -461,6 +461,26 @@ agent 自己发现并修复、未经 Jo 提出的条目，覆盖阶段一到阶�
     目标同样用 `mkdir -p`，另外 `loadtest-llm-timeout` 还显式依赖 `sh -c`/`trap`，本来就
     离不开 Git Bash/WSL，没有再花时间让它们也能在 cmd.exe 下跑，见
     `docs/KNOWN_ISSUES.md` 第 27 条。
+45. **"`--wait` 重试给自愈留出时间"这个判断没有依据，验证也没有覆盖真实失败场景**：agent 在
+    "步骤 5.7 第三轮"把 `up` 目标改成 `docker compose up -d --wait || docker compose up -d
+    --wait`，理由是"`--wait` 本身会反复轮询直到 healthy，重试只是让它再走一遍轮询"，验证
+    时只用"故意传一个不存在的 flag 让第一段报错"来确认 `||` 这个语法本身能触发第二段，没有
+    让容器真的进入过 unhealthy 状态；Jo 在 cmd.exe 冷启动 `make up` 时遇到的是 gateway 容器
+    已经被判定为真实的 unhealthy，两次 `--wait` 间隔只有 1.1 秒、全部失败——容器一旦被判
+    unhealthy，要等下一次真正跑成功的健康检查（间隔 5 秒）才会转回 healthy，`--wait` 对已经
+    unhealthy 的容器是直接判失败退出，不会像"starting"状态那样继续帮你轮询，所以间隔不到
+    2 秒的重试在数学上不可能等到新一轮检查，这个判断本身是错的；而且验证只覆盖了"语法能不能
+    触发重试"，没有覆盖"重试遇到真实 unhealthy 时到底有没有用"这个真正要验证的场景，跟第
+    42、44 条是同一类"验证没有覆盖真实使用场景"的问题。已用 `docker inspect`/gateway 容器
+    日志查到真实原因：gateway/worker 的启动逻辑会在对外监听端口之前先连 RabbitMQ，RabbitMQ
+    健康检查（`rabbitmq-diagnostics ping`）通过的那一刻 AMQP 端口不一定已经能接受新连接，
+    这个窗口期连接失败会让 FastAPI 启动直接抛异常退出、整个进程重启，重启期间健康检查端口
+    没有监听、多次失败会被计入 unhealthy 判定；已把 `docker-compose.yml` 里 rabbitmq 的
+    健康检查换成 `check_port_connectivity`（真去连 AMQP 端口，不只是确认节点内部 RPC 通），
+    给 gateway/worker 的健康检查加 `start_period`（启动阶段的失败不计入 unhealthy 阈值），
+    `up` 目标里去掉这条从未真正被验证过、也不可能生效的重试；改完在 cmd.exe 下连续冷启动
+    5 次、Git Bash 下 1 次，全部一次性成功、11/11 healthy，没有再出现 unhealthy（见"步骤
+    5.7 第四轮：修复冷启动被误判 unhealthy"）。
 
 ### agent 自查修复（agent 自己发现并修复，未经 Jo 提出，每条一句话）
 
@@ -6352,3 +6372,96 @@ internal or external command`，`make up` 报 `Makefile:28: up] Error 1`）。�
 2. 验证重试路径时不满足于"这次没触发就算了"：`||` 短路意味着"跑一遍不报错"不能证明第二段
    命令本身语法正确、能被 cmd.exe 正确解析执行——故意让第一段失败、强制走到第二段，才是
    真正验证了这条重试命令在 cmd.exe 下的可执行性，而不是巧合地一直没用上它。
+
+**更正说明（保留原文，见索引第 45 条【人工审查发现】）**：上面第 1 点"`--wait` 本身会反复
+轮询各容器状态直到全部 healthy"这个判断是错的，只对"starting"这类过渡状态成立；一旦容器被
+判定为 unhealthy，`--wait` 不会继续帮你等，是直接判失败退出，必须等下一次真正跑成功的健康
+检查（间隔 5 秒）才会转回 healthy。第 2 点的验证同样不成立："故意传一个不存在的 flag 让第
+一段报错"只验证了 `||` 语法本身、第二段命令能不能被 cmd.exe 解析执行，跟"重试遇到真实
+unhealthy 状态时到底有没有用"完全是两回事——真实场景下 Jo 冷启动撞到的是容器已经 unhealthy，
+两次 `--wait` 间隔 1.1 秒就都失败了，这次验证用的失败场景（不存在的 flag）从来没有真的让
+容器进入过 unhealthy 状态，覆盖不到真正要验证的路径，属于验证方法本身的问题，不是运气不好
+没撞上。已经按索引第 45 条的方式重新排查根因、修复 `docker-compose.yml` 的健康检查参数，
+`up` 目标里这条重试已经去掉，不再需要。
+
+---
+
+## 步骤 5.7 第四轮：修复冷启动被误判 unhealthy
+
+**日期**：2026-09-28
+
+【人工审查发现】Jo 在 cmd.exe 里冷启动 `make up` 失败：第一次 `docker compose up -d --wait`
+报 `container edu-cs-bot-gateway-1 is unhealthy`，1.1 秒后重试的第二次同样立刻失败，
+`migrate`/`seed`/`reindex` 都没跑到。这说明"步骤 5.7 第三轮"里"`--wait` 会一直轮询到
+healthy、外部重试是多余的"这个判断不成立，也说明上一轮验证方式没有覆盖这个真实场景（详见
+上面"步骤 5.7 第三轮"末尾的更正说明、索引第 45 条）。
+
+**先查原因，不直接改**：
+
+1. 用 `docker inspect edu-cs-bot-gateway-1 --format='{{json .State.Health}}'` 看健康检查
+   历史，再用 `docker compose logs gateway --timestamps` 看启动日志，复现了一次真实的
+   冷启动（`make down` 后 `make up`）。日志显示：gateway 的 uvicorn 进程连续启动了 3 次
+   （`10:52:17.598`/`10:52:18.785`/`10:52:19.995`，前两次相隔约 1.2 秒），前两次都在
+   `Waiting for application startup` 阶段抛出
+   `aiormq.exceptions.AMQPConnectionError: [Errno 111] Connection refused`，
+   `ERROR: Application startup failed. Exiting.`，第三次才连上 RabbitMQ、`Uvicorn running`。
+2. 根因：`app/gateway/main.py` 的 `lifespan()` 会在 uvicorn 真正开始监听 8000 端口之前先
+   `await get_connection()` 连 RabbitMQ（`app/worker/main.py` 的 `run_consumer()` 同理，
+   在监听 8001 之前先连）；这时 `docker-compose.yml` 里 rabbitmq 的健康检查用的是
+   `rabbitmq-diagnostics -q ping`，这条命令只确认 Erlang 节点和 CLI 之间的内部 RPC 通了，
+   不代表 AMQP（5672）端口已经绑定、能接受新连接——用
+   `docker exec edu-cs-bot-rabbitmq-1 rabbitmq-diagnostics check_port_connectivity` 和
+   `... ping` 两条命令对照验证过，`check_port_connectivity` 会真的去连 5672/15672/15692/
+   25672 这几个端口，`ping` 不会。`ping` 通过后仍有一个短窗口 AMQP 连接会被直接拒绝，
+   gateway/worker 在这个窗口期连接失败不是进程内部重连，是 FastAPI/uvicorn 启动阶段直接
+   抛异常退出，靠 `restart: unless-stopped` 整个进程重启；这几次崩溃重启期间 `/health`
+   端口根本没监听，健康检查必然失败——机器负载重、镜像还在构建占用 IO 时这个窗口可能被
+   拉长，多次失败攒够 `x-app-healthcheck` 的 `retries: 10`（原来没有 `start_period`，
+   失败从容器一启动就开始计数）就会被判 unhealthy，这正是 Jo 撞到的场景。
+3. scheduler 检查过没有同样的问题：`app/scheduler/main.py` 的 `main()` 用
+   `asyncio.create_task(run_scheduler_loop())` 起后台任务，不 `await` 它，uvicorn 监听
+   8002 之前不需要等任何外部连接成功，所以没有改 scheduler 的健康检查参数。
+
+**按原因修（只改 `docker-compose.yml`，没有改任何应用代码）**：
+
+1. rabbitmq 的健康检查从 `rabbitmq-diagnostics -q ping` 改成
+   `rabbitmq-diagnostics check_port_connectivity`——RabbitMQ 官方文档给容器编排场景推荐的
+   检查方式，真去 TCP 连一遍所有监听端口（含 5672），"healthy" 才真正等价于"AMQP 端口已经
+   能连"，从根上消掉这个窗口期。
+2. gateway、worker 的健康检查各加 `start_period: 45s`：Docker 的健康检查规则是
+   `start_period` 内的失败不计入 `retries` 判定 unhealthy 的阈值，一旦有一次成功立刻转
+   healthy（不需要等满 45 秒），这样"启动阶段几秒钟的崩溃重启抖动"不会被判 unhealthy，
+   真正卡死超过 45 秒的情况过了 `start_period` 该判 unhealthy 还是会判，不是把检测关掉。
+3. `Makefile` 的 `up` 目标把 `docker compose up -d --wait || docker compose up -d --wait`
+   改回单独一次 `docker compose up -d --wait`：这条重试从提出到现在没有一次真正验证过
+   "遇到真实 unhealthy 时能不能救回来"（见上面"步骤 5.7 第三轮"更正说明），间隔 1.1 秒
+   的重试在数学上也不可能等到下一次健康检查（间隔 5 秒）跑完，健康检查参数修好之后
+   `--wait` 单跑一次就该稳定成功，留着一条已知不可能生效的重试只会误导以后看这份 Makefile
+   的人，所以直接去掉，没有再改成别的"等一会再重试"写法。
+
+**验证**（覆盖真实失败场景：每次都先 `make down` 再冷启动 `make up`）：
+
+1. cmd.exe（本机没有把 Git 的 `sh.exe` 放进 `PATH`，`make` 在这个环境下用 cmd.exe 当
+   `SHELL`，跟 Jo 报告问题时的原生 cmd.exe 是同一种 shell 语义）下连续跑了 5 次
+   `make down` → `make up`：5 次 exit code 都是 0，`docker compose ps` 都是 11/11
+   healthy，输出里一次都没有出现过 "unhealthy" 字样——也就是说，改完之后这 5 次没有一次
+   触发过失败（不需要讨论"第一次 --wait 有没有失败"，因为根本没有失败过）。
+2. Git Bash 下再跑 1 次 `make down` → `make up`：exit code 0，11/11 healthy，同样没有
+   出现 "unhealthy"。
+3. 改之前用同一台机器复现过一次真实的崩溃重启（见上面"先查原因"第 1 步的日志），确认改动
+   前这个问题是真实存在的，不是凭空猜的；改动后 6 次冷启动没有再复现，但 RabbitMQ AMQP
+   端口就绪的时间窗口本质上仍然是概率性的，`start_period: 45s` 是按"实测崩溃重启一般
+   1~3 次、2 秒多就恢复"留出的余量，不是理论上限——如果以后在明显更慢的机器上仍然复现，
+   应当先看是不是这个余量不够，再考虑要不要调大，不代表这次的根因判断错了。
+
+**关键设计点**：
+1. 优先修健康检查参数而不是在 Makefile 里加更复杂的重试/等待逻辑：`--wait` 对
+   unhealthy 状态是直接判失败退出，不是"还在等"，所以外部重试从设计上就救不了 unhealthy，
+   只有让"unhealthy"这个判定本身更准确（`check_port_connectivity`）、给正常启动抖动留出
+   缓冲（`start_period`），才是对症的修法。
+2. 没有給 scheduler 一起加 `start_period`：它的健康检查跟这次的崩溃重启机制没有关系
+   （见"先查原因"第 3 步），照抄一份不相关的参数只会掩盖以后 scheduler 健康检查真正出问题
+   时的信号，不是"顺手加上更保险"。
+3. 去掉重试分支而不是保留它当"双保险"：一条已经证明不可能在真实失败场景下生效的重试，
+   留着比去掉更危险——它会让人误以为"失败了还有兜底"，掩盖了健康检查参数本身可能配置不当
+   这个真正该关注的信号。

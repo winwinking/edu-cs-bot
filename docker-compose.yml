@@ -17,6 +17,16 @@ x-app-healthcheck: &app-healthcheck
     interval: 5s
     timeout: 5s
     retries: 10
+    # gateway 的 lifespan 在 uvicorn 开始对外监听之前先去连 RabbitMQ（见 app/gateway/main.py）；
+    # RabbitMQ 健康检查通过的那一刻 AMQP 端口不一定已经能接受新连接（下面 rabbitmq 服务健康检查
+    # 的注释有解释），这一步连接失败会导致 FastAPI 启动直接抛异常退出（Application startup
+    # failed. Exiting.），不是进程内部重试，是整个进程崩溃，靠 restart: unless-stopped 拉起来
+    # 重来，实测一般 1~3 次、2 秒多就能连上。这几次崩溃重启期间 /health 端口根本没监听，健康检查
+    # 会失败，如果没有 start_period，这些失败会被计入 retries 阈值，一旦攒够 10 次就被判
+    # unhealthy——`docker compose up --wait` 对"unhealthy"是直接判失败退出，不会继续等，之前
+    # 遇到的冷启动失败就是这样来的。start_period 期间的失败不计入 retries、一旦有一次成功立刻
+    # 转 healthy，覆盖的正是"启动阶段几秒钟的抖动"，不影响真正卡住时最终仍会判 unhealthy
+    start_period: 45s
 
 # 5 个 mock 服务共用同一个镜像和健康检查方式，用 YAML anchor 避免每个服务都抄一遍。
 # target: base 同上，不含测试工具；mocks-tools 服务不复用这个锚点，见它自己的 image/build
@@ -120,6 +130,10 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+      # worker 在 uvicorn 开始监听 8001 之前先 await run_consumer()（见 app/worker/main.py），
+      # 跟 gateway 是同一个道理：RabbitMQ AMQP 端口没准备好会导致进程启动阶段崩溃重启，端口没监听
+      # 期间健康检查必然失败。理由跟上面 x-app-healthcheck 的 start_period 注释一致，这里不重复
+      start_period: 45s
     depends_on:
       postgres:
         condition: service_healthy
@@ -198,7 +212,15 @@ services:
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      # 阶段五 5.7 第四轮排障发现：`rabbitmq-diagnostics ping` 只确认 Erlang 节点和 CLI 之间的
+      # 内部 RPC 通了，不代表 AMQP（5672）端口已经绑定、能接受新连接——ping 通过后仍有一个短窗口
+      # AMQP 连接会被直接拒绝（Connection refused）。gateway/worker 的 depends_on 拿这个
+      # service_healthy 当"能连 AMQP 了"的信号，这个窗口期里连接失败会导致它们启动阶段直接崩溃
+      # 重启（见 gateway/worker 健康检查的 start_period 注释）。改用 check_port_connectivity——
+      # 这是 RabbitMQ 官方文档给容器编排场景推荐的检查，真正去 TCP 连一遍所有监听端口（含
+      # 5672），"healthy" 才真正等价于"AMQP 端口已经能连"，从根上消掉这个窗口期，不是靠外面加
+      # 等待时间硬扛
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
       interval: 5s
       timeout: 5s
       retries: 10

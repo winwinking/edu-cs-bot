@@ -5,17 +5,32 @@
 # seed.py 里 tenants 现在也用 ON CONFLICT DO NOTHING，不会把压测/演示中改过的
 # daily_token_budget 等字段冲回种子默认值），重复执行 make up 不会产生重复数据。
 #
-# RabbitMQ 健康检查（rabbitmq-diagnostics ping）通过的那一刻，AMQP 端口不一定已经能接受新
-# 连接——worker 偶尔会在这个窄窗口第一次连接失败退出；`restart: unless-stopped` 会在几秒内
-# 自己拉起来重连成功，这是已有的自愈机制，不是新引入的问题，只是以前 make up 不等 healthy
-# 状态，没人注意到这个瞬时抖动。下面用 --wait 确认全部 healthy 再往下走（保证 migrate/seed
-# 执行时所有服务都真的活着），失败了重试一次而不是直接判失败，给自愈留出时间。重试不用
-# `sleep`——`sleep` 不是 cmd.exe 的内置命令，之前 `sleep 10 && ...` 这个写法在原生 cmd.exe
-# 下报 "'sleep' is not recognized"，`up` 直接中断（阶段五 5.7 复核发现，见 AGENT_LOG.md
-# 索引"agent 自查修复"）；`docker compose up -d --wait` 本身就会反复轮询直到全部 healthy
-# 或者等到它自己的等待超时才返回，不需要外部再睡一段时间才重试，直接再跑一次同一条命令，
-# 让它自己重新走一遍轮询等待即可——`||` 是 cmd.exe/Git Bash/POSIX sh 共同支持的写法，不用
-# 再分平台各写一套。
+# 阶段五 5.7 第四轮排障（Jo 在 cmd.exe 冷启动实测到 --wait 直接判 unhealthy 失败）：上一轮
+# "重试一次给自愈留出时间"这个判断是错的——container 一旦被判 unhealthy，状态是"贴上去就不
+# 会自己掉"的：只有等到下一次健康检查真的跑成功才会转回 healthy，而健康检查间隔是 5s；上一轮
+# 的重试紧跟着失败后立刻又跑一次 `--wait`，间隔通常不到 2 秒，连一次新的健康检查都没来得及跑，
+# 重试当然还是读到同一个 unhealthy 状态、立刻又失败——`--wait` 对已经是 unhealthy 的容器是
+# 直接判失败退出，不会像"starting"状态那样继续帮你轮询等它变 healthy，所以重试在数学上就不
+# 可能有用，不是运气不好。
+#
+# 真正查到的原因（docker inspect + gateway 容器日志）：gateway 的 FastAPI lifespan（worker
+# 同理）会在 uvicorn 真正开始监听端口之前先去连 RabbitMQ；这时 RabbitMQ 的健康检查
+# （rabbitmq-diagnostics ping）已经通过，但 ping 只确认 Erlang 节点内部 RPC 通了，不代表
+# AMQP（5672）端口已经绑定、能接受新连接——ping 通过后仍有一个短窗口连接会被直接拒绝
+# （Connection refused）。gateway/worker 这时候的行为不是"进程内部重连"，是 lifespan 抛异常、
+# FastAPI 启动直接失败退出（Application startup failed. Exiting.），靠 restart: unless-stopped
+# 整个进程重启，实测一般 1~3 次、2 秒多能连上；但这几次崩溃重启期间健康检查端口根本没监听，
+# 攒够 retries 次失败就会被判 unhealthy——机器负载重、镜像还在构建占用 IO 时这个窗口可能被
+# 拉长，退化成 Jo 实测到的"直接就是 unhealthy"。
+#
+# 按根因修在 docker-compose.yml 里（没有改应用代码）：① rabbitmq 的健康检查换成
+# `rabbitmq-diagnostics check_port_connectivity`——这是官方给容器编排场景推荐的检查，真去
+# TCP 连一遍所有监听端口（含 5672），"healthy" 才真正等价于"AMQP 能连了"；② gateway/worker
+# 的健康检查加 start_period（45s）——正常启动期间的健康检查失败不计入 unhealthy 判定阈值，
+# 覆盖的正是这类启动阶段的短暂抖动，真正卡死的情况过了 start_period 之后该判 unhealthy 还是
+# 会判。两条修完，`docker compose up -d --wait` 单跑一次就该稳定成功，不再需要"失败了猜一下
+# 是不是能重试"这种没有把握的兜底，所以下面把重试去掉了；具体验证过程和跑了几次见
+# AGENT_LOG.md 第 45 条。
 #
 # tools 服务不在 `up` 启动的服务集合里（profiles 挡住了），上面的 --build 不会重新构建它；
 # `docker compose run` 默认只在镜像不存在时才现场构建，已经存在的旧镜像不会自动刷新——
@@ -31,7 +46,7 @@
 # 命令行（见 AGENT_LOG.md 索引第 44 条）。
 up:
 	docker compose up -d --build
-	docker compose up -d --wait || docker compose up -d --wait
+	docker compose up -d --wait
 	docker compose run --rm --build tools alembic upgrade head
 	docker compose run --rm --build tools sh -c "python scripts/seed.py && python scripts/reindex.py"
 
