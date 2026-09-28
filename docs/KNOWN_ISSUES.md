@@ -454,6 +454,34 @@ seed.py，跟 mock-llm 速度完全无关。
 `asyncio.sleep(0.03)` 改成读一个可配置的每字间隔（比如 `MOCK_LLM_CHAR_DELAY_SECONDS`，
 默认改成约 0.02 秒对应每秒 50 字），改完需要重新跑一遍压测四场景和评测，确认新的耗时数字。
 
+### 27. `make loadtest`/`loadtest-*` 只能在 Git Bash 或 WSL 里跑，不支持原生 Windows cmd.exe
+
+**现象**：`Makefile` 的 `loadtest-steady`/`loadtest-burst`/`loadtest-finance`/
+`loadtest-llm-timeout` 四个目标都用 `mkdir -p loadtest/output` 建压测输出目录——`-p` 是
+POSIX 的 `mkdir` 参数，cmd.exe 自带的 `mkdir` 不认识它，会把 `-p` 当成一个要创建的目录名，
+报"语法不正确"（如果 `-p` 目录已经存在则报"目录已存在"）；`loadtest-llm-timeout` 还额外
+显式调用 `sh -c '...'`，在里面用 `trap "..." EXIT` 保证 mock-llm 的 `timeout_rate` 配置
+不管 k6 是正常跑完、非零退出还是被 Ctrl+C 中断都会被重置（压测场景 4 的关键设计，见
+`docs/LOADTEST.md`），`trap` 不是 cmd.exe 的内置命令，`sh` 本身在原生 cmd.exe 环境下也
+不一定存在。
+
+**影响**：`make loadtest`/单个 `loadtest-*` 目标在原生 cmd.exe 下跑不起来；`make up`/
+`make test`/`make demo`/`make eval`/`make down` 不受影响，已经在 cmd.exe 下验证过
+（阶段五 5.7，见 `AGENT_LOG.md` 索引第 44 条）。
+
+**为什么没做**：`loadtest-llm-timeout` 里的 `sh -c`+`trap` 是故意这样写的（`docs/
+LOADTEST.md`"检查点审查：场景 4 改真超时模式，恢复逻辑加 trap 兜底"一节；`AGENT_LOG.md`
+记录过用 `|| true` 兜底不够、Ctrl+C 中断时会漏 reset，才改成现在这个写法），cmd.exe 没有
+等价的内置机制能做到"不管进程怎么退出都执行一次清理"，要保留这个故障恢复保证就必须依赖
+`sh`；四个目标共用的 `mkdir -p` 本身可以单独换成跨平台写法，但既然 `loadtest-llm-timeout`
+无论如何都要靠 `sh`，四个场景本来就要在同一种环境（Git Bash/WSL）下跑才有意义，单独修
+`mkdir -p` 不能让 `make loadtest` 整体在 cmd.exe 下可用，收益有限。
+
+**后续怎么做**：README"快速开始"已经写明这几个目标需要 Git Bash 或 WSL。如果要做到原生
+cmd.exe 也能跑完整压测，需要把 `loadtest-llm-timeout` 的清理逻辑换成 PowerShell 的
+`try/finally`（或者按操作系统分别写两套 Makefile 配方），改动集中在这一个目标，其余三个
+场景目标本身没有 `trap` 这类强依赖，换成跨平台的目录创建方式即可。
+
 ## 后续规划（按优先级）
 
 1. **真实 LLM 评测**：接入 DeepSeek 跑一次 `eval/cases.jsonl`，对比 mock-llm 和真实 LLM

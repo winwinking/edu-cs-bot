@@ -104,6 +104,22 @@ make up                  # 起基础设施 + gateway/worker/scheduler + 5 个 mo
 make demo                # 生成 token -> 发消息看三个耗时 -> 同 message_id 重发看 duplicate
 ```
 
+**Windows 下 `make up`/`make test`/`make demo`/`make eval`/`make down` 已经在原生
+cmd.exe 和 Git Bash 两种环境下分别验证过，都能跑通**（阶段五 5.7 发现并修复了 `up`/`test`
+配方里以 Tab 开头的 `#` 注释行在 cmd.exe 下会被当命令执行、报 `CreateProcess` 错误的问题，
+见 `AGENT_LOG.md` 索引第 44 条；`eval` 目标原来用 `mkdir -p` 建输出目录，`-p` 是 POSIX
+参数，cmd.exe 自带的 `mkdir` 不认识，已经去掉这一行，改成让 `eval/run_eval.py` 自己在写
+文件前建目录，不用分平台写两套命令）。上面这段快速开始代码块里的第一行 `cp .env.example
+.env` 是 POSIX 命令，cmd.exe 没有——在 cmd.exe 里手动执行 `copy .env.example .env` 代替
+即可，后面的 `make` 命令不受影响。
+
+**`make loadtest`/`make loadtest-steady`/`make loadtest-burst`/`make loadtest-finance`/
+`make loadtest-llm-timeout` 仍然只能在 Git Bash 或 WSL 里跑，不支持原生 cmd.exe**：这几个
+目标本身就依赖 `mkdir -p`（`loadtest/output` 没有代码在运行时自己建，跟 `eval` 不一样），
+`loadtest-llm-timeout` 还额外显式调用 `sh -c '...'` 并在里面用 `trap` 做故障恢复兜底（压测
+场景 4 的关键设计，见 `docs/LOADTEST.md`），`trap` 不是 cmd.exe 的内置命令，即使解决了
+`mkdir -p` 也跑不起来，见 `docs/KNOWN_ISSUES.md` 第 27 条。
+
 `make up` 里的迁移和种子数据都是幂等的：重复执行不会产生重复数据，也不会覆盖已经改过的机构配置
 （比如压测/演示中调整过的 `daily_token_budget`）。`make migrate`/`make seed` 仍然保留成独立目标，
 只是不需要在启动步骤里手动敲了；改了 `data/knowledge/` 下的文档之后单独重建索引用这个（不用重新

@@ -54,7 +54,7 @@
 
 ### 3. 人工审查与修复点
 
-见下面"审查故事索引"——41 条【人工审查发现】/【agent 做错】，加上"agent 自查修复"小节里
+见下面"审查故事索引"——44 条【人工审查发现】/【agent 做错】，加上"agent 自查修复"小节里
 agent 自己发现并修复、未经 Jo 提出的条目，覆盖阶段一到阶段五全程。
 
 ### 4. agent 做错或需要重写的部分
@@ -441,6 +441,27 @@ agent 自己发现并修复、未经 Jo 提出的条目，覆盖阶段一到阶�
 > 里的记录早于本索引的编号体系建立，5.6 补编号时按 Jo 的要求"不改前面任何编号"，只追加在
 > 末尾，不重排——这两条编号不代表发生顺序。
 
+44. **`Makefile` 配方里以 Tab 开头的 `#` 注释行，在 Windows 原生 cmd.exe 下会被当命令执行
+    直接报错**：agent 从阶段一起写 `Makefile` 时在多个目标的配方（recipe）里插入了以 Tab
+    开头的 `# ...` 注释行来解释相邻命令；Jo 在 Windows 的 cmd.exe（不是 Git Bash）里跑
+    `make up`，在配方第一处这类注释行上报
+    `CreateProcess(NULL, # RabbitMQ 健康检查..., ...) failed`，`up` 在这一行中断，
+    migrate/seed/reindex 都没跑到；根因是 Linux/macOS/Git Bash 下 make 把配方交给 `sh`
+    执行、`sh` 把 `#` 开头的行当注释跳过，Windows 原生 cmd.exe 下 make 没有 `sh` 可用，会把
+    这一行原样当命令执行，`#` 对 cmd.exe 没有任何特殊含义，报错——这跟第 42 条是同一类问题：
+    此前所有验证都在 Git Bash 里做，验证用的环境和评委可能会用的真实环境（原生 cmd.exe）
+    不是同一个，Git Bash 能"包容"的写法在 cmd.exe 下直接暴露成真实故障；已把 `up`、`test`
+    两个目标配方里的全部 Tab 注释行挪到目标定义上方（不带 Tab，Make 解析阶段直接丢弃，不会
+    交给任何 shell），不改任何命令本身，改完用真正的 `cmd /c "make up"`（不是 Git Bash）
+    重新验证 `up`/`test`/`demo`/`down` 四个目标全部不再因为这类注释报错，`docker compose
+    ps` 确认全部 healthy（见"步骤 5.7：最终检查（cmd.exe 验证）"）；同一次 cmd.exe 复核中
+    还发现 `eval` 目标里的 `mkdir -p` 在原生 cmd.exe 下是另一类真实不兼容（cmd 自带
+    `mkdir` 不认识 `-p`），这一条不属于本次要修的"注释报错"问题，当场没有顺手改，先如实
+    记入已知问题；下一轮 Jo 授权后已经改掉（见下面"agent 自查修复"）。`loadtest-*` 几个
+    目标同样用 `mkdir -p`，另外 `loadtest-llm-timeout` 还显式依赖 `sh -c`/`trap`，本来就
+    离不开 Git Bash/WSL，没有再花时间让它们也能在 cmd.exe 下跑，见
+    `docs/KNOWN_ISSUES.md` 第 27 条。
+
 ### agent 自查修复（agent 自己发现并修复，未经 Jo 提出，每条一句话）
 
 - 步骤 1.4：迁移脚本里 ENUM 类型被重复创建（`DuplicateObjectError`），加 `create_type=False`
@@ -545,6 +566,14 @@ agent 自己发现并修复、未经 Jo 提出的条目，覆盖阶段一到阶�
   确认执行结果完全正确；这是 agent 写 `eval/cases.jsonl` 时的题目设计问题（在
   `eval/PENDING_DECISIONS.md` 里报告给 Jo、经她确认改法），已改成 `expect.intent_turn1`，
   只检查第一轮，第二轮是否真的执行交给 `db_check` 判断。
+- 步骤 5.7：`Makefile` 的 `eval` 目标用 `mkdir -p eval/output` 建输出目录在 cmd.exe 下不
+  兼容，发现 `eval/run_eval.py` 的 `main()` 自己已经会 `OUTPUT_DIR.mkdir(exist_ok=True)`，
+  这行 Makefile 命令本来就是多余的，直接删掉，不需要分平台写两套命令。
+- 步骤 5.7：`up` 目标的重试分支 `docker compose up -d --wait || (sleep 10 && ...)` 里的
+  `sleep` 不是 cmd.exe 的内置命令，导致这条重试本身在 cmd.exe 下就跑不起来；`docker
+  compose up -d --wait` 本身会反复轮询直到 healthy，不需要外部先睡一段时间再重试，改成
+  `docker compose up -d --wait || docker compose up -d --wait`，去掉 `sleep` 和括号，
+  `cmd.exe`/Git Bash/POSIX sh 都认识 `||`，不用分平台写两套。
 
 ---
 
@@ -6175,3 +6204,151 @@ tools.py:241-259`、高风险原子抢占 `app/worker/graph/command.py:353-393`�
 
 **验证**：贴总览全文（见文件开头）；索引最后一条是第 43 条，编号连续；
 `docs/PHASE4.md` 决定 7 那一行后面能看到新加的更正说明。
+
+---
+
+## 步骤 5.7：最终检查（cmd.exe 验证）
+
+**日期**：2026-09-28
+
+**做什么**：Jo 在 Windows 原生 cmd.exe（不是 Git Bash）里跑 `make up`，在
+`CreateProcess(NULL, # RabbitMQ 健康检查..., ...) failed` 处中断，指出根因是 `Makefile`
+的 `up` 目标配方里有以 Tab 开头的 `#` 注释行——Linux/macOS/Git Bash 下 make 把配方交给
+`sh`，`sh` 把这类行当注释跳过，Windows 原生 cmd.exe 下没有 `sh`，会把这一行原样当命令
+执行。修复：
+- 把 `up`、`test` 两个目标配方里全部以 Tab 开头的 `#` 注释行挪到目标定义上方（不带 Tab），
+  不改任何命令本身；`grep -nP "^\t#" Makefile` 确认修完之后配方里不再有任何这类行。
+- 用真正的 cmd.exe（`cmd /c "make up"` 等，不是 Git Bash）依次重新验证
+  `up`/`test`/`demo`/`down` 四个目标：`up` 从头到尾无报错，`docker compose ps` 全部
+  11 个服务 healthy；`test` 四层（258 passed 2 skipped / 42 passed / 11 passed /
+  10 passed）；`demo` 三步耗时正常输出；`down` 干净停止全部容器（未加 `-v`，数据卷保留）。
+- 复核时额外用 `cmd /c "make eval"` 验证，撞到一个跟本次注释问题**无关**的新发现：
+  `eval` 目标里的 `mkdir -p eval/output`，cmd.exe 自带的 `mkdir` 不认识 `-p` 参数，会把
+  `-p` 当成要创建的目录名，报"语法不正确"，实测在仓库根目录真的创建出一个名叫 `-p` 的空
+  目录（验证完已删除，不是仓库该有的文件）；这个问题不属于本次要求修的范围（Tab 注释），
+  没有当场改，如实记入 `docs/KNOWN_ISSUES.md` 第 27 条，`loadtest-*` 四个目标共用同一行
+  写法，同样会撞到。
+- README"快速开始"下面补一行，明确 Windows 下要在 Git Bash 或 WSL 里跑这些 `make` 命令，
+  不支持原生 cmd.exe/PowerShell，并点出 `mkdir -p` 这个已知的原生 cmd.exe 不兼容点。
+
+**关键设计点**：
+1. 只搬注释、不改命令：用 `grep -nP "^\t#" Makefile` 先精确定位所有需要搬的行（只有 `up`
+   第 9~13、15~20 行和 `test` 第 59~61 行三段），确认没有漏改或者误改到真正的命令行。
+2. 验证必须换真正的 cmd.exe，不能继续用 Git Bash 里跑 `cmd /c` 冒充——这正是这次问题本身
+   的教训（验证环境和真实使用环境不一致），用 PowerShell 工具调用 `cmd /c "..."` 是唯一
+   能在这次会话里真正跑到原生 cmd.exe 解释器的办法。
+3. 发现 `mkdir -p` 问题后没有顺手一起改：这次的授权范围明确是"注释挪位置"，`mkdir -p` 是
+   性质不同的另一类不兼容（参数语义，不是注释语法），修复方式也不同（要么分平台写两套
+   命令，要么换成不依赖 `-p` 语义的等价写法），扩大范围去改不在这次要求内，如实汇报交给
+   Jo 决定要不要连带修。
+
+**验证**：`grep -nP "^\t#" Makefile` 无输出；`cmd /c "make up"` 后 `docker compose ps`
+11/11 healthy；`cmd /c "make test"` 四层全部通过；`cmd /c "make demo"` 三步耗时输出正常；
+`cmd /c "make down"` 干净退出；`cmd /c "make eval"` 在 `mkdir -p` 处报错（已知问题，不是
+本次要修的问题）；`git status --short` 只有 `Makefile` 被改动。
+
+---
+
+## 步骤 5.7 第二轮：修 `make eval` 的 `mkdir -p`，README/已知问题精确化，清理残留目录
+
+**日期**：2026-09-28
+
+**做什么**：
+1. `Makefile` 的 `eval` 目标删掉 `mkdir -p eval/output` 这一行——查
+   `eval/run_eval.py` 的 `main()` 发现它自己在写任何文件之前已经会
+   `OUTPUT_DIR.mkdir(exist_ok=True)`（`eval/` 本身靠 `docker-compose.yml` 的 bind mount
+   一直存在，不需要额外建），这行 Makefile 命令本来就是多余的，直接删比"分平台写两套
+   mkdir 命令"或者"提交一个 `.gitkeep`"都更干净。用真正的 cmd.exe（`cmd /c "make eval"`）
+   重新验证：exit 0，仓库根目录没有再冒出名叫 `-p` 的目录，`eval/output/` 正常写出 51 个
+   文件，五个指标和失败题列表（`kq06/07/09/10/12`、`nohit04/05`、`sens02`、`inj01`）跟
+   `docs/EVAL_REPORT.md` 完全一致。
+2. 检查 `loadtest-*` 四个目标除 `mkdir -p` 外还有哪些只能在 bash 下跑的写法：
+   `loadtest-llm-timeout` 显式调用 `sh -c '...'`，里面用 `trap "..." EXIT` 保证 mock-llm
+   的 `timeout_rate` 配置不管 k6 正常跑完/非零退出/被 Ctrl+C 中断都会被重置（压测场景 4
+   的关键设计，`docs/LOADTEST.md`"检查点审查：场景 4 改真超时模式，恢复逻辑加 trap
+   兜底"）；`trap` 不是 cmd.exe 的内置命令。这四个目标本来就依赖 bash，没有改，也没有跑
+   完整压测。
+3. README"快速开始"下面的说明改准确：写明 `make up`/`make test`/`make demo`/`make eval`/
+   `make down` 已经在 cmd.exe 和 Git Bash 下都验证过能跑通；`make loadtest`/`loadtest-*`
+   仍然只能在 Git Bash 或 WSL 下跑，并写清楚原因（`mkdir -p` + `loadtest-llm-timeout` 的
+   `sh -c`/`trap`）；补了一句"快速开始"代码块第一行 `cp` 在 cmd.exe 下要换成 `copy`。
+4. `docs/KNOWN_ISSUES.md` 第 27 条整条改写，只描述 `loadtest-*` 依赖 bash 这一件事（原来
+   混着写了"Tab 注释"和"`eval` 的 `mkdir -p`"两个已经解决的问题，不该再留在"已知问题"
+   里）；`AGENT_LOG.md` 里两处引用第 27 条的地方（索引第 44 条、上面"步骤 5.7"正文）同步
+   改成跟新范围一致的说法，`eval` 的 `mkdir -p` 记进"agent 自查修复"小节一句话。
+5. Jo 授权后删除仓库根目录两个空目录：`-p`（上一轮验证 `mkdir -p` bug 时产生，已经在
+   写本条之前的排查过程中删过一次）、`app;C`（更早的一次 shell 引号/分号处理事故留下的
+   空目录，跟本次修改无关，之前只发现没有删）——删之前都用 `find "<dir>" -mindepth 1`
+   确认目录内没有任何文件、`git ls-files`/`git status --ignored` 确认没有被 git 跟踪或
+   忽略规则覆盖，再执行 `rmdir`。
+
+**中途发现但本次不处理的新问题（如实汇报，不在这次授权范围内，没有修）**：验证 `make up`
+在 cmd.exe 下的行为时（为了让环境干净地跑 `make eval`），撞到 `up` 目标里另一处真实的
+cmd.exe 不兼容——健康检查第一次没通过时的重试分支 `docker compose up -d --wait ||
+(sleep 10 && docker compose up -d --wait)`，`sleep` 不是 cmd.exe 的内置命令，报
+`'sleep' is not recognized as an internal or external command`，`make up` 因此在
+`Makefile:28` 报错退出（这次触发的是 gateway 健康检查一次性抖动，AGENT_LOG 里"步骤
+5.1"记录过的同类自愈窗口，几秒后 gateway 自己变 healthy，不是新故障，但 cmd.exe 下这条
+重试分支本身跑不起来）。跟这次修的"注释报错""`mkdir -p`"都不是同一处、也不是这次授权
+要改的范围，没有当场修，只在这里如实记录，交给 Jo 决定要不要一起处理（比如换成
+`docker compose up -d --wait --wait-timeout N` 之类不依赖外部 `sleep` 的重试方式）。
+
+**关键设计点**：
+1. `eval` 的修法选"删掉多余的行"而不是"换一个跨平台命令"：run_eval.py 已经做了这件事，
+   Makefile 层再做一次是重复代码，两处一致性以后容易漂移（比如以后改了 `eval/` 目录结构，
+   只改了 Python 那边、忘了改 Makefile），删掉多余的一份比维护两份一致更简单。
+2. `loadtest-*` 保持不动：`trap` 提供的"无论怎么退出都会重置 mock-llm 配置"这个保证是
+   PHASE4.md 4.6 审查时特意加的（见索引第 29 条），cmd.exe 没有等价的内置机制，勉强去掉
+   `trap` 换成别的写法会牺牲这个故障恢复保证，收益（让 `mkdir -p` 也能跑）不足以抵消
+   代价，所以连 `mkdir -p` 也一起留着不改，不做"改一半"的中间状态。
+3. 删空目录前逐一验证"真的没有内容、真的没有被 git 跟踪"，不是看名字像垃圾就删——这两个
+   目录都是 shell 解析异常的副产物，理论上文件系统层面可能有 Windows 保留字符导致的
+   访问异常，先用 `find`/`git status --ignored` 确认过再删，不是凭观察猜的。
+
+**验证**：`cmd /c "make eval"` exit 0，`eval/output/` 51 个文件正常写出，五个指标/失败题
+列表跟 `docs/EVAL_REPORT.md` 完全一致，仓库根目录没有 `-p` 目录；`grep -n "mkdir -p eval"
+Makefile` 无输出；`rmdir "app;C"` 成功后 `ls` 确认根目录不再有 `-p`/`app;C`；最终
+`git status --short` 只有 `AGENT_LOG.md`/`Makefile`/`README.md`/`docs/KNOWN_ISSUES.md`
+四个文件被改动。
+
+---
+
+## 步骤 5.7 第三轮：修 `up` 目标重试分支的 `sleep`
+
+**日期**：2026-09-28
+
+**做什么**：`up` 目标里健康检查失败后的重试分支原来是 `docker compose up -d --wait ||
+(sleep 10 && docker compose up -d --wait)`，`sleep` 不是 cmd.exe 的内置命令，这条重试
+本身在原生 cmd.exe 下跑不起来（上一轮验证时撞到过一次，`'sleep' is not recognized as an
+internal or external command`，`make up` 报 `Makefile:28: up] Error 1`）。改成
+`docker compose up -d --wait || docker compose up -d --wait`，去掉 `sleep` 和外层括号：
+`docker compose up -d --wait` 本身会反复轮询各容器状态直到全部 healthy（或者到它自己的
+等待上限才返回非零），不需要外部先睡 10 秒再重试一次，直接再跑一次同一条命令、让它自己
+重新走一遍轮询等待即可；`||` 是 cmd.exe/Git Bash/POSIX sh 共同支持的写法（用
+`cmd /c "dir 不存在的路径 || echo 成功"` 验证过 cmd.exe 确实支持 `||`），不用分平台各写
+一套，也没有改任何应用代码。
+
+**验证**：
+1. `docker compose down` 后用真正的 cmd.exe（`cmd /c "make up"`）从冷启动跑一次：exit 0，
+   输出里 `docker compose up -d --wait` 只出现 1 次（说明这次重试没有被触发，第一次
+   `--wait` 就直接成功了），`docker compose ps` 11/11 healthy。
+2. 再 `docker compose down` 后用 Git Bash 跑一次 `make up`：exit 0，同样重试没被触发
+   （只出现 1 次），11/11 healthy。
+3. 这两次都没有自然触发重试分支（RabbitMQ/AMQP 窗口期的抖动本来就是概率性的），所以
+   单独在 cmd.exe 里做了两次针对性验证：
+   - 直接跑改完后的那整行命令 `cmd /c "docker compose up -d --wait ||
+     docker compose up -d --wait"`：第一段本身就成功，`||` 短路，只能证明语法不报错，
+     不能证明第二段真的会被执行。
+   - 故意让第一段失败（`cmd /c "docker compose --this-flag-does-not-exist up -d
+     --wait || docker compose up -d --wait"`，`docker compose` 收到不存在的参数会报
+     `unknown flag` 并返回非零退出码），观察到 `||` 确实触发、第二段真正跑了一遍完整的
+     `docker compose up -d --wait`，最终 exit 0、11/11 healthy——这才是对"重试那一半在
+     cmd.exe 下能不能正确执行"的真实验证，不是靠短路蒙混过去。
+
+**关键设计点**：
+1. 选"去掉 sleep 直接重试"而不是分平台写两套（比如 cmd.exe 用 `timeout /t 10`）：`--wait`
+   本身自带轮询等待语义，外部再睡一段固定时间纯粹是多余的等待，删掉反而更快也更简单，不
+   需要为了保留一个本来就不必要的延迟去维护两套平台专属写法。
+2. 验证重试路径时不满足于"这次没触发就算了"：`||` 短路意味着"跑一遍不报错"不能证明第二段
+   命令本身语法正确、能被 cmd.exe 正确解析执行——故意让第一段失败、强制走到第二段，才是
+   真正验证了这条重试命令在 cmd.exe 下的可执行性，而不是巧合地一直没用上它。
